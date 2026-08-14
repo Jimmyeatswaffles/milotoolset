@@ -4643,6 +4643,44 @@ MAX_MILO_TEX_SIZE = 2048  # Confirmed against the glTFMilo reference tool: its o
                           # must always be enforced, independent of ignore_size_limits.
 
 
+def _require_loaded_image_buffer(image):
+    """Raises a clear, actionable error if `image`'s pixel buffer never actually decoded,
+    BEFORE anything tries to .scale()/read .pixels on it and gets Blender's raw, unhelpful
+    'RuntimeError: Error: Image 'X' failed to load image buffer'.
+
+    Why this happens: Blender can read a DDS file's HEADER (width/height/etc - so
+    image.size is non-zero and it shows up fine in the file browser and material preview
+    thumbnail) without being able to actually DECODE its pixel data - Blender's built-in
+    DDS support only covers a subset of real-world DDS variants (notably missing most
+    BC7/DX10-header/typeless-format files, which are extremely common output from texture
+    tools and game-asset extractors). The failure only surfaces the moment something
+    (like this exporter) actually needs the decoded pixels, which is exactly the confusing
+    experience a plugin user reported: a crash pointing at Blender's own scale()/pixels
+    machinery with no indication the source file itself is the problem.
+
+    image.has_data is Blender's own signal for "the pixel buffer is actually loaded",
+    independent of whether the header parsed enough to report a size - checking it here
+    lets us fail with a real explanation instead of Blender's raw RuntimeError."""
+    if not image.has_data:
+        import os
+        ext = os.path.splitext(image.filepath or image.name)[1].lower()
+        dds_note = (
+            " This is a known Blender limitation with DDS files specifically: Blender's "
+            "built-in DDS reader can parse the header (so it shows a correct size/name "
+            "here) without being able to decode many real-world DDS variants - BC7, "
+            "DX10-header, and typeless-format DDS files in particular. Re-export/convert "
+            "this texture to PNG or TGA (e.g. in GIMP, Photoshop, or an online DDS "
+            "converter) and re-link it in Blender, then try exporting again."
+        ) if ext == '.dds' else (
+            " Try re-saving/re-exporting this image in a different format (PNG or TGA "
+            "are the safest bets) and re-linking it in Blender."
+        )
+        raise RuntimeError(
+            f"Image '{image.name}' has a size but its pixel buffer never actually loaded "
+            f"(Blender's own image.has_data is False for it) - this is NOT a bug in the "
+            f"exporter, Blender itself failed to decode this file's pixel data.{dds_note}")
+
+
 def get_image_rgba8(image, max_size=512, ignore_size_limits=False):
     """Returns (width, height, rgba_bytes) as flat RGBA8 bytes, downscaled to fit
     max_size unless ignore_size_limits, and rounded up to a multiple of 4 in each
@@ -4663,6 +4701,7 @@ def get_image_rgba8(image, max_size=512, ignore_size_limits=False):
     orig_w, orig_h = image.size[0], image.size[1]
     if orig_w == 0 or orig_h == 0:
         raise ValueError(f"Image '{image.name}' has no pixel data - is it missing or unpacked?")
+    _require_loaded_image_buffer(image)
 
     target_w, target_h = orig_w, orig_h
     if not ignore_size_limits and (orig_w > max_size or orig_h > max_size):
@@ -4724,6 +4763,7 @@ def export_texture_as_png(image, out_path, max_size=512, ignore_size_limits=Fals
     orig_w, orig_h = image.size[0], image.size[1]
     if orig_w == 0 or orig_h == 0:
         raise ValueError(f"Image '{image.name}' has no pixel data - is it missing or unpacked?")
+    _require_loaded_image_buffer(image)
 
     target_w, target_h = orig_w, orig_h
     if not ignore_size_limits and (orig_w > max_size or orig_h > max_size):
@@ -4996,7 +5036,8 @@ def repair_degenerate_skeleton_bones(bone_trans_entries, reference_trans, root_n
 
 
 def build_armature_trans_entries(armatures_used, root_name, only_bones=None,
-                                  skip_skeleton_bones=True, label="armature"):
+                                  skip_skeleton_bones=True, label="armature",
+                                  zero_rotation=False):
     """Builds top-level "Trans" directory entries for armature bones, matching how the
     glTFMilo CLI imports an armature (Program.cs, commit "Import armature..."): for each
     skin-joint bone it creates an RndTrans whose localXfm/worldXfm come from the bone's
@@ -5021,7 +5062,20 @@ def build_armature_trans_entries(armatures_used, root_name, only_bones=None,
     the hair path to emit exactly the physics bones referenced by hair strands, and
     nothing else). None means "all bones on the armature" (subject to the skeleton
     skip). Bone names are left raw/unsanitized to exactly match whatever the .hair
-    strands and boneTransforms reference."""
+    strands and boneTransforms reference.
+
+    `zero_rotation` (default False): write each bone's LOCAL rotation as identity,
+    keeping only its local translation, so worldXfm ends up as "the parent's world
+    rotation, offset by the bone's own translation" - i.e. no additional twist relative
+    to the parent. REQUIRED for hair/cloth physics bones: a real vanilla .hair-driven
+    Trans carries no rotation of its own - CharHair.cpp only ever reads each point's
+    position and the Y-translation-derived length (see write_char_hair's module
+    docstring), so copying Blender's actual bone rotation into these Trans entries
+    (correct and necessary for regular skinned-mesh bones, where rotation matters for
+    skinning) introduces a twist a real .hair bone never has. This was fixed once before
+    by zeroing rotation on exactly these bones; that fix isn't in this unified function,
+    which is presumably how it regressed when hair-bone export got folded into the same
+    code path as regular armature export."""
     entries = []
     seen_names = set()
     skipped_skeleton = 0
@@ -5048,6 +5102,16 @@ def build_armature_trans_entries(armatures_used, root_name, only_bones=None,
             else:
                 local_xfm_blender = world_xfm_blender
                 parent_obj = root_name
+
+            if zero_rotation:
+                # Keep the bone's local translation (its position/length relative to its
+                # parent), drop rotation/scale entirely - see this function's docstring.
+                from mathutils import Matrix
+                local_xfm_blender = Matrix.Translation(local_xfm_blender.to_translation())
+                if bone.parent is not None:
+                    world_xfm_blender = parent_world_blender @ local_xfm_blender
+                else:
+                    world_xfm_blender = local_xfm_blender
 
             entries.append((
                 bone.name,
@@ -5915,21 +5979,17 @@ def build_char_hair_entries(armatures_used, root_name):
                 # Hookup() only wires up collisions - it does NOT call SetRoot - so the
                 # STORED matrix is used directly and drives every strand's twist reference.
                 # Verified against a real vanilla RB3 .hair (female_hair_ladylayered):
-                # mBaseMat == that bone's Trans local rotation byte-for-byte. So compute the
-                # bone's PARENT-RELATIVE local matrix identically to build_armature_trans_entries
-                # and reuse _matrix_to_milo, so the row-vector transpose and parent basis match
-                # the Trans entry exactly. (The previous code used the ARMATURE-space
-                # matrix_local laid out row-major - no parent step, no transpose - producing a
-                # seed transposed and rotated relative to the bone, which twisted every strand
-                # in-game even though the position sim, which never reads this matrix, looked fine.)
-                world_xfm_blender = armature_obj.matrix_world @ root_bone.matrix_local
-                if root_bone.parent is not None:
-                    parent_world_blender = armature_obj.matrix_world @ root_bone.parent.matrix_local
-                    local_xfm_blender = parent_world_blender.inverted() @ world_xfm_blender
-                else:
-                    local_xfm_blender = world_xfm_blender
-                # first 9 of the 4x3 = the 3x3 rotation, already in Milo row-vector form
-                base_mat = _matrix_to_milo(local_xfm_blender)[:9]
+                # mBaseMat == that bone's Trans local rotation byte-for-byte.
+                #
+                # The root bone's Trans entry is now written with zero_rotation=True (see
+                # build_armature_trans_entries's docstring - hair-driven Trans bones carry
+                # no rotation of their own in a real .hair file), so its local rotation is
+                # always identity by construction. base_mat/root_mat must match that
+                # exactly, so it's just IDENTITY_MATRIX3 directly rather than recomputed
+                # from Blender's actual (rotated) bone matrix - reintroducing the real
+                # rotation here would silently disagree with the zeroed Trans entry and
+                # reproduce the exact twisting bug zero_rotation exists to fix.
+                base_mat = IDENTITY_MATRIX3
             else:
                 base_mat = IDENTITY_MATRIX3
 
@@ -7302,7 +7362,8 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                          f"entries so the .hair file has bones to drive.")
                     hair_bone_entries = build_armature_trans_entries(
                         armatures_used, root_name, only_bones=hair_bones_to_emit,
-                        skip_skeleton_bones=skip_shared, label="hair bones")
+                        skip_skeleton_bones=skip_shared, label="hair bones",
+                        zero_rotation=True)
                     for entry in hair_bone_entries:
                         _log(f"  Bone '{entry[0]}' -> parent '{entry[3]}'")
                     bone_trans_entries = bone_trans_entries + hair_bone_entries
