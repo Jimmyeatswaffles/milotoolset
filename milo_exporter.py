@@ -1,8 +1,8 @@
 bl_info = {
-    "name": "Milo Scene Exporter",
+    "name": "Milo Toolset",
     "author": "jimmyeatwaffles",
-    "version": (0, 2, 0),
-    "blender": (5, 0, 0),
+    "version": (0, 8, 5),
+    "blender": (5, 2, 0),
     "location": "File > Export > Milo Scene (.milo)",
     "description": "3D model expoter for Harmonix games using the milo archive format. Based on the gltfmilo CLI program by ihatecompvir.",
     "category": "Import-Export",
