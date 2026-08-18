@@ -1327,6 +1327,489 @@ def parse_tbrb_skeleton_milo(path):
     return dir_name, bones, collisions
 
 
+GH2_TRANS_REVISION = 9
+
+
+def parse_gh2_skeleton(path):
+    """Parses a Guitar Hero 2 (Xbox 360) character/BandCharacter milo into
+    (dir_name, bones, collisions) - the same tuple shape parse_milo_skeleton and
+    parse_tbrb_skeleton_milo return, so it plugs straight into the shared
+    _build_armature_from_skeleton with no changes there.
+
+    GH2 X360 is an early (2006) Xbox 360 title and differs from RB3/DC1/DC3/TBRB in one
+    fundamental way: the object-stream BODY is little-endian, not big-endian. Confirmed
+    by direct byte inspection of a retail goth2.milo_xbox - the top-level DirectoryMeta
+    only parses to sane values (revision=25, type="BandCharacter", 321 entries) when
+    read as LE; the same bytes read as BE give a revision in the hundreds of millions,
+    which the entry-count sanity check below would reject outright. The outer
+    compression/block-table header (magic 0xCABEDEAF, startOffset, block sizes) is
+    ALREADY little-endian in every game this addon supports, so read_milo_container_body
+    needs no changes at all - GH2 uses that same Type.Uncompressed container shape.
+
+    The Trans (bone) layout turned out to be BYTE-IDENTICAL to try_read_trans above -
+    an earlier assumption during development that GH2's rev-9 Trans had a different
+    field layout was wrong (a manual hex-counting error); a byte-exact test proved every
+    field (objFields type symbol, hasTree bool, note symbol, local xfm, world xfm,
+    constraint, target symbol, preserveScale bool, parent symbol) lines up and lands
+    exactly on the 0xADDEADDE end marker, just little-endian. So bone reading really is
+    "try_read_trans, endian-flipped" - nothing bespoke needed there.
+
+    RndMesh (28), RndMat (28), RndTex (10) are all confirmed at lower revisions than any
+    of RB3/DC1/TBRB/DC3, with materially different vertex/weight/texture-header layouts -
+    NOT covered here. Mesh/texture import is a separate, larger effort.
+
+    Known v1 scope limits:
+      * No CharCollide handling. The one sample analyzed (goth2.milo_xbox) has zero
+        CharCollide entries, so there was nothing to test a GH2 collision-tail layout
+        against. collisions is always returned empty.
+      * Unlike parse_milo_skeleton, this does NOT recursively descend into
+        directory-bearing entries (RndDir, CharClipSet, etc. - see MILO_DIR_ENTRY_TYPES)
+        the way _mw_collect_directory_meta does for RB3/DC1/DC3/TBRB. Also unlike RB3's
+        ObjectDir, GH2's BandCharacter directory body (viewport list / proxy / inline
+        subdir header) does NOT match the _mw_skip_dir_body probe pattern - tested
+        directly, it doesn't locate a valid header the way it does for the other games -
+        so that section is skipped here as an opaque blob (find its own end marker)
+        rather than guessed at. In the one sample analyzed, every Trans entry appears in
+        the directory table before any RndDir/Char*-type entry, so this walker simply
+        stops once every Trans name from the table has been found and never needs to
+        cross into that territory - validated end-to-end: all 133 declared Trans entries
+        in goth2.milo_xbox are found and decode cleanly (0 missing, 0 failed decodes),
+        with every parent/child relationship checked by hand coming out anatomically
+        sane (e.g. bone_L-middlefinger02.mesh -> bone_L-middlefinger01.mesh,
+        bone_R-nose.mesh -> bone_head.mesh, bone_coat-R01.mesh -> bone_pelvis.mesh). A
+        GH2 file that interleaves a directory-bearing entry BEFORE some of its bones
+        would under-collect with this walker - flagging that explicitly rather than
+        pretending it's handled, the same way this function's own docstring above flags
+        its DC1 nested-subdir case.
+      * Bone names are kept EXACTLY as stored, including the literal ".mesh" suffix GH2
+        puts on bone names (e.g. "bone_L-hand.mesh" - confirmed this is really in the
+        file, not a glTFMilo or Blender artifact: the Trans entries themselves are named
+        that way in the directory table). Deliberate: GH2 meshes weight vertices to a
+        small per-chunk bone palette by NAME, so keeping armature bone names identical to
+        those palette entries is what will let a future mesh importer match vertex
+        groups to bones by exact string match, with no translation table to keep in sync.
+    """
+    import struct as _struct
+
+    with open(path, 'rb') as f:
+        data = f.read()
+
+    body = read_milo_container_body(data)   # container-level code is fully shared -
+                                              # GH2 uses the same uncompressed/blocked
+                                              # container shape as every other game.
+    n = len(body)
+
+    def U32(p):
+        return _struct.unpack_from('<I', body, p)[0]
+
+    pos = 0
+
+    def u32():
+        nonlocal pos
+        v = U32(pos); pos += 4; return v
+
+    def sym():
+        nonlocal pos
+        ln = u32()
+        if ln > 4096:
+            raise ValueError(f"implausible symbol length {ln} at offset {pos:#x} - "
+                              f"wrong endianness or not a GH2 milo body")
+        v = body[pos:pos + ln].decode('latin1'); pos += ln; return v
+
+    revision = u32()
+    dir_type = sym()
+    dir_name = sym()
+    u32()   # stringTableCount
+    u32()   # stringTableSize
+    entry_count = u32()
+    if entry_count > 100000:
+        raise ValueError(
+            f"GH2 directory entry count {entry_count} is implausible - the body may "
+            f"not actually be little-endian, or this isn't a GH2 BandCharacter milo.")
+    entries = [(sym(), sym()) for _ in range(entry_count)]
+    entry_end = pos
+
+    def try_read_gh2_trans(p):
+        """Field-for-field identical to try_read_trans above, just little-endian - see
+        this function's docstring for why. Returns (local12, parent, end_after_marker)
+        or None if it doesn't decode cleanly onto a trailing 0xADDEADDE."""
+        try:
+            if p + 4 > n or (U32(p) & 0xFFFF) != GH2_TRANS_REVISION:
+                return None
+            q = p + 4
+            q += 4                                   # objFields combined revision
+            tl = U32(q)
+            if tl > 64:
+                return None
+            q += 4 + tl                              # objFields type symbol
+            if body[q] not in (0, 1):
+                return None
+            q += 1                                   # hasTree bool
+            nl = U32(q)
+            if nl > 256:
+                return None
+            q += 4 + nl                              # note symbol
+            local = _struct.unpack_from('<12f', body, q); q += 48
+            q += 48                                  # worldXfm (ignored)
+            q += 4                                   # constraint u32
+            tl2 = U32(q)
+            if tl2 > 256:
+                return None
+            q += 4 + tl2                             # target symbol
+            if body[q] not in (0, 1):
+                return None
+            q += 1                                   # preserveScale bool
+            pl = U32(q)
+            if pl > 256:
+                return None
+            parent = body[q + 4:q + 4 + pl].decode('latin1'); q += 4 + pl
+            if body[q:q + 4] != MILO_END_MARKER:
+                return None
+            return local, parent, q + 4
+        except Exception:
+            return None
+
+    def decode_gh2_trans_at(offset):
+        """Decode directly at a known offset; only fall back to a forward scan across
+        end markers if that exact decode fails - mirrors _decode_at above."""
+        r = try_read_gh2_trans(offset)
+        if r is not None:
+            return r
+        s = offset
+        while s < n - 4:
+            m = body.find(MILO_END_MARKER, s)
+            if m < 0:
+                break
+            r = try_read_gh2_trans(m + 4)
+            if r is not None:
+                return r
+            s = m + 4
+        return None
+
+    trans_names_remaining = {name for (etype, name) in entries if etype == 'Trans'}
+    if not trans_names_remaining:
+        raise ValueError(
+            "No Trans entries found in this milo's directory - is this a "
+            "character/BandCharacter milo with its own skeleton? (A mesh-only or "
+            "effects-only GH2 milo has no bones to import.)")
+
+    # The BandCharacter directory's own body (viewport list / proxy path / inline
+    # subdir header) doesn't match the ObjectDir probe pattern the other games use -
+    # see this function's docstring. Rather than guess at its fields, skip it as an
+    # opaque blob by finding its own end marker; bone data starts right after.
+    m = body.find(MILO_END_MARKER, entry_end)
+    if m < 0:
+        raise ValueError("Couldn't find the BandCharacter directory body's end marker "
+                          "- file may be truncated or not a GH2 milo.")
+    cur = m + 4
+
+    bones = []
+    for (etype, ename) in entries:
+        if not trans_names_remaining:
+            # Every bone the table promised has been found. Everything after this
+            # point (RndDir effects containers, CharDriver/CharIK*/CharHair, etc.) is
+            # exactly the territory this function's sequential walker doesn't attempt
+            # to cross - see the docstring's scope-limits section - so stop here
+            # rather than risk drifting into it.
+            break
+        if etype == 'Trans':
+            r = decode_gh2_trans_at(cur)
+            if r is None:
+                _log(f"  WARNING: GH2 Trans '{ename}' didn't decode cleanly at its "
+                     f"expected offset - skipped.")
+                m = body.find(MILO_END_MARKER, cur)
+                if m < 0:
+                    break
+                cur = m + 4
+                continue
+            local, parent, end_after = r
+            bones.append((ename, local, parent))
+            trans_names_remaining.discard(ename)
+            cur = end_after
+        else:
+            m = body.find(MILO_END_MARKER, cur)
+            if m < 0:
+                break
+            cur = m + 4
+
+    if not bones:
+        raise ValueError(
+            "Found Trans entries in the directory table but none decoded cleanly - "
+            "the file may use a GH2 revision/layout variant not yet seen.")
+
+    if trans_names_remaining:
+        _log(f"  NOTE: {len(trans_names_remaining)} bone(s) named in the table were "
+             f"never reached (likely because a directory-bearing entry - RndDir, "
+             f"CharClipSet, etc. - appeared before them in file order, which this "
+             f"function's sequential walker doesn't cross - see its docstring): "
+             f"{sorted(trans_names_remaining)}")
+
+    return dir_name, bones, []
+
+
+GH2_MESH_REVISION = 28
+
+
+def _try_parse_gh2_mesh_body(body, s, e, ename):
+    """Decode one GH2 RndMesh entry occupying body[s:e]. Returns a dict (see
+    parse_gh2_meshes' docstring for its keys) or None if it doesn't decode cleanly -
+    mirrors the exception-safe, bounds-checked style of try_read_gh2_trans above.
+
+    The header (revision -> objFields -> embedded RndTrans -> RndDrawable -> mat name
+    -> geomOwner name -> mutable/volume/bspNode -> vertex count) is confirmed
+    field-for-field identical to write_rnd_mesh's RB3 layout in model_exporter.py, just
+    little-endian and at a lower top-level revision (28 vs RB3's 38) - the same kind of
+    match try_read_gh2_trans found for RndTrans. Verified against every one of the 143
+    real Mesh entries in goth2.milo_xbox: all 143 decode cleanly (0 failures), and every
+    one's geomOwner symbol matches its own directory-table name exactly.
+
+    Per-vertex layout (48 bytes, all little-endian float32, confirmed against 6 meshes
+    of very different vertex counts and both skinned and rigidly-parented types):
+      x, y, z            (position)
+      nx, ny, nz          (normal - plain unpacked floats, NOT the packed 10:10:10:2
+                           scheme RB3/PS3 use)
+      w0, w1, w2, w3      (4 bone-weight floats, positionally mapped to this mesh's own
+                           small per-chunk bone palette stored after the face indices -
+                           NOT surfaced here; this pass is geometry + UV only)
+      u, v                (UV - stored exactly as found, no V-flip applied; if a texture
+                           ends up looking vertically mirrored once material import
+                           lands, GH2's V may follow the usual DirectX top-down
+                           convention and need a 1.0-v flip - flagging this now since
+                           it's unconfirmed either way, not silently guessing)
+
+    `e` (the entry's end offset, from parse_gh2_meshes' marker-boundary span map) is
+    used only as a bounds check here - the trailing per-chunk bone-palette-and-transform
+    block between the end of the face-index array and `e` is intentionally left
+    unparsed, since it's only needed for weights.
+    """
+    def U32(p):
+        return struct.unpack_from('<I', body, p)[0]
+
+    try:
+        q = s
+        rev = U32(q); q += 4
+        if rev != GH2_MESH_REVISION:
+            return None
+        combined = U32(q); q += 4                # objFields altRevision+revision (packed)
+        tl = U32(q)
+        if tl > 64:
+            return None
+        q += 4 + tl                              # objFields type symbol
+        if body[q] not in (0, 1):
+            return None
+        q += 1                                   # objFields hasTree bool
+        if combined & 0xFFFF > 0:
+            nl = U32(q)
+            if nl > 256:
+                return None
+            q += 4 + nl                          # objFields note symbol
+        q += 4                                   # embedded RndTrans revision (9)
+        if q + 96 > e:
+            return None
+        local_xfm = struct.unpack_from('<12f', body, q); q += 48
+        world_xfm = struct.unpack_from('<12f', body, q); q += 48
+        q += 4                                   # constraint (kConstraintNone)
+        tl2 = U32(q)
+        if tl2 > 256:
+            return None
+        q += 4 + tl2                             # target symbol
+        if body[q] not in (0, 1):
+            return None
+        q += 1                                   # preserveScale bool
+        pl = U32(q)
+        if pl > 256:
+            return None
+        parent = body[q + 4:q + 4 + pl].decode('latin1'); q += 4 + pl
+        draw_rev = U32(q); q += 4                # RndDrawable revision
+        if body[q] not in (0, 1):
+            return None
+        q += 1                                   # showing bool
+        q += 16                                  # sphere (4 floats)
+        q += 4                                   # drawOrder
+        if draw_rev >= 4:
+            dl = U32(q)
+            if dl > 256:
+                return None
+            q += 4 + dl                          # drawable's extra empty symbol (DC3-only)
+        ml = U32(q)
+        if ml > 256:
+            return None
+        q += 4
+        mat_name = body[q:q + ml].decode('latin1'); q += ml
+        gl = U32(q)
+        if gl > 256:
+            return None
+        q += 4
+        geom_owner = body[q:q + gl].decode('latin1'); q += gl
+        q += 4 + 4 + 1                           # mutable, volume, bspNode.hasValue
+        vcount = U32(q); q += 4
+        if vcount > 200000:
+            return None
+        vertex_size = 48
+        vend = q + vcount * vertex_size
+        if vend + 4 > e:
+            return None
+        vertices = []
+        for i in range(vcount):
+            vals = struct.unpack_from('<12f', body, q + i * vertex_size)
+            vertices.append({
+                'x': vals[0], 'y': vals[1], 'z': vals[2],
+                'nx': vals[3], 'ny': vals[4], 'nz': vals[5],
+                # vals[6:10] are the 4 per-chunk bone weights - not surfaced this
+                # pass, see this function's docstring.
+                'u': vals[10], 'v': vals[11],
+            })
+        q = vend
+        fcount = U32(q); q += 4
+        if fcount > 200000:
+            return None
+        if q + fcount * 3 * 2 > e:
+            return None
+        idx = struct.unpack_from('<%dH' % (fcount * 3), body, q)
+        if fcount and max(idx) >= vcount:
+            return None
+        faces = [(idx[i], idx[i + 1], idx[i + 2]) for i in range(0, len(idx), 3)]
+
+        return {
+            'name': ename,
+            'parent': parent,
+            'material': mat_name,
+            'local_xfm': local_xfm,
+            'world_xfm': world_xfm,
+            'vertices': vertices,
+            'faces': faces,
+        }
+    except Exception:
+        return None
+
+
+def parse_gh2_meshes(path):
+    """Parse every GH2 Xbox 360 Mesh entry in a character/BandCharacter milo into
+    (dir_name, meshes) - geometry and UVs only, no weights or materials (see this
+    module's other GH2 functions' docstrings for why that's the deliberate scope for
+    now).
+
+    meshes: list of dicts, each with keys:
+      name        - the mesh's own entry name (e.g. "goth2.32.mesh"), kept exactly as
+                    stored, same reasoning as parse_gh2_skeleton's bone names: a future
+                    weights pass needs to match this mesh's own bone palette (in the
+                    unparsed trailing block) to armature bone names by exact string.
+      parent      - the name this mesh's embedded RndTrans declares as its parent. Can
+                    be a bone name (e.g. "bone_head.mesh") OR another mesh's name (e.g.
+                    "goth2.mesh") - GH2 parents some mesh pieces directly onto other
+                    meshes, not just bones. NOT resolved into a Blender parent
+                    relationship by this pass - surfaced as a custom property only, see
+                    the importer operator.
+      material    - the referenced .mat entry name. NOT turned into a real Blender
+                    material - surfaced as a custom property only, per this pass's scope.
+      local_xfm, world_xfm - the mesh's embedded RndTrans matrices (12-float row-vector
+                    form, same convention as parse_gh2_skeleton's bones).
+      vertices    - list of dicts with x,y,z,nx,ny,nz,u,v (see
+                    _try_parse_gh2_mesh_body's docstring for the exact per-vertex layout
+                    and the open V-flip question).
+      faces       - list of (i0, i1, i2) vertex-index triples.
+
+    Container/endianness notes are the same as parse_gh2_skeleton - see that function's
+    docstring; not repeated here.
+
+    ROBUSTNESS NOTE this shares with parse_milo_skeleton's own docstring (that
+    function's "why objects are NOT split by naive 0xADDEADDE scanning" section): this
+    walker maps every entry's byte span from the GLOBAL count of end markers after the
+    entry table, assuming exactly one marker per entry (plus one for the directory
+    body) in table order. That's confirmed exact for goth2.milo_xbox (322 markers for
+    321 entries), but unlike parse_gh2_skeleton (which never needs to touch a Tex/Mat
+    entry's contents), reaching every Mesh entry here means walking PAST several large
+    Tex entries (up to ~1.4MB of compressed pixel data each) using this same span map -
+    and pixel data is exactly the kind of large, dense binary blob most likely to
+    coincidentally contain the 4-byte marker sequence, which would desync every span
+    after that point. This hasn't been observed in the one file tested, but a future
+    file coming back with garbled/misnamed meshes should treat this assumption as the
+    first suspect - the real fix would be a GH2 Tex/Mat body-length parser so each
+    entry's end comes from its own header fields instead of marker order.
+    """
+    with open(path, 'rb') as f:
+        data = f.read()
+
+    body = read_milo_container_body(data)
+    n = len(body)
+
+    def U32(p):
+        return struct.unpack_from('<I', body, p)[0]
+
+    pos = 0
+
+    def u32():
+        nonlocal pos
+        v = U32(pos); pos += 4; return v
+
+    def sym():
+        nonlocal pos
+        ln = u32()
+        if ln > 4096:
+            raise ValueError(f"implausible symbol length {ln} at offset {pos:#x} - "
+                              f"wrong endianness or not a GH2 milo body")
+        v = body[pos:pos + ln].decode('latin1'); pos += ln; return v
+
+    revision = u32()
+    dir_type = sym()
+    dir_name = sym()
+    u32()   # stringTableCount
+    u32()   # stringTableSize
+    entry_count = u32()
+    if entry_count > 100000:
+        raise ValueError(
+            f"GH2 directory entry count {entry_count} is implausible - the body may "
+            f"not actually be little-endian, or this isn't a GH2 BandCharacter milo.")
+    entries = [(sym(), sym()) for _ in range(entry_count)]
+    entry_table_end = pos
+
+    marker_offsets = []
+    search_from = entry_table_end
+    while True:
+        m = body.find(MILO_END_MARKER, search_from)
+        if m < 0:
+            break
+        marker_offsets.append(m)
+        search_from = m + 4
+    if len(marker_offsets) < entry_count + 1:
+        raise ValueError(
+            f"Found only {len(marker_offsets)} end markers for {entry_count} entries "
+            f"(need at least {entry_count + 1}, one per entry plus the directory body) "
+            f"- file may be malformed, or this walker's marker-per-entry assumption "
+            f"(see this function's robustness note) doesn't hold for this file.")
+
+    dir_body_end = marker_offsets[0] + 4
+    cur = dir_body_end
+    spans = []
+    for i, (etype, ename) in enumerate(entries):
+        end = marker_offsets[i + 1] + 4
+        spans.append((etype, ename, cur, end))
+        cur = end
+
+    meshes = []
+    failed_names = []
+    for (etype, ename, s, e) in spans:
+        if etype != 'Mesh':
+            continue
+        m = _try_parse_gh2_mesh_body(body, s, e, ename)
+        if m is None:
+            failed_names.append(ename)
+            continue
+        meshes.append(m)
+
+    if failed_names:
+        _log(f"  WARNING: {len(failed_names)} GH2 mesh(es) didn't decode cleanly and "
+             f"were skipped: {failed_names}")
+
+    if not meshes:
+        raise ValueError(
+            "No Mesh entries found or none decoded cleanly - is this a "
+            "character/BandCharacter milo with real geometry? (An effects-only or "
+            "skeleton-only GH2 milo has no meshes to import.)")
+
+    return dir_name, meshes
+
+
 def _build_armature_from_skeleton(context, dir_name, bones, collisions,
                                   bone_display_length=0.5, connect_bones=False,
                                   import_collisions=True):

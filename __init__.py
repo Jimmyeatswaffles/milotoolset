@@ -2831,6 +2831,200 @@ class IMPORT_OT_dc3_skeleton(_IMPORT_OT_milo_skeleton_base):
     )
 
 
+class IMPORT_OT_gh2_skeleton(bpy.types.Operator, ImportHelper):
+    """Import a Guitar Hero 2 (Xbox 360) skeleton/character milo as a Blender armature.
+
+    GH2 X360's object-stream body is little-endian (unlike RB3/DC1/DC3/TBRB, which are
+    all big-endian) so it needs its own reader - parse_gh2_skeleton in io.py - but the
+    Trans (bone) layout itself turned out to be byte-identical to the other four games',
+    just endian-flipped, and both feed the exact same _build_armature_from_skeleton.
+
+    A standalone operator rather than a subclass of _IMPORT_OT_milo_skeleton_base:
+    that base's execute() hardcodes a call to parse_milo_skeleton (the RB3/DC1/DC3
+    reader), so sharing it would mean either modifying that already-relied-on class or
+    adding a branch to it for a format it was never written against. Duplicating its
+    ~30 lines of glue here keeps the existing importers untouched. If more early-
+    Xbox-360-era games end up sharing GH2's reader later, that's the point to
+    reconsider factoring out a common base with a pluggable parser function.
+
+    No mesh/texture import yet - GH2's RndMesh/RndMat/RndTex are all lower, differently-
+    laid-out revisions than RB3/DC1/TBRB and need their own (larger) effort. Skeleton
+    only, for now.
+    """
+    bl_idname = "import_scene.gh2_skeleton"
+    bl_label = "Import GH2 Skeleton Milo"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(
+        default="*.milo_xbox",
+        options={'HIDDEN'},
+    )
+
+    bone_display_length: FloatProperty(
+        name="Bone Display Length",
+        description="Length given to bones that have no child to point at. Purely "
+                     "cosmetic - Milo bones are transforms, so only the head position "
+                     "and orientation are exported. Does NOT affect exported data",
+        default=0.5, min=0.01, max=20.0,
+    )
+
+    connect_bones: BoolProperty(
+        name="Auto-Connect Bones",
+        description="Snap each bone's tail to its single child's head. Leave OFF unless "
+                     "you want prettier viewport display: connecting bones makes Blender "
+                     "move a child's head whenever the parent's tail moves, which is "
+                     "exactly how a faithful rest pose gets silently corrupted during "
+                     "editing",
+        default=False,
+    )
+
+    import_collisions: BoolProperty(
+        name="Import Collision Volumes",
+        description="No-op for GH2 right now - the one retail file this reader was "
+                     "developed against (goth2.milo_xbox) has zero CharCollide entries, "
+                     "so there's nothing yet to decode. Left here for UI consistency "
+                     "with the other importers and so it's one flag away from working "
+                     "once a GH2 CharCollide layout is confirmed against a file that "
+                     "actually has one",
+        default=True,
+    )
+
+    def execute(self, context):
+        try:
+            dir_name, bones, collisions = parse_gh2_skeleton(self.filepath)
+        except Exception as e:
+            _log(f"IMPORT FAILED: {e}")
+            self.report({'ERROR'}, f"Could not parse GH2 milo: {e}")
+            return {'CANCELLED'}
+
+        if not bones:
+            self.report({'ERROR'},
+                        "No Trans bones found - is this a skeleton/character milo with a "
+                        "shared armature? (A mesh-only milo has no bones to import.)")
+            return {'CANCELLED'}
+
+        _log(f"===== Importing GH2 skeleton '{dir_name}' from {self.filepath} =====")
+        _log(f"  {len(bones)} bone(s), {len(collisions)} collision volume(s)")
+
+        try:
+            _arm, applied = _build_armature_from_skeleton(
+                context, dir_name, bones, collisions,
+                bone_display_length=self.bone_display_length,
+                connect_bones=self.connect_bones,
+                import_collisions=self.import_collisions)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        summary = (f"Imported GH2 skeleton '{dir_name}': {len(bones)} bone(s), "
+                   f"{applied} collision volume(s) applied")
+        _log(f"===== SUCCESS: {summary} =====")
+        self.report({'INFO'}, summary)
+        return {'FINISHED'}
+
+
+def _build_gh2_mesh_object(mesh_dict, collection):
+    """Build one Blender mesh object from a parse_gh2_meshes() entry: geometry + UV
+    only, matching that function's deliberate scope (no weights, no real materials -
+    see its docstring).
+
+    Positioning: uses the mesh's own embedded world_xfm as the object's matrix_world,
+    with vertex positions left completely raw (no coordinate-axis conversion, same as
+    _build_armature_from_skeleton applies none either - meshes and the armature need to
+    stay in the same convention as each other, not necessarily "true" Z-up).
+
+    This choice isn't fully cross-checked against a reference render yet: of the meshes
+    inspected during development, local_xfm came out identity for the large per-bone-
+    group body chunks but a real non-identity offset for at least one rigidly-parented
+    standalone piece (an eye), which reads as the standard "vertices in the mesh's own
+    local space, world_xfm the one placement transform to apply" model - and is why
+    world_xfm (not local_xfm, and no parent-chain walk through the `parent` field) is
+    what's applied here. If meshes come in offset or misrotated relative to the
+    imported armature, this is the first place to revisit.
+
+    `material` and `parent` (which can name either a bone or another mesh - see
+    parse_gh2_meshes' docstring) are stashed as custom properties only; nothing here
+    creates a Blender material or reparents anything.
+    """
+    verts_in = mesh_dict['vertices']
+    verts = [(v['x'], v['y'], v['z']) for v in verts_in]
+    faces = mesh_dict['faces']
+
+    me = bpy.data.meshes.new(mesh_dict['name'])
+    me.from_pydata(verts, [], faces)
+    me.update()
+
+    uv_layer = me.uv_layers.new(name="UVMap")
+    for loop in me.loops:
+        v = verts_in[loop.vertex_index]
+        # Stored exactly as found in the file - no V-flip applied. If a texture ends
+        # up vertically mirrored once material import lands, GH2 may follow the usual
+        # DirectX top-down V convention and need this to become (v['u'], 1.0 - v['v'])
+        # - flagging now since it's unconfirmed either way.
+        uv_layer.data[loop.index].uv = (v['u'], v['v'])
+
+    obj = bpy.data.objects.new(mesh_dict['name'], me)
+    collection.objects.link(obj)
+    obj.matrix_world = _milo_to_blender_matrix(mesh_dict['world_xfm'])
+    obj['gh2_material'] = mesh_dict['material']
+    obj['gh2_parent'] = mesh_dict['parent']
+    return obj
+
+
+class IMPORT_OT_gh2_meshes(bpy.types.Operator, ImportHelper):
+    """Import every mesh in a Guitar Hero 2 (Xbox 360) character milo as separate
+    Blender mesh objects - geometry and UVs only, no weights or materials yet (see
+    parse_gh2_meshes' docstring in io.py for why that's the deliberate scope of this
+    first pass). Each of the file's Mesh entries becomes its own object, matching how
+    GH2 actually splits a character into many small per-bone-group chunks rather than
+    one skinned mesh - the same structure the eventual weights pass will need to key
+    off of, so keeping that 1-object-per-entry shape now avoids a re-import later.
+
+    A standalone operator, not layered onto IMPORT_OT_gh2_skeleton, so mesh-only or
+    skeleton-only imports both stay simple single-purpose actions - matching how this
+    addon generally keeps import/export concerns as separate operators rather than one
+    operator with a "what to import" toggle pile.
+    """
+    bl_idname = "import_scene.gh2_meshes"
+    bl_label = "Import GH2 Meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(
+        default="*.milo_xbox",
+        options={'HIDDEN'},
+    )
+
+    def execute(self, context):
+        try:
+            dir_name, meshes = parse_gh2_meshes(self.filepath)
+        except Exception as e:
+            _log(f"IMPORT FAILED: {e}")
+            self.report({'ERROR'}, f"Could not parse GH2 milo: {e}")
+            return {'CANCELLED'}
+
+        _log(f"===== Importing {len(meshes)} GH2 mesh(es) from {self.filepath} =====")
+
+        collection = bpy.data.collections.new(dir_name)
+        context.scene.collection.children.link(collection)
+
+        imported = 0
+        for m in meshes:
+            try:
+                _build_gh2_mesh_object(m, collection)
+                imported += 1
+            except Exception as ex:
+                _log(f"  WARNING: failed to build Blender object for mesh "
+                     f"'{m['name']}': {ex}")
+
+        summary = (f"Imported {imported}/{len(meshes)} GH2 mesh(es) into collection "
+                   f"'{dir_name}'")
+        _log(f"===== SUCCESS: {summary} =====")
+        self.report({'INFO'}, summary)
+        return {'FINISHED'}
+
+
 class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
     """File > Import > Milo Skeleton Importer submenu grouping every game's skeleton
     importer in one place instead of scattering four entries across the Import menu."""
@@ -2851,11 +3045,20 @@ class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_dc3_skeleton.bl_idname,
                         text="Dance Central 3 (.milo_xbox)",
                         icon_value=_milo_icon_id('DC3'))
+        layout.operator(IMPORT_OT_gh2_skeleton.bl_idname,
+                        text="Guitar Hero 2 (.milo_xbox)",
+                        icon_value=_milo_icon_id('GH2'))
 
 
 def menu_func_import(self, context):
     self.layout.menu(TOPBAR_MT_milo_skeleton_import.bl_idname,
                       icon_value=_milo_icon_id('MILO_EXPORT'))
+    # Not nested inside the skeleton submenu above - this imports meshes, not a
+    # skeleton, and there's only one game's mesh importer so far, so a second
+    # submenu would be premature. Revisit if more games get mesh import later.
+    self.layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
+                          text="Guitar Hero 2 Meshes (.milo_xbox)",
+                          icon_value=_milo_icon_id('GH2'))
 
 
 classes = (
@@ -2879,6 +3082,8 @@ classes = (
     IMPORT_OT_rb3_skeleton,
     IMPORT_OT_dc1_skeleton,
     IMPORT_OT_dc3_skeleton,
+    IMPORT_OT_gh2_skeleton,
+    IMPORT_OT_gh2_meshes,
     TOPBAR_MT_milo_skeleton_import,
 )
 
