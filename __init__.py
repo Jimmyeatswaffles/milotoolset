@@ -33,6 +33,7 @@ from .texture_exporter import *
 from .skeleton_exporter import *
 from .model_exporter import *
 from .viseme_importer import *
+from .lipsync_importer import *
 
 # `import *` skips names starting with underscore, so anything private that this file
 # calls directly (rather than through a public wrapper) has to be imported explicitly.
@@ -3490,6 +3491,11 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
                           text="Rock Band 3 Viseme Set (.milo_xbox)",
                           icon_value=_milo_icon_id('RB3'))
+    # Depends on the viseme set above having been imported first - a .lipsync file
+    # carries only weights, no pose data - so it sits directly beneath it.
+    self.layout.operator(IMPORT_OT_rb3_lipsync.bl_idname,
+                          text="Rock Band Lipsync (.lipsync)",
+                          icon_value=_milo_icon_id('RB3'))
 
 
 classes = (
@@ -3516,6 +3522,9 @@ classes = (
     IMPORT_OT_gh2_skeleton,
     IMPORT_OT_gh2_meshes,
     IMPORT_OT_rb3_viseme_set,
+    IMPORT_OT_rb3_lipsync,
+    POSE_OT_bake_lipsync_preview,
+    VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
 )
 
@@ -3531,9 +3540,15 @@ def register():
     _register_coll_draw_handler()
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
+    # Baking is a required step after importing a .lipsync, so it needs a home in both
+    # Object and Pose mode menus rather than living only in F3 search.
+    bpy.types.VIEW3D_MT_object.append(menu_func_lipsync)
+    bpy.types.VIEW3D_MT_pose.append(menu_func_lipsync)
 
 
 def unregister():
+    bpy.types.VIEW3D_MT_pose.remove(menu_func_lipsync)
+    bpy.types.VIEW3D_MT_object.remove(menu_func_lipsync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     _unregister_coll_draw_handler()
