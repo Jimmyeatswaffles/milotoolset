@@ -32,11 +32,12 @@ from .physics_exporter import *
 from .texture_exporter import *
 from .skeleton_exporter import *
 from .model_exporter import *
+from .viseme_importer import *
 
 # `import *` skips names starting with underscore, so anything private that this file
 # calls directly (rather than through a public wrapper) has to be imported explicitly.
 from .utilities import _log, _resolve_stock_reference_armature
-from .io import _build_armature_from_skeleton
+from .io import _build_armature_from_skeleton, _milo_to_blender_matrix
 from .physics_exporter import _hair_bone_names, hair_profile_for_game
 from .skeleton_exporter import _read_skeleton_milo_trans, _trans_world_translation
 
@@ -2924,15 +2925,160 @@ class IMPORT_OT_gh2_skeleton(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 
-def _build_gh2_mesh_object(mesh_dict, collection):
-    """Build one Blender mesh object from a parse_gh2_meshes() entry: geometry + UV
-    only, matching that function's deliberate scope (no weights, no real materials -
-    see its docstring).
+def _gh2_mesh_family(name):
+    """Group a GH2 mesh entry name into the "family" of pieces it belongs to, based on
+    the file's own naming convention (confirmed against goth2.milo_xbox's 143 Mesh
+    entries): a root piece is named "{family}.mesh" and each additional chunk of that
+    same logical object is "{family}.N.mesh" (e.g. "goth2.mesh" + "goth2.32.mesh" +
+    "goth2.36.mesh" ... all belong to family "goth2"; "goth2_lod.mesh" +
+    "goth2_lod.3.mesh" ... belong to family "goth2_lod"; "shadow.mesh" +
+    "shadow.3.mesh" belong to family "shadow"). A name with no extra "." segment before
+    ".mesh" (e.g. "eye-R.mesh") is its own single-piece family.
 
-    Positioning: uses the mesh's own embedded world_xfm as the object's matrix_world,
-    with vertex positions left completely raw (no coordinate-axis conversion, same as
+    This is deliberately based on the name pattern, not the embedded parent field:
+    goth2.mesh, goth2_lod.mesh, and shadow.mesh are ALL parented directly to the
+    character root in the one file this was tested against, so parent alone can't
+    distinguish those three groups from each other - only the name can.
+    """
+    base = name[:-5] if name.endswith('.mesh') else name   # strip ".mesh"
+    return base.split('.', 1)[0]
+
+
+def _gh2_mesh_category(family, dir_name):
+    """Classify a family as 'shadow', 'lod', 'main' (the character's own full-quality
+    body - the family name matches the directory's own name, e.g. "goth2"), or 'other'
+    (hair, eyes, and anything else that isn't one of the three explicitly-requested
+    join targets - left as individual, unjoined objects).
+
+    Matched on the family string rather than the full per-piece name, and checked with
+    a substring test (not an exact "_lod"/"shadow" suffix match) to be a little more
+    forgiving of other GH2 characters' naming - only confirmed against goth2's own
+    "goth2_lod" / "shadow" families, though, so this is the first place to check if a
+    different character's LOD or shadow pieces don't get grouped as expected.
+    """
+    low = family.lower()
+    if 'shadow' in low:
+        return 'shadow'
+    if 'lod' in low:
+        return 'lod'
+    if family == dir_name:
+        return 'main'
+    return 'other'
+
+
+def _apply_gh2_shading(me, verts_in):
+    """Shade-smooth a just-built GH2 mesh using its own real per-vertex normals from
+    the file, rather than Blender's auto-computed smooth normals - the file's normals
+    are exact (GH2 authored them, including any deliberate hard edges), so re-deriving
+    them from face adjacency would be a step down in fidelity, not just a shortcut.
+
+    Blender 4.1 removed the old "Auto Smooth" angle-threshold toggle in favor of always
+    letting a mesh carry explicit custom split normals underneath a plain smooth-shaded
+    surface, which is what this does: flag every face smooth, then set one normal per
+    loop from this mesh's own vertex data. Wrapped in a try/except and falls back to
+    plain shade-smooth (Blender's own auto-computed normals) if that call doesn't exist
+    or behaves differently on whatever Blender version this actually runs on - this
+    addon's bl_info targets a specific version, but silently producing a flat-shaded
+    mesh instead of erroring out on an API mismatch is the safer failure mode here.
+    """
+    try:
+        me.polygons.foreach_set('use_smooth', [True] * len(me.polygons))
+    except Exception:
+        pass
+    try:
+        loop_normals = [
+            (verts_in[loop.vertex_index]['nx'],
+             verts_in[loop.vertex_index]['ny'],
+             verts_in[loop.vertex_index]['nz'])
+            for loop in me.loops
+        ]
+        me.normals_split_custom_set(loop_normals)
+    except Exception as ex:
+        _log(f"  NOTE: couldn't apply custom split normals to '{me.name}' ({ex}) - "
+             f"left it shade-smooth with Blender's own auto-computed normals instead.")
+
+
+def _apply_gh2_weights(obj, verts_in):
+    """Create and assign vertex groups from each vertex's already-resolved
+    parse_gh2_meshes() `weights` list (bone_name, weight) pairs - see
+    _try_parse_gh2_mesh_body's docstring in io.py for how those get resolved from the
+    mesh's own per-chunk bone palette. Returns the set of bone names actually used, so
+    the caller can check that set against a scene armature (see _find_valid_armature).
+
+    Empty input (a mesh with no palette - e.g. an eye, rigidly parented via its own
+    `parent` field instead - see parse_gh2_meshes' docstring) correctly yields an empty
+    set here; the caller falls back to the separate single-bone rigid-parent path for
+    those instead of expecting a real group from this function.
+    """
+    groups = {}
+    used_names = set()
+    for i, v in enumerate(verts_in):
+        for name, weight in v.get('weights', ()):
+            vg = groups.get(name)
+            if vg is None:
+                vg = obj.vertex_groups.new(name=name)
+                groups[name] = vg
+            vg.add([i], weight, 'REPLACE')
+            used_names.add(name)
+    return used_names
+
+
+def _apply_gh2_materials(me, mesh_dict, material_cache):
+    """Create/reuse a dummy Blender Material per distinct .mat this mesh references and
+    assign the right one to each face - no texture yet (see parse_gh2_meshes'
+    docstring), just a plain material carrying the real .mat name so a future texture
+    pass has the right material to attach an image to instead of one guessed anew.
+
+    This matters specifically because of the join step: a merged family (see
+    _merge_gh2_family) can legitimately span more than one .mat (the main body alone
+    uses at least "goth2_body.mat" and "goth2_head_skin.mat"), so every face needs its
+    OWN correct material_index rather than the whole merged object collapsing onto a
+    single material - that collapse is exactly the "weird material overlap" a later
+    texture import would otherwise bake in permanently. `mesh_dict['face_materials']`
+    (parallel to `mesh_dict['faces']`, populated by _merge_gh2_family for joined groups
+    and directly available as a single repeated name for an unjoined piece) is what
+    makes that per-face assignment possible.
+
+    `material_cache` is a dict the caller owns across the whole import so the same
+    .mat name reuses one Material instead of creating a duplicate per mesh piece;
+    reusing across separate import runs happens too, via bpy.data.materials.get().
+    """
+    face_materials = mesh_dict.get('face_materials')
+    if face_materials is None:
+        face_materials = [mesh_dict['material']] * len(mesh_dict['faces'])
+
+    slot_index = {}
+    for name in face_materials:
+        if name not in slot_index:
+            mat = material_cache.get(name)
+            if mat is None:
+                mat = bpy.data.materials.get(name)
+                if mat is None:
+                    mat = bpy.data.materials.new(name=name)
+                    mat.use_nodes = True
+                material_cache[name] = mat
+            slot_index[name] = len(me.materials)
+            me.materials.append(mat)
+
+    for poly, name in zip(me.polygons, face_materials):
+        poly.material_index = slot_index[name]
+
+
+def _build_gh2_mesh_object(mesh_dict, collection, material_cache, apply_world_xfm=True):
+    """Build one Blender mesh object from a parse_gh2_meshes()-shaped dict: geometry,
+    UV, shading, weights, and dummy per-.mat materials (no textures yet - see
+    parse_gh2_meshes' docstring for why that's the deliberate scope).
+
+    `apply_world_xfm`: True for a single, not-being-joined piece (positions the object
+    via its own embedded world_xfm as matrix_world). False for an already-merged group
+    from _merge_gh2_family (see that function) - the merge bakes every piece's
+    world_xfm directly into the vertex data itself, so the resulting object is left at
+    the identity transform and re-applying world_xfm here would double-transform it.
+
+    Positioning (for the apply_world_xfm=True / world_xfm-baked-in cases alike): no
+    coordinate-axis conversion is applied to vertex data, same as
     _build_armature_from_skeleton applies none either - meshes and the armature need to
-    stay in the same convention as each other, not necessarily "true" Z-up).
+    stay in the same convention as each other, not necessarily "true" Z-up.
 
     This choice isn't fully cross-checked against a reference render yet: of the meshes
     inspected during development, local_xfm came out identity for the large per-bone-
@@ -2940,12 +3086,13 @@ def _build_gh2_mesh_object(mesh_dict, collection):
     standalone piece (an eye), which reads as the standard "vertices in the mesh's own
     local space, world_xfm the one placement transform to apply" model - and is why
     world_xfm (not local_xfm, and no parent-chain walk through the `parent` field) is
-    what's applied here. If meshes come in offset or misrotated relative to the
+    what's applied/baked in. If meshes come in offset or misrotated relative to the
     imported armature, this is the first place to revisit.
 
-    `material` and `parent` (which can name either a bone or another mesh - see
-    parse_gh2_meshes' docstring) are stashed as custom properties only; nothing here
-    creates a Blender material or reparents anything.
+    Returns (obj, used_bone_names) - the caller (IMPORT_OT_gh2_meshes.execute) uses
+    used_bone_names to decide whether this object needs the general vertex-group-based
+    armature match (_find_valid_armature) or, if empty, falls back to the single-bone
+    rigid-parent path keyed on `parent` instead.
     """
     verts_in = mesh_dict['vertices']
     verts = [(v['x'], v['y'], v['z']) for v in verts_in]
@@ -2964,27 +3111,197 @@ def _build_gh2_mesh_object(mesh_dict, collection):
         # - flagging now since it's unconfirmed either way.
         uv_layer.data[loop.index].uv = (v['u'], v['v'])
 
+    _apply_gh2_shading(me, verts_in)
+    _apply_gh2_materials(me, mesh_dict, material_cache)
+
     obj = bpy.data.objects.new(mesh_dict['name'], me)
     collection.objects.link(obj)
-    obj.matrix_world = _milo_to_blender_matrix(mesh_dict['world_xfm'])
+    if apply_world_xfm:
+        obj.matrix_world = _milo_to_blender_matrix(mesh_dict['world_xfm'])
+    used_bones = _apply_gh2_weights(obj, verts_in)
     obj['gh2_material'] = mesh_dict['material']
     obj['gh2_parent'] = mesh_dict['parent']
-    return obj
+    return obj, used_bones
+
+
+def _merge_gh2_family(pieces, final_name):
+    """Combine several parse_gh2_meshes() piece-dicts into ONE, at the raw-data level,
+    before any Blender object exists for them - the data-level equivalent of selecting
+    a family's pieces and hitting Ctrl+J.
+
+    Why not just build each piece as its own object and call bpy.ops.object.join() on
+    them (which is what this addon's first pass at this did): that operator relies on
+    the calling context correctly reflecting which objects are "selected" and "active",
+    and that doesn't reliably hold when it's invoked from inside another operator's
+    execute() - especially an import operator invoked through the file browser via
+    ImportHelper rather than from a normal viewport interaction. That's almost
+    certainly why the first version silently produced ~140 separate objects instead of
+    a handful of joined ones instead of erroring outright. Merging the plain Python
+    vertex/face dicts here sidesteps the whole problem: there's no operator call, so
+    there's no context to get wrong. It also guarantees the custom split normals
+    _apply_gh2_shading sets survive the merge exactly - they're just concatenated
+    float data, never round-tripped through bpy.ops.object.join() or a bmesh
+    from_mesh/to_mesh pass that might not preserve them.
+
+    Each piece's own world_xfm is baked directly into its vertex positions and normals
+    here (rotation part only for normals, correct since these are confirmed rigid
+    transforms with no scale - see parse_gh2_skeleton's docstring on the matrix
+    convention), so the returned dict's vertices are all already in one shared final
+    space and the object built from it needs no further matrix_world beyond identity
+    (see _build_gh2_mesh_object's apply_world_xfm=False path). Each vertex's already-
+    resolved `weights` list (see io.py) carries over completely unchanged - bone names
+    are labels, not spatial data, so there's nothing to transform there.
+
+    `material` becomes a comma-joined list of every distinct .mat referenced, purely
+    for a human glancing at the object's custom properties. `face_materials` (parallel
+    to the returned `faces` list) is the one that actually matters: it's what lets
+    _apply_gh2_materials give the merged object one material slot per distinct .mat
+    and assign each face to the RIGHT one, instead of the merge collapsing everything
+    onto a single material - which is exactly the "weird material overlap" problem a
+    future texture-import pass would otherwise inherit permanently once the mesh is
+    already one giant merged object with no per-piece boundary left to recover.
+    """
+    from mathutils import Vector
+
+    merged_vertices = []
+    merged_faces = []
+    face_materials = []
+    materials = []
+
+    for piece in pieces:
+        mat = _milo_to_blender_matrix(piece['world_xfm'])
+        rot = mat.to_3x3()
+        base = len(merged_vertices)
+        for v in piece['vertices']:
+            pos = mat @ Vector((v['x'], v['y'], v['z']))
+            nrm = rot @ Vector((v['nx'], v['ny'], v['nz']))
+            merged_vertices.append({
+                'x': pos.x, 'y': pos.y, 'z': pos.z,
+                'nx': nrm.x, 'ny': nrm.y, 'nz': nrm.z,
+                'u': v['u'], 'v': v['v'],
+                'weights': v.get('weights', []),
+            })
+        for f in piece['faces']:
+            merged_faces.append((f[0] + base, f[1] + base, f[2] + base))
+            face_materials.append(piece['material'])
+        if piece['material'] not in materials:
+            materials.append(piece['material'])
+
+    return {
+        'name': final_name,
+        'parent': None,       # caller supplies the representative parent separately
+        'material': ", ".join(materials),
+        'face_materials': face_materials,
+        'world_xfm': None,    # already baked into vertices above - see docstring
+        'vertices': merged_vertices,
+        'faces': merged_faces,
+    }
+
+
+def _find_armature_bone(context, bone_name):
+    """Return the first ARMATURE object in the scene whose bone list contains
+    `bone_name` exactly, or None. Used for the single-bone rigid-parent path (a mesh
+    with no per-chunk weight palette of its own, attached via its embedded RndTrans's
+    `parent` field instead - see parse_gh2_meshes' docstring, e.g. the eyes). GH2 bone
+    names are kept exactly as stored (including the odd literal ".mesh" suffix - see
+    parse_gh2_skeleton's docstring) specifically so this kind of exact-name match works
+    without a translation table."""
+    for obj in context.scene.objects:
+        if obj.type == 'ARMATURE' and bone_name in obj.data.bones:
+            return obj
+    return None
+
+
+def _find_valid_armature(context, bone_names):
+    """Return the first ARMATURE object in the scene whose bone set is a SUPERSET of
+    `bone_names`, or None. Used for the general per-vertex-weight path (see
+    _apply_gh2_weights): every bone name a mesh's real vertex groups reference needs to
+    actually exist on the armature the Armature modifier points at, or those vertices
+    silently stop deforming with no error - a partial-match armature is worse than no
+    armature at all, since nothing calls that out. Requiring the full set (rather than
+    just one matching bone, like _find_armature_bone's single-bone case) is only
+    reliable because parse_gh2_skeleton keeps bone names exact including their odd
+    literal ".mesh" suffix, so a same-file skeleton import is guaranteed to match."""
+    bone_names = set(bone_names)
+    if not bone_names:
+        return None
+    for obj in context.scene.objects:
+        if obj.type == 'ARMATURE' and bone_names <= set(obj.data.bones.keys()):
+            return obj
+    return None
+
+
+def _attach_armature_modifier(obj, armature_obj):
+    """Add an Armature modifier pointing at `armature_obj` and parent `obj` to it, with
+    matrix_parent_inverse set so parenting doesn't move the object - it's already
+    correctly placed via its own (or, for a merged group, its baked-in) world_xfm (see
+    _build_gh2_mesh_object / _merge_gh2_family), and naive Python parenting (unlike the
+    interactive Ctrl+P operator) doesn't compensate for that automatically. Assumes
+    `obj` already has whatever vertex groups it needs (real per-vertex weights via
+    _apply_gh2_weights, or a synthesized single-bone group via
+    _rigid_bone_parent_group) - this function only wires up the modifier/parenting,
+    not the groups themselves.
+    """
+    mod = obj.modifiers.new(name="Armature", type='ARMATURE')
+    mod.object = armature_obj
+    obj.parent = armature_obj
+    obj.matrix_parent_inverse = armature_obj.matrix_world.inverted()
+
+
+def _rigid_bone_parent_group(obj, bone_name):
+    """Synthesize a single all-weight-1.0 vertex group named after `bone_name`, for a
+    mesh piece with no real per-vertex weight data of its own (e.g. eye-R.mesh -
+    rigidly parented via its embedded RndTrans's `parent` field rather than the
+    per-chunk bone-palette system - see parse_gh2_meshes' docstring). Pair with
+    _attach_armature_modifier to actually make it deform. Using the same
+    vertex-group + Armature-modifier mechanism a fully weighted mesh uses, rather than
+    Blender's simpler direct bone-parenting (Object > Parent > Bone), means there's
+    nothing to restructure if a future pass ever finds real per-vertex weights for a
+    piece like this - it would just repaint the existing group.
+    """
+    vg = obj.vertex_groups.new(name=bone_name)
+    vg.add(range(len(obj.data.vertices)), 1.0, 'REPLACE')
 
 
 class IMPORT_OT_gh2_meshes(bpy.types.Operator, ImportHelper):
-    """Import every mesh in a Guitar Hero 2 (Xbox 360) character milo as separate
-    Blender mesh objects - geometry and UVs only, no weights or materials yet (see
-    parse_gh2_meshes' docstring in io.py for why that's the deliberate scope of this
-    first pass). Each of the file's Mesh entries becomes its own object, matching how
-    GH2 actually splits a character into many small per-bone-group chunks rather than
-    one skinned mesh - the same structure the eventual weights pass will need to key
-    off of, so keeping that 1-object-per-entry shape now avoids a re-import later.
+    """Import every mesh in a Guitar Hero 2 (Xbox 360) character milo as Blender mesh
+    objects - geometry, UV, shading, real per-vertex weights, and dummy per-.mat
+    materials (see parse_gh2_meshes' docstring in io.py for the weight-resolution
+    details, and _apply_gh2_materials' docstring for why materials are still texture-
+    less "dummy" ones this pass).
 
-    A standalone operator, not layered onto IMPORT_OT_gh2_skeleton, so mesh-only or
-    skeleton-only imports both stay simple single-purpose actions - matching how this
-    addon generally keeps import/export concerns as separate operators rather than one
-    operator with a "what to import" toggle pile.
+    GH2 splits a character into many small per-bone-group chunks rather than one
+    skinned mesh (see parse_gh2_meshes' docstring), which matters for weights but isn't
+    something a user wants staring at ~140 separate objects for - so pieces belonging
+    to the same logical object (see _gh2_mesh_family) get merged back into one object
+    each: the full-quality body, the LOD body, and the shadow mesh, each as a single
+    combined object. This is done at the raw vertex-data level (_merge_gh2_family)
+    rather than via bpy.ops.object.join() - see that function's docstring for why the
+    operator-based approach didn't reliably work when called from inside an import
+    operator's execute(). That same merge is what keeps weights and materials correct
+    across a join: each vertex's resolved bone weights and each face's source .mat
+    travel with it through the merge, rather than the combined object collapsing onto
+    one bone or one material for everything. Anything that isn't one of those three
+    families (hair, eyes, and other standalone pieces) is left as individual objects,
+    since joining wasn't asked for there and some of those (hair in particular) are
+    exactly the kind of piece a future rigging pass would want to keep addressable on
+    its own.
+
+    LOD and shadow are off by default (import_lod_meshes / import_shadow_mesh) so a
+    plain import gives just the full-quality character.
+
+    Armature attachment, two tiers (see _find_valid_armature / _find_armature_bone):
+    a piece with real per-vertex weights (almost everything) needs a scene armature
+    whose bones are a superset of every bone name its weights reference - anything less
+    would leave some vertices silently un-deformed, so it's treated as no match at all.
+    A piece with no weight palette of its own (e.g. the eyes) falls back to its embedded
+    RndTrans's own `parent` field naming a single bone directly - the eyes-onto-
+    bone_head.mesh case from development is the typical example. Either way, once a
+    match is found the mesh gets an Armature modifier and is parented to the armature
+    object (see _attach_armature_modifier). If no matching armature is found - most
+    likely because IMPORT_OT_gh2_skeleton hasn't been run yet in this scene - the piece
+    still imports at its correct world position, just undeformed, and every such piece
+    gets rolled into one summary warning at the end rather than one per mesh.
     """
     bl_idname = "import_scene.gh2_meshes"
     bl_label = "Import GH2 Meshes"
@@ -2996,6 +3313,21 @@ class IMPORT_OT_gh2_meshes(bpy.types.Operator, ImportHelper):
         options={'HIDDEN'},
     )
 
+    import_lod_meshes: BoolProperty(
+        name="Import LOD Meshes",
+        description="Also import the lower-detail LOD mesh pieces (joined into one "
+                     "object, same as the full-quality body). Off by default so a "
+                     "plain import gives just the character you'd actually look at",
+        default=False,
+    )
+
+    import_shadow_mesh: BoolProperty(
+        name="Import Shadow Mesh",
+        description="Also import the low-poly shadow-casting mesh pieces (joined into "
+                     "one object). Off by default, same reasoning as LOD",
+        default=False,
+    )
+
     def execute(self, context):
         try:
             dir_name, meshes = parse_gh2_meshes(self.filepath)
@@ -3004,24 +3336,116 @@ class IMPORT_OT_gh2_meshes(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, f"Could not parse GH2 milo: {e}")
             return {'CANCELLED'}
 
-        _log(f"===== Importing {len(meshes)} GH2 mesh(es) from {self.filepath} =====")
+        _log(f"===== Importing GH2 meshes from {self.filepath} =====")
+
+        all_names = {m['name'] for m in meshes}
+        material_cache = {}
+
+        families = {}
+        for m in meshes:
+            families.setdefault(_gh2_mesh_family(m['name']), []).append(m)
 
         collection = bpy.data.collections.new(dir_name)
         context.scene.collection.children.link(collection)
 
-        imported = 0
-        for m in meshes:
-            try:
-                _build_gh2_mesh_object(m, collection)
-                imported += 1
-            except Exception as ex:
-                _log(f"  WARNING: failed to build Blender object for mesh "
-                     f"'{m['name']}': {ex}")
+        # (built_object, representative_parent_name, used_bone_names) triples - what
+        # the two-tier armature match at the end resolves against once every
+        # piece/group has been built.
+        placed = []
+        objects_built = 0
+        pieces_processed = 0
+        skipped_lod_shadow = 0
 
-        summary = (f"Imported {imported}/{len(meshes)} GH2 mesh(es) into collection "
-                   f"'{dir_name}'")
-        _log(f"===== SUCCESS: {summary} =====")
-        self.report({'INFO'}, summary)
+        for family, pieces in families.items():
+            category = _gh2_mesh_category(family, dir_name)
+            if category == 'lod' and not self.import_lod_meshes:
+                skipped_lod_shadow += len(pieces)
+                continue
+            if category == 'shadow' and not self.import_shadow_mesh:
+                skipped_lod_shadow += len(pieces)
+                continue
+
+            if category in ('main', 'lod', 'shadow'):
+                # These three are the explicitly-requested joins. Root piece (exactly
+                # "{family}.mesh") supplies the representative parent - see
+                # _gh2_mesh_category's docstring on why parent alone can't tell these
+                # three families apart, only the join target itself matters here.
+                root_piece = next((m for m in pieces if m['name'] == f"{family}.mesh"),
+                                   pieces[0])
+                final_name = dir_name if category == 'main' else f"{dir_name}_{category}"
+                # Both steps wrapped together: a failure in either one now skips just
+                # this family (logged) instead of aborting every remaining family's
+                # import, the way an earlier, un-wrapped version let one bad exception
+                # take down the whole operator partway through.
+                try:
+                    merged = _merge_gh2_family(pieces, final_name)
+                    obj, used_bones = _build_gh2_mesh_object(
+                        merged, collection, material_cache, apply_world_xfm=False)
+                    objects_built += 1
+                    pieces_processed += len(pieces)
+                    placed.append((obj, root_piece['parent'], used_bones))
+                except Exception as ex:
+                    _log(f"  WARNING: failed to build merged '{final_name}' from "
+                         f"{len(pieces)} piece(s): {ex}")
+            else:
+                # 'other' - hair, eyes, standalone accessories: left as individual
+                # objects, each resolved against its own parent field.
+                for m in pieces:
+                    try:
+                        obj, used_bones = _build_gh2_mesh_object(m, collection,
+                                                                  material_cache)
+                        objects_built += 1
+                        pieces_processed += 1
+                        placed.append((obj, m['parent'], used_bones))
+                    except Exception as ex:
+                        _log(f"  WARNING: failed to build Blender object for mesh "
+                             f"'{m['name']}': {ex}")
+
+        unresolved = []
+        for obj, parent_name, used_bones in placed:
+            if used_bones:
+                # Real per-vertex weights - needs an armature covering every bone name
+                # actually used, not just one (see _find_valid_armature's docstring).
+                armature_obj = _find_valid_armature(context, used_bones)
+                if armature_obj is not None:
+                    _attach_armature_modifier(obj, armature_obj)
+                else:
+                    example = next(iter(used_bones))
+                    unresolved.append((obj.name, f"{len(used_bones)} bone(s), e.g. "
+                                                  f"'{example}'"))
+                continue
+
+            # No per-vertex weight data of its own - fall back to the single-bone
+            # rigid-parent path keyed on the embedded RndTrans's own `parent` field
+            # (e.g. the eyes onto bone_head.mesh).
+            if parent_name == dir_name or parent_name in all_names:
+                continue   # character root, or another mesh in this file - not a bone
+            armature_obj = _find_armature_bone(context, parent_name)
+            if armature_obj is not None:
+                _rigid_bone_parent_group(obj, parent_name)
+                _attach_armature_modifier(obj, armature_obj)
+            else:
+                unresolved.append((obj.name, parent_name))
+
+        summary = (f"Imported {pieces_processed} GH2 mesh piece(s) as {objects_built} "
+                   f"object(s) into collection '{dir_name}'")
+        if skipped_lod_shadow:
+            summary += f" ({skipped_lod_shadow} LOD/shadow piece(s) skipped)"
+
+        if unresolved:
+            examples = ", ".join(f"{n} (needs: {p})" for n, p in unresolved[:4])
+            more = f", +{len(unresolved) - 4} more" if len(unresolved) > 4 else ""
+            warning = (f"{summary}. {len(unresolved)} piece(s) imported with no "
+                       f"armature to deform them - the matching skeleton may not be "
+                       f"imported into this scene yet: {examples}{more}")
+            _log(f"===== DONE WITH WARNINGS: {warning} =====")
+            self.report({'WARNING'}, warning)
+        else:
+            _log(f"===== SUCCESS: {summary} =====")
+            self.report({'INFO'}, summary)
+
+        return {'FINISHED'}
+
         return {'FINISHED'}
 
 
@@ -3059,6 +3483,13 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
                           text="Guitar Hero 2 Meshes (.milo_xbox)",
                           icon_value=_milo_icon_id('GH2'))
+    # Also not nested in the skeleton submenu - this needs an existing armature
+    # already selected (it writes viseme poses onto pose bones by name), it doesn't
+    # build one, so it belongs with the other "import onto what's already in the
+    # scene" entries rather than the rig-creation submenu above.
+    self.layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
+                          text="Rock Band 3 Viseme Set (.milo_xbox)",
+                          icon_value=_milo_icon_id('RB3'))
 
 
 classes = (
@@ -3084,6 +3515,7 @@ classes = (
     IMPORT_OT_dc3_skeleton,
     IMPORT_OT_gh2_skeleton,
     IMPORT_OT_gh2_meshes,
+    IMPORT_OT_rb3_viseme_set,
     TOPBAR_MT_milo_skeleton_import,
 )
 
