@@ -56,7 +56,8 @@ def write_tbrb_rnd_tex(w: MiloWriter, width, height, encoding, bpp, block_data,
     w.block(END_MARKER)
 
 
-def write_tbrb_rnd_mat(w: MiloWriter, settings, standalone=True, force_tbrb_defaults=False):
+def write_tbrb_rnd_mat(w: MiloWriter, settings, standalone=True, force_tbrb_defaults=False,
+                        end_marker=False):
     """RndMat.Write at revision 55 (The Beatles: Rock Band). Field order verified by
     decoding all 12 retail materials - every one lands exactly on its object boundary.
 
@@ -174,7 +175,25 @@ def write_tbrb_rnd_mat(w: MiloWriter, settings, standalone=True, force_tbrb_defa
     w.f32(1.0)                                  # val_0x178   |
     w.f32(1.0)                                  # val_0x17c  /
     w.symbol("")                                # alpha_mask (ScreenMask) (rev > 53)
-    w.boolean(False)
+    w.boolean(False)                            # ps3_force_trilinear (rev > 54)
+
+    # end_marker mirrors write_tbrb_rnd_mesh's parameter of the same name, and for the same
+    # reason. A material that is a DirectoryMeta ENTRY inside a .milo container must be
+    # followed by 0xADDEADDE: the reader walks entry bodies by scanning for that separator
+    # (Mackiloha's MiloObjectDirSerializer.GuessEntrySize), so without it the mat's bytes
+    # get swallowed into the PREVIOUS entry's body and every subsequent entry desyncs -
+    # the directory promises N entries but the reader only finds a handful before running
+    # off the end of the file. That is exactly the corruption this parameter was added to
+    # fix; MiloEditor shows such a milo as empty, and the game would fault on it too.
+    #
+    # A LOOSE standalone .mat on disk (the TBRB Custom Song Asset workflow) passes False,
+    # because there p9songtool appends its own 0xADDEADDE per entry when it packs the song
+    # milo - writing one here as well would leave a doubled, never-consumed marker.
+    # Verified against retail: every material body in george_headhands_long.milo_ps3 and
+    # sixtyeight.milo_ps3 terminates on 0xADDEADDE, while the confirmed-working loose
+    # harmonica .mat ends immediately after its last field with nothing appended.
+    if end_marker:
+        w.block(END_MARKER)
 
 
 TBRB_CUSTOM_SONG_MAT_REVISION = 28

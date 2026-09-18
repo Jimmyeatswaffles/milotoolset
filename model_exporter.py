@@ -34,8 +34,9 @@ TBRB_MESH_WRITE_REVISION = 34
 
 def write_tbrb_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_obj,
                          vertices, faces, mat_name="", bone_transforms=None,
-                         force_white_vertex_color=False, write_tangents=True):
-    """RndMesh.Write at revision 34 for The Beatles: Rock Band.
+                         force_white_vertex_color=False, write_tangents=True,
+                         end_marker=False):
+    """RndMesh.Write at revision 34 for The Beatles: Rock Band (and Rock Band 2).
 
     WHY 34. Confirmed empirically against a KNOWN-WORKING TBRB milo (the same custom
     character, with meshes injected via glTFMilo + MiloEditor, that loads and plays in-game):
@@ -67,6 +68,21 @@ def write_tbrb_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_
         tangent    4 x f32
     There is no isNextGen/vertexSize/compressionType header (gated on rev >= 36), no
     keepMeshData (rev > 34) and no hasAOCalculation (rev > 37).
+
+    SHARED WITH ROCK BAND 2. RB2 also writes its meshes at revision 34 with this exact
+    layout - confirmed by byte-parsing a retail PS3 RB2 milo, where the mesh decodes
+    field-for-field against this writer and lands on its terminator. rb2_exporter.py
+    calls straight into here rather than duplicating the vertex loop.
+
+    `end_marker`: whether to append 0xADDEADDE after the bone list. This differs by
+    CONTEXT, not by game, which is why it is a parameter rather than a constant:
+      - False (default) for a loose standalone .mesh asset on disk. Two independent
+        known-working reference files confirm nothing follows the bone list there;
+        see the long note further down for the trailing-bytes bug that caused.
+      - True when the mesh is a DirectoryMeta ENTRY inside a milo container. Every
+        entry in a container is followed by the marker - milo_file.bt models it as a
+        `uint padding` after each object, and the retail RB2 milo has one at 0x849E3
+        immediately after its mesh's bone list, with the next entry 4 bytes later.
     """
     if bone_transforms is None:
         bone_transforms = []
@@ -157,6 +173,10 @@ def write_tbrb_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_
             write_bone_transform(w, bone_name, transform12)
     else:
         w.u32(0)
+
+    # Only when this mesh is a container entry - see the `end_marker` note above.
+    if end_marker:
+        w.block(END_MARKER)
 
 
 def write_tbrb_rnd_group(w: MiloWriter, object_names, sort_in_world=False):
@@ -276,16 +296,29 @@ def build_tbrb_mesh_milo_bytes(root_name, mesh_entries, materials, textures,
     # --- Mesh bodies ---
     for (entry_name, local_xfm, world_xfm, parent_obj, vertices, faces,
          bone_transforms, mat_name, needs_ao_calc) in mesh_entries:
+        # end_marker=True: a mesh that is a DirectoryMeta ENTRY is followed by 0xADDEADDE.
+        # _mark() below only records BLOCK boundaries for the header's block-size table - it
+        # writes no bytes - so the per-entry separator has to come from the object writer
+        # itself. Omitting it silently corrupts the container: the reader walks entry bodies
+        # by scanning for 0xADDEADDE, so an unterminated mesh swallows every following entry
+        # until the next marker, and the directory ends up promising far more entries than
+        # the file actually contains. (The TBRB loose-asset path passes False, because a
+        # standalone .mesh on disk genuinely has nothing after its bone list - p9songtool
+        # adds the separator itself at pack time.) Matches the RB2 container path, which
+        # has always passed end_marker=True here.
         write_tbrb_rnd_mesh(body, entry_name, local_xfm, world_xfm, parent_obj,
                              vertices, faces, mat_name=mat_name,
                              bone_transforms=bone_transforms,
                              force_white_vertex_color=needs_ao_calc,
-                             write_tangents=write_tangents)
+                             write_tangents=write_tangents,
+                             end_marker=True)
         _mark()
 
     # --- Mat bodies ---
     for (_mat_entry_name, settings) in materials:
-        write_tbrb_rnd_mat(body, settings, force_tbrb_defaults=force_tbrb_mat_defaults)
+        # end_marker=True for the same reason as the meshes above - see that comment.
+        write_tbrb_rnd_mat(body, settings, force_tbrb_defaults=force_tbrb_mat_defaults,
+                            end_marker=True)
         _mark()
 
     # --- Tex bodies ---
@@ -549,8 +582,21 @@ def write_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_obj,
 
 def collect_mesh_entries(context, root_name, only_selected=False, bone_axis_correction='none',
                           offset_multiply_order='mesh_first', stock_reference_armature=None,
-                          platform='xbox360', include_tangents=True):
+                          platform='xbox360', include_tangents=True,
+                          vertex_format='compressed'):
+    """`vertex_format`: 'compressed' (default) for the packed RB3/DC vertex, or
+    'uncompressed' for the plain 80-byte revision-34 vertex that TBRB and Rock Band 2
+    use. This is a separate axis from `platform` because two of the decisions below -
+    bone/weight pairing order and whether tangent handedness joins the dedup key -
+    are properties of the VERTEX LAYOUT, and the existing code keys both off the
+    platform because until now only the compressed format had a PS3 variant. Both
+    are marked with their own notes at the point of use."""
     from mathutils import Matrix
+
+    # At revision 34 weights and bone indices are plain parallel arrays, so bone[i]
+    # always pairs with weight[i] regardless of console, and handedness IS stored
+    # (tangent is four real floats, w included).
+    uncompressed_vertex = (vertex_format == 'uncompressed')
 
     # No Blender Z-up -> Milo Y-up conversion is applied anywhere below anymore.
     # Confirmed against a real reference file: raw Blender local vertex coordinates
@@ -779,9 +825,18 @@ def collect_mesh_entries(context, root_name, only_selected=False, bone_axis_corr
                     # at rest (the shared skeleton sits at bind pose, so every bone contributes
                     # ~identity), but on the HAIR - whose physics bones move - it drags scalp
                     # vertices onto swinging hair bones, which looks like broken/twisted hair.
+                    # The reversal is a property of the COMPRESSED vertex only: there
+                    # the bone bytes pair against the packed weight order. The rev-34
+                    # uncompressed vertex stores both as plain parallel arrays, so it
+                    # takes natural order on every platform - reversing there would
+                    # pair each weight with the wrong bone and skin the mesh to the
+                    # wrong joints (invisible at bind pose, obvious once animated).
                     last_valid = 0
                     for i in range(4):
-                        src_idx = i if platform == 'ps3' else (3 - i)
+                        if uncompressed_vertex or platform == 'ps3':
+                            src_idx = i
+                        else:
+                            src_idx = 3 - i
                         if src_idx < len(infl):
                             name, _ = infl[src_idx]
                             b_list[i] = influencing_bones.index(name)
@@ -804,7 +859,13 @@ def collect_mesh_entries(context, root_name, only_selected=False, bone_axis_corr
                     tangent_key = (
                         round(tangent[0], 4), round(tangent[1], 4), round(tangent[2], 4),
                     )
-                    if platform != 'ps3':
+                    # PS3's packed 11-11-10 tangent has no w, so keying on handedness
+                    # there would only emit byte-identical duplicates. The rev-34
+                    # uncompressed vertex DOES store w, so it keys on it on both
+                    # platforms - otherwise two loops differing only in handedness
+                    # collapse and one side of a mirrored UV island gets the wrong
+                    # tangent baked in.
+                    if uncompressed_vertex or platform != 'ps3':
                         tangent_key = tangent_key + (round(tw, 3),)
 
                 key = (

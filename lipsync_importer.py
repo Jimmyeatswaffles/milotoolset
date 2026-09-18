@@ -30,6 +30,25 @@ Big-endian throughout. Header, then a viseme name table, then a keyframe stream 
 each frame lists only the visemes whose weight CHANGED on that frame, as (index, weight)
 byte pairs. Weights are 0-255 and normalise to 0-1.
 
+Versions 0-2 exist and the layout is NOT identical between them. Version 1 appends a
+`propanim` NumString after the keyframe stream; retail RB3 song files are version 0 and
+have no such field, while files produced by song-packaging tools are version 1 with an
+EMPTY propanim - a bare 00 00 00 00. That single trailing length word is why those files
+used to parse perfectly right up to the final trailing-byte check and then get rejected.
+
+The header's second word (`subversion` here, `always2` in the format notes) selects the
+rest of the layout: 2 means a dtaImport string plus a count/byte-count keyframe stream,
+which is what every file checked so far uses. The other branches - a sampled-fps float, a
+player-type table when it's 0, and an offset-table keyframe layout when it isn't 2 - are
+implemented from the format notes but are UNTESTED, with no sample to hand. They validate
+their own structure and raise rather than returning quietly wrong data.
+
+Viseme tables come in more than one size. Retail RB3 songs reference 65 visemes including
+the exp_* performance clips; tool-generated files typically use a reduced 36-entry table
+covering phonemes plus a few brow shapes, with no eyelid or expression clips at all. Both
+work - matching is by NAME, never by index - and the reduced case is called out in the log
+since those missing channels are exactly what a hybrid hand-editing pass would add.
+
 Weight persistence is HOLD-UNTIL-CHANGED, not re-declared-every-frame. That's directly
 observable in the data: a viseme's weight ramps smoothly on consecutive frames and then
 writes an explicit 0 before dropping out of the stream entirely. If an absent viseme
@@ -100,6 +119,19 @@ def parse_lipsync(filepath):
     if len(data) < 16:
         raise LipsyncImportError("file is too small to be a .lipsync")
 
+    try:
+        return _parse_lipsync_body(data)
+    except LipsyncImportError:
+        raise
+    except (struct.error, IndexError) as e:
+        # A truncated file otherwise surfaces a raw struct/index error naming byte
+        # offsets, which tells the user nothing actionable.
+        raise LipsyncImportError(
+            f"file ended unexpectedly while reading - it looks truncated or corrupt "
+            f"({e})") from e
+
+
+def _parse_lipsync_body(data):
     p = 0
 
     def u32():
@@ -120,52 +152,105 @@ def parse_lipsync(filepath):
 
     version = u32()
     subversion = u32()
+    if version > 2:
+        raise LipsyncImportError(
+            f"unsupported .lipsync version {version} (known versions are 0-2)")
 
     dta_import = ''
+    sampled_fps = None
     if subversion == 2:
         dta_import = numstring()
-        p += 1          # embedded-DTB flag
-        u32()           # unknown
+        embed_dtb = data[p]; p += 1
+        if embed_dtb:
+            raise LipsyncImportError(
+                "this file embeds a DTB block, which isn't parsed yet")
+        u32()           # unknown, always 0 in the files checked
     else:
-        f32()           # fps, on the older layout
+        sampled_fps = f32()
 
     viseme_count = u32()
     if viseme_count > 4096:
         raise LipsyncImportError(f"implausible viseme count {viseme_count}")
     visemes = [numstring(256) for _ in range(viseme_count)]
 
-    frame_count = u32()
-    byte_count = u32()
-    if p + byte_count > len(data):
-        raise LipsyncImportError(
-            f"keyframe block claims {byte_count} bytes but only {len(data)-p} remain")
+    players = []
+    if subversion == 0:
+        # UNTESTED: no sample of this layout to hand, but the format notes document a
+        # player-type table here. Validated loosely so a wrong guess fails loudly.
+        player_count = u32()
+        if player_count > 64:
+            raise LipsyncImportError(f"implausible player count {player_count}")
+        players = [numstring(256) for _ in range(player_count)]
 
-    start = p
     frames = []
-    for i in range(frame_count):
-        if p >= len(data):
-            raise LipsyncImportError(f"ran out of data at frame {i} of {frame_count}")
-        change_count = data[p]; p += 1
-        changes = []
-        for _ in range(change_count):
-            idx, weight = data[p], data[p + 1]; p += 2
-            if idx >= viseme_count:
+    if subversion == 2:
+        frame_count = u32()
+        byte_count = u32()
+        if p + byte_count > len(data):
+            raise LipsyncImportError(
+                f"keyframe block claims {byte_count} bytes but only {len(data)-p} remain")
+        start = p
+        for i in range(frame_count):
+            if p >= len(data):
+                raise LipsyncImportError(f"ran out of data at frame {i} of {frame_count}")
+            change_count = data[p]; p += 1
+            changes = []
+            for _ in range(change_count):
+                idx, weight = data[p], data[p + 1]; p += 2
+                if idx >= viseme_count:
+                    raise LipsyncImportError(
+                        f"frame {i} references viseme index {idx}, but the table only "
+                        f"has {viseme_count} entries")
+                changes.append((idx, weight))
+            frames.append(changes)
+        consumed = p - start
+        if consumed != byte_count:
+            raise LipsyncImportError(
+                f"keyframe stream consumed {consumed} bytes but the header declared "
+                f"{byte_count}")
+    else:
+        # UNTESTED: the offset-table layout. Same change records, but frame boundaries
+        # come from an offset table instead of an inline count, and the table has one
+        # more entry than there are frames (the final entry closes the last frame).
+        frame_count = u32()
+        offsets = [u32() for _ in range(frame_count)]
+        base = p
+        for i in range(frame_count - 1):
+            blob_start, blob_end = base + offsets[i], base + offsets[i + 1]
+            if not (base <= blob_start <= blob_end <= len(data)):
+                raise LipsyncImportError(f"frame {i} offsets fall outside the file")
+            q = blob_start
+            change_count = data[q]; q += 1
+            changes = []
+            for _ in range(change_count):
+                idx, weight = data[q], data[q + 1]; q += 2
+                if idx >= viseme_count:
+                    raise LipsyncImportError(
+                        f"frame {i} references viseme index {idx}, but the table only "
+                        f"has {viseme_count} entries")
+                changes.append((idx, weight))
+            if q != blob_end:
                 raise LipsyncImportError(
-                    f"frame {i} references viseme index {idx}, but the table only has "
-                    f"{viseme_count} entries")
-            changes.append((idx, weight))
-        frames.append(changes)
+                    f"frame {i} has {blob_end-q} leftover byte(s) - the offset-table "
+                    f"layout may differ from what's implemented here")
+            frames.append(changes)
+        p = base + offsets[-1] if offsets else base
 
-    consumed = p - start
-    if consumed != byte_count:
-        raise LipsyncImportError(
-            f"keyframe stream consumed {consumed} bytes but the header declared "
-            f"{byte_count} - the file may be a different .lipsync variant")
+    # Version 1 appends a propanim reference after the keyframe stream. Files written by
+    # song-packaging tools are version 1 with an EMPTY propanim, i.e. a bare 00 00 00 00,
+    # which is why they otherwise parse perfectly and then trip the trailing-byte check.
+    propanim = ''
+    if version == 1:
+        propanim = numstring()
+
     if p != len(data):
-        raise LipsyncImportError(f"{len(data)-p} unexpected trailing byte(s)")
+        raise LipsyncImportError(
+            f"{len(data)-p} unexpected trailing byte(s) after a complete parse - this "
+            f"may be a .lipsync variant that isn't supported yet")
 
     return dict(version=version, subversion=subversion, dta_import=dta_import,
-                visemes=visemes, frames=frames)
+                visemes=visemes, frames=frames, propanim=propanim,
+                players=players, sampled_fps=sampled_fps)
 
 
 def expand_weight_tracks(parsed):
@@ -395,6 +480,15 @@ class IMPORT_OT_rb3_lipsync(bpy.types.Operator, ImportHelper):
         _log(f"===== Importing lipsync '{song_name}' from {self.filepath} =====")
         _log(f"  version {parsed['version']}, {len(visemes)} viseme(s), "
              f"{len(frames)} frames ({len(frames)/LIPSYNC_FPS:.1f}s at {LIPSYNC_FPS:g}Hz)")
+        if parsed.get('propanim'):
+            _log(f"  propanim reference: {parsed['propanim']!r} (not used on import)")
+        if len(visemes) <= 40 and not any(v.startswith('exp_') for v in visemes):
+            # Tool-generated files typically carry the reduced phoneme-only table, with
+            # none of the eyelid/expression clips. Worth flagging, since it's exactly the
+            # gap a hybrid workflow would want to fill in by hand afterwards.
+            _log(f"  NOTE: this file uses the reduced {len(visemes)}-viseme table and "
+                 f"references no exp_* expression clips - typical of tool-generated "
+                 f"lipsync. Blink/Squint/expression channels can be hand-keyed on top.")
 
         # Which of these visemes actually have poses imported?
         available = {a.get(_MILO_VISEME_NAME) for a in bpy.data.actions

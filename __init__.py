@@ -32,6 +32,8 @@ from .physics_exporter import *
 from .texture_exporter import *
 from .skeleton_exporter import *
 from .model_exporter import *
+from .rb2_exporter import *
+from .gh2_exporter import *
 from .viseme_importer import *
 from .lipsync_importer import *
 
@@ -39,6 +41,14 @@ from .lipsync_importer import *
 # calls directly (rather than through a public wrapper) has to be imported explicitly.
 from .utilities import _log, _resolve_stock_reference_armature
 from .io import _build_armature_from_skeleton, _milo_to_blender_matrix
+from .gh2_exporter import (
+    GH2DonorError, GH2_MAX_BONES_PER_MESH, extract_gh2_dir_body,
+    split_mesh_by_bone_limit, build_gh2_character_milo_bytes,
+    verify_gh2_milo_bytes, build_gh2_injected_milo_bytes, check_gh2_references,
+    build_gh2_reverse_donor_milo_bytes, check_gh2_all_references,
+    check_gh2_root_bones, GH2_OPTIONAL_DONOR_TYPES,
+    write_gh2_rnd_mat, write_gh2_rnd_tex, build_gh2_texture_blocks,
+)
 from .physics_exporter import _hair_bone_names, hair_profile_for_game
 from .skeleton_exporter import _read_skeleton_milo_trans, _trans_world_translation
 
@@ -786,8 +796,23 @@ def _milo_game_items(self, context):
          "donor to copy that game's win/intro animation clips - injecting them into a "
          "rev-28 (DC1) container instead makes DC3 misread the clips and crash. Xbox 360 "
          "only", _milo_icon_id('DC3'), 2),
-        ('rb2', "Rock Band 2", "Not yet implemented", _milo_icon_id('RB2'), 3),
+        ('rb2', "Rock Band 2", "EXPERIMENTAL, PS3 only. Meshes + Trans bones. RB2 uses its "
+         "own revision set (DirectoryMeta 25 / ObjectDir 20 / Character 12 / Mesh 34), "
+         "all byte-verified against a retail PS3 milo. Mesh 34 is the uncompressed "
+         "80-byte-vertex format - the same one TBRB uses - so skinning data is written "
+         "as plain floats with no packing. Materials are written at RB2's own revision "
+         "47, which is NOT interchangeable with any other game's",
+         _milo_icon_id('RB2'), 3),
         ('tbrb', "The Beatles: Rock Band", "Not yet implemented", _milo_icon_id('TBRB'), 4),
+        ('gh2', "Guitar Hero 2", "EXPERIMENTAL, Xbox 360 only. Rigged meshes + Trans "
+         "bones. GH2 is the odd one out in this addon: its object body is "
+         "LITTLE-ENDIAN (every other supported game is big-endian) and it uses its own "
+         "older revision set (DirectoryMeta 25 / ObjectDir 17 / Character 10 / Mesh 28), "
+         "all byte-verified against a retail Xbox 360 milo. Mesh 28 stores plain float32 "
+         "vertices with a FOUR-bone palette per mesh, so meshes are automatically split "
+         "to fit that limit on export. Requires a donor GH2 milo for the character "
+         "directory body. Materials and textures are not written yet",
+         _milo_icon_id('GH2'), 5),
     )
 
 
@@ -834,9 +859,45 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         default='inject_meshes',
     )
 
+    gh2_donor_mode: EnumProperty(
+        name="GH2 Donor Mode",
+        description="How the donor milo is used for a Guitar Hero 2 export",
+        items=(
+            ('reverse', "Reverse Donor (Build From Blender)",
+             "Build the milo from the Blender scene - your bones, your meshes, your "
+             "LOD groups - and borrow ONLY the special entries this addon can't author "
+             "yet (the CharDriver, IK chains, eye/twist/servo bones, lipsync servo, "
+             "outfit loader). Anything those specials reference is pulled across "
+             "automatically, so nothing can dangle. This is the path toward a fully "
+             "donor-free export: as more writers land, less gets borrowed"),
+            ('inject', "Inject Into Donor (Swap Meshes Only)",
+             "Rebuild the DONOR milo with its geometry replaced by yours, leaving "
+             "everything else byte-for-byte untouched. The most conservative option - "
+             "the output is that character with your meshes - and the one already "
+             "confirmed working in-game"),
+        ),
+        default='reverse',
+    )
+
+    gh2_omit_groups: BoolProperty(
+        name="Omit LOD Groups (Test)",
+        description="EXPERIMENT. Skip writing the lod0.grp / lod1.grp / shadow Group "
+                     "entries entirely, to find out whether GH2 actually needs them. "
+                     "Leaves the directory body naming groups that don't exist, which "
+                     "is normally the exact dangling-reference crash this exporter "
+                     "guards against - so the reference checks are told to expect "
+                     "these specific names to be missing rather than being disabled. "
+                     "Off by default; turn it on only for a deliberate test",
+        default=False,
+    )
+
     donor_milo: StringProperty(
-        name="Donor Milo (CharClipSet)",
-        description="EXPERIMENTAL, Dance Central only. Path to a real DC1 or DC3 character "
+        name="Donor Milo",
+        description="Path to a real donor milo. For Dance Central (DC1/DC3) this supplies "
+                     "the CharClipSet or is rebuilt with your meshes; for Guitar Hero 2 it "
+                     "supplies the BandCharacter directory body, which holds character "
+                     "behaviour config that cannot be derived from a Blender scene and so "
+                     "is REQUIRED for GH2. Path to a real DC1 or DC3 character "
                      "milo to use as the donor. What gets taken from it depends on Donor "
                      "Mode above (DC3 supports CharClipSet copy only). The CharClipSet "
                      "extractor auto-detects the donor's revision (DC1 = 28, DC3 = 32). "
@@ -925,6 +986,46 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
              "Use the filename you typed in the dialog instead of forcing <beatle>_skeleton"),
         ),
         default='george',
+    )
+
+    rb2_bone_export: EnumProperty(
+        name="RB2 Bones",
+        description="Which armature bones become Trans entries in the RB2 milo",
+        items=(
+            ('all', "All bones (self-contained)",
+             "Write every bone on the armature. The milo then carries the complete "
+             "skeleton its own meshes skin against, with no external dependency - which "
+             "is what you want for a first load test, because nothing can go wrong by "
+             "referencing a bone that turns out not to exist"),
+            ('custom', "Custom bones only",
+             "Skip bones whose names match the shared Harmonix base skeleton and emit "
+             "only custom ones, relying on a resource milo to supply the rest. Smaller, "
+             "but it only works if the subdir below actually provides those bones - the "
+             "retail RB2 clothing milo does exactly this"),
+        ),
+        default='all',
+    )
+
+    rb2_subdir_milo: StringProperty(
+        name="RB2 Resource Milo",
+        description="Optional subdirectory path written into the RB2 ObjectDir, e.g. "
+                    "'blankhoodie/blankhoodie_resource.milo'. Retail clothing milos carry "
+                    "one of these to pull in the shared skeleton. Leave blank for a "
+                    "self-contained milo that needs no external reference",
+        default="",
+    )
+
+    rb2_force_mat_defaults: BoolProperty(
+        name="Force RB2 Material Defaults",
+        description="Write the render-tuning material fields with the values observed in "
+                    "a retail RB2 material instead of the Blender UI's defaults. The UI "
+                    "was authored against RB3's much newer shader model, and those "
+                    "defaults are already known to render a TBRB character solid black; "
+                    "RB2's shader path is older still and has no verified custom material "
+                    "yet. Blend, Z-mode, base color and all texture names still come from "
+                    "the authored material either way - only lighting/specular tuning is "
+                    "overridden. Turn this off to A/B test your own values",
+        default=True,
     )
 
     tbrb_mesh_kind: EnumProperty(
@@ -1276,6 +1377,28 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                     sub.label(text="Textures written as compiled .tex (default, matches",
                               icon='INFO')
                     sub.label(text="every other export path).")
+        if self.game == 'gh2':
+            sub = box.box()
+            sub.label(text="Guitar Hero 2 (experimental)", icon='ARMATURE_DATA')
+            if self.platform != 'xbox360':
+                sub.label(text="GH2 is Xbox 360 only - set Platform to Xbox 360.",
+                          icon='ERROR')
+            sub.prop(self, "gh2_donor_mode")
+            sub.prop(self, "donor_milo")
+            if not self.donor_milo:
+                sub.label(text="A donor GH2 milo is REQUIRED.", icon='ERROR')
+            if self.gh2_donor_mode == 'reverse':
+                sub.label(text="Bone names must match the donor's rig - its", icon='INFO')
+                sub.label(text="drivers/IK reference bones by name.")
+                sub.prop(self, "gh2_omit_groups")
+                if self.gh2_omit_groups:
+                    sub.label(text="Test build: directory will name 3 groups that",
+                              icon='ERROR')
+                    sub.label(text="won't exist. May not load.")
+            sub.label(text="Meshes auto-split to GH2's 4-bone-per-mesh limit.",
+                      icon='INFO')
+            sub.label(text="Materials/textures not written yet.", icon='INFO')
+
         if self.game in ('dc1', 'dc3'):
             sub = box.box()
             label = "Dance Central 1" if self.game == 'dc1' else "Dance Central 3"
@@ -1310,6 +1433,23 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                 else:
                     sub.label(text="Fresh milo + donor's CharClipSet as entry 0.",
                               icon='INFO')
+
+        if self.game == 'rb2':
+            sub = box.box()
+            sub.label(text="Rock Band 2 (PS3 only)", icon='ARMATURE_DATA')
+            sub.prop(self, "rb2_bone_export")
+            sub.prop(self, "rb2_subdir_milo")
+            sub.prop(self, "rb2_force_mat_defaults")
+            if not self.rb2_force_mat_defaults:
+                sub.label(text="RB3-authored UI defaults may render black on RB2's shader "
+                               "path.", icon='INFO')
+            if self.rb2_bone_export == 'custom' and not self.rb2_subdir_milo.strip():
+                sub.label(text="Custom-only bones with no resource milo will leave base "
+                               "bones unresolved.", icon='ERROR')
+            sub.label(text="Mesh 34 / Mat 47 / Tex 10 - RB2's own revisions.", icon='INFO')
+            if self.platform != 'ps3':
+                sub.label(text="Set Platform to PS3 - RB2 isn't testable on Xenia.",
+                          icon='ERROR')
 
         if self.game == 'tbrb' and self.milo_type != 'custom_song_asset':
             sub = box.box()
@@ -1401,6 +1541,475 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         else:
             objs = context.scene.objects
         return {o.name: o for o in objs if o.type == 'ARMATURE'}
+
+    def _export_gh2(self, context):
+        """Guitar Hero 2 (Xbox 360) export path - see gh2_exporter.py.
+
+        Lives here as a Game branch of the one Milo Scene exporter rather than as its
+        own File > Export entry, so GH2 sits in the same Game dropdown as every other
+        supported game instead of being the odd one out in a different menu.
+
+        Two GH2-specific constraints are enforced up front rather than deep in the
+        writer, so the user gets a clear message instead of a malformed file:
+
+          * Xbox 360 only. GH2 never shipped on PS3; there is a PS2 port, but PS2 milos
+            are a different container/endianness story entirely and aren't supported.
+          * A donor milo is required - the BandCharacter directory body holds character
+            behaviour config (the retail bytes contain gameplay strings like "guitarist"
+            and "in_solo") that can't be derived from a Blender scene.
+
+        Meshes are split to GH2's four-bone-per-mesh palette limit automatically; see
+        split_mesh_by_bone_limit for why that isn't optional.
+        """
+        if self.platform != 'xbox360':
+            self.report({'ERROR'},
+                        "Guitar Hero 2 is Xbox 360 only - GH2 never shipped on PS3. "
+                        "Set Platform to Xbox 360.")
+            return {'CANCELLED'}
+        if not self.donor_milo:
+            self.report({'ERROR'},
+                        "GH2 export needs a donor milo (any retail GH2 Xbox 360 "
+                        "character) to supply the BandCharacter directory body.")
+            return {'CANCELLED'}
+
+        donor_abspath = bpy.path.abspath(self.donor_milo)
+        try:
+            _dt, _dn, dir_body = extract_gh2_dir_body(donor_abspath)
+        except GH2DonorError as e:
+            _log(f"GH2 EXPORT FAILED (donor): {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        except Exception as e:
+            _log(f"GH2 EXPORT FAILED (donor): {e}")
+            self.report({'ERROR'}, f"Couldn't read the donor milo: {e}")
+            return {'CANCELLED'}
+
+        candidates = (context.selected_objects
+                      if context.selected_objects else context.scene.objects)
+        mesh_objs = [o for o in candidates if o.type == 'MESH']
+        if not mesh_objs:
+            self.report({'ERROR'}, "No mesh objects to export "
+                                    "(select the character meshes, or the armature).")
+            return {'CANCELLED'}
+
+        armature_obj = None
+        for o in mesh_objs:
+            for mod in o.modifiers:
+                if mod.type == 'ARMATURE' and mod.object is not None:
+                    armature_obj = mod.object
+                    break
+            if armature_obj:
+                break
+        if armature_obj is None:
+            armature_obj = next((o for o in candidates if o.type == 'ARMATURE'), None)
+        if armature_obj is None:
+            self.report({'ERROR'},
+                        "No armature found - a GH2 character needs a rig. Give the "
+                        "meshes an Armature modifier, or select the armature too.")
+            return {'CANCELLED'}
+
+        root_name = armature_obj.name
+
+        _log(f"===== Exporting GH2 character '{root_name}' =====")
+        bone_entries, inv_bind = _collect_gh2_bones(armature_obj)
+        _log(f"  armature '{armature_obj.name}': {len(bone_entries)} bone(s)")
+
+        depsgraph = context.evaluated_depsgraph_get()
+        identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+
+        # Author real Mat/Tex entries from the Blender materials. Reverse-donor mode
+        # consumes these directly; inject mode keeps the donor's own materials, since
+        # its whole premise is leaving everything except geometry untouched.
+        material_entries = []
+        mat_name_by_material = {}
+        if self.gh2_donor_mode == 'reverse':
+            try:
+                material_entries, mat_name_by_material = _collect_gh2_materials(
+                    mesh_objs, max_tex_size=512,
+                    ignore_tex_size_limits=self.ignore_tex_size_limits)
+            except Exception as e:
+                _log(f"  WARNING: material/texture export failed ({e}) - meshes will "
+                     f"reference no material.")
+
+        mesh_entries = []
+        truncated_total = 0
+        unknown_bone_names = set()
+
+        for obj in mesh_objs:
+            try:
+                vertices, faces = _collect_gh2_mesh_data(obj, depsgraph)
+            except Exception as e:
+                _log(f"  WARNING: couldn't read mesh '{obj.name}': {e} - skipped.")
+                continue
+            if not faces:
+                _log(f"  NOTE: '{obj.name}' has no faces - skipped.")
+                continue
+
+            # Drop weights naming something that isn't a bone on this armature, so a
+            # stray vertex group can't become a bogus palette entry the game then
+            # fails to resolve.
+            for v in vertices:
+                kept = [(b, w) for (b, w) in v["weights"] if b in inv_bind]
+                for (b, _w) in v["weights"]:
+                    if b not in inv_bind:
+                        unknown_bone_names.add(b)
+                total = sum(w for _b, w in kept)
+                v["weights"] = ([(b, w / total) for (b, w) in kept]
+                                if total > 1e-6 else [])
+
+            # Prefer the material we just authored for this object's first slot; fall
+            # back to the imported gh2_material tag (which names a DONOR material, so
+            # it only resolves in inject mode or when the closure borrows it).
+            mat_name = ""
+            slots = [m for m in obj.data.materials if m is not None]
+            if slots:
+                mat_name = mat_name_by_material.get(slots[0].name, "")
+            if not mat_name:
+                mat_name = obj.get('gh2_material') or ""
+            if isinstance(mat_name, str) and "," in mat_name:
+                # An imported merged object stashes every .mat its pieces used; with
+                # materials unimplemented, take the first rather than emit a name that
+                # is really a list.
+                mat_name = mat_name.split(",")[0].strip()
+
+            chunks = split_mesh_by_bone_limit(vertices, faces)
+            for i, (cverts, cfaces, cbones) in enumerate(chunks):
+                if len(cbones) > GH2_MAX_BONES_PER_MESH:
+                    truncated_total += 1
+                palette = [(bn, _matrix_to_gh2_m12(inv_bind[bn]))
+                           for bn in cbones if bn in inv_bind]
+                entry_name = (f"{root_name}.mesh" if (len(chunks) == 1
+                                                       and len(mesh_objs) == 1)
+                              else f"{root_name}.{len(mesh_entries) + 1}.mesh")
+                mesh_entries.append((entry_name, identity, identity, root_name,
+                                     cverts, cfaces, palette, mat_name))
+            _log(f"  '{obj.name}': {len(vertices)} vert(s), {len(faces)} tri(s) "
+                 f"-> {len(chunks)} GH2 chunk(s)")
+
+        if not mesh_entries:
+            self.report({'ERROR'}, "Nothing exportable - every mesh was empty or "
+                                    "unreadable (see the system console).")
+            return {'CANCELLED'}
+
+        # Inject into the donor rather than building a fresh milo. A GH2 directory
+        # body is not self-contained - it names lod0.grp / lod1.grp / main.drv /
+        # shadow directly - so a from-scratch milo holding only Trans + Mesh leaves
+        # those dangling and the character crashes on the loading screen while
+        # resolving them. Injection keeps the donor's entry table, drivers, materials,
+        # textures, groups and skeleton intact and swaps only the geometry.
+        borrowed = {}
+        expected_missing = set()
+        if self.gh2_donor_mode == 'reverse':
+            # Author everything we can from the scene; borrow only the specials.
+            # The LOD groups are authored here rather than borrowed precisely because
+            # they name OUR meshes - a borrowed group would list the donor's, and the
+            # meshes would exist but never draw.
+            all_mesh_names = [e[0] for e in mesh_entries]
+            drop_types = GH2_OPTIONAL_DONOR_TYPES
+            if self.gh2_omit_groups:
+                # Deliberate experiment - see the property description. The directory
+                # body still names these, so they're declared expected-missing below
+                # rather than the checks being switched off wholesale.
+                #
+                # 'Group' must also be added to drop_types, not just left unauthored:
+                # the closure resolves the directory's group references by borrowing
+                # them from the donor, which silently reinstates the groups AND drags
+                # in every donor mesh they list. Omitting has to be explicit.
+                groups = []
+                drop_types = tuple(GH2_OPTIONAL_DONOR_TYPES) + ('Group',)
+                expected_missing = {'lod0.grp', 'lod1.grp', 'shadow'}
+            else:
+                groups = [('lod0.grp', all_mesh_names),
+                          ('lod1.grp', all_mesh_names),
+                          ('shadow', [])]
+            try:
+                data, borrowed = build_gh2_reverse_donor_milo_bytes(
+                    donor_abspath, mesh_entries, bone_entries, groups,
+                    extra_entries=material_entries, drop_types=drop_types)
+            except GH2DonorError as e:
+                _log(f"GH2 EXPORT FAILED (reverse donor): {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            except Exception as e:
+                _log(f"GH2 EXPORT FAILED (reverse donor): {e}")
+                self.report({'ERROR'}, f"Failed while building from Blender: {e}")
+                return {'CANCELLED'}
+        else:
+            chunks = [(verts, faces, palette)
+                      for (_n, _l, _w, _p, verts, faces, palette, _m) in mesh_entries]
+            try:
+                data = build_gh2_injected_milo_bytes(donor_abspath, chunks)
+            except GH2DonorError as e:
+                _log(f"GH2 EXPORT FAILED (inject): {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+            except Exception as e:
+                _log(f"GH2 EXPORT FAILED (inject): {e}")
+                self.report({'ERROR'}, f"Failed while injecting into the donor: {e}")
+                return {'CANCELLED'}
+
+        ok, msg = verify_gh2_milo_bytes(data)
+        if not ok:
+            _log(f"GH2 EXPORT FAILED (verify): {msg}")
+            self.report({'ERROR'}, f"Built milo failed verification, nothing written: "
+                                    f"{msg}")
+            return {'CANCELLED'}
+        _log(f"  verify: {msg}")
+
+        # Separate from the structural check above, and the one that would have caught
+        # the first loading-screen crash: every object landing on its terminator says
+        # nothing about whether the names inside them resolve.
+        ok, msg = check_gh2_references(data, expected_missing)
+        if not ok:
+            _log(f"GH2 EXPORT FAILED (references): {msg}")
+            self.report({'ERROR'}, f"Milo has unresolvable references, nothing "
+                                    f"written: {msg}")
+            return {'CANCELLED'}
+        _log(f"  references: {msg}")
+
+        ok, msg = check_gh2_all_references(data, expected_missing)
+        if not ok:
+            _log(f"GH2 EXPORT FAILED (deep references): {msg}")
+            self.report({'ERROR'}, f"Milo has unresolvable references, nothing "
+                                    f"written: {msg}")
+            return {'CANCELLED'}
+        _log(f"  deep references: {msg}")
+
+        ok, msg = check_gh2_root_bones(data)
+        if not ok:
+            _log(f"GH2 EXPORT FAILED (root bones): {msg}")
+            self.report({'ERROR'}, f"Milo has unparented root bones, nothing written: "
+                                    f"{msg}")
+            return {'CANCELLED'}
+        _log(f"  root bones: {msg}")
+
+        try:
+            with open(self.filepath, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            self.report({'ERROR'}, f"Couldn't write '{self.filepath}': {e}")
+            return {'CANCELLED'}
+
+        summary = (f"Exported GH2 character '{root_name}': {len(bone_entries)} bone(s), "
+                   f"{len(mesh_entries)} mesh chunk(s), {len(data)} bytes")
+        if material_entries:
+            nmat = sum(1 for t, _n, _b in material_entries if t == 'Mat')
+            ntex = sum(1 for t, _n, _b in material_entries if t == 'Tex')
+            summary += f"; wrote {nmat} material(s) + {ntex} texture(s)"
+        if borrowed:
+            summary += (f"; borrowed {sum(borrowed.values())} donor special(s) "
+                        f"({', '.join(f'{k} x{v}' for k, v in sorted(borrowed.items()))})")
+        warnings = []
+        if unknown_bone_names:
+            ex = ", ".join(sorted(unknown_bone_names)[:3])
+            warnings.append(f"{len(unknown_bone_names)} vertex group(s) don't name a "
+                            f"bone on '{armature_obj.name}' and were ignored ({ex})")
+        if truncated_total:
+            warnings.append(f"{truncated_total} chunk(s) had weights truncated to the "
+                            f"{GH2_MAX_BONES_PER_MESH}-bone limit")
+        if warnings:
+            full = summary + ". " + "; ".join(warnings)
+            _log(f"===== DONE WITH WARNINGS: {full} =====")
+            self.report({'WARNING'}, full)
+        else:
+            _log(f"===== SUCCESS: {summary} =====")
+            self.report({'INFO'}, summary)
+        return {'FINISHED'}
+
+
+    def _export_rb2(self, context):
+        """Rock Band 2 export: one Character milo holding Trans bones + weighted meshes.
+
+        PS3 only for now, and that restriction is real rather than cautious: RB2 does not
+        run on Xenia, so an Xbox 360 build could not be tested, and the bone/weight
+        pairing order is the kind of thing that looks perfect at bind pose and only goes
+        wrong once the character animates. Better to ship one verified target.
+
+        Materials (RndMat 47) and textures (RndTex 10) are written. Mat 47 is NOT a
+        near-copy of any other game's material - see write_rb2_rnd_mat for the nine
+        revision gates that differ from TBRB's 55 alone. Tex 10 is genuinely identical to
+        TBRB's, so that writer is reused unchanged.
+        """
+        import os
+
+        if self.platform != 'ps3':
+            self.report({'ERROR'},
+                        "Rock Band 2 export is PS3 only for now - set Platform to PS3. "
+                        "(RB2 doesn't run on Xenia, so the 360 path can't be verified.)")
+            return {'CANCELLED'}
+        if self.milo_type == 'custom_song_asset':
+            self.report({'ERROR'},
+                        "Type=Custom Song Asset is for The Beatles: Rock Band only.")
+            return {'CANCELLED'}
+
+        base, ext = os.path.splitext(self.filepath)
+        self.filepath = base + '.milo_ps3'
+        root_name = os.path.splitext(os.path.basename(self.filepath))[0]
+
+        _log(f"===== Starting RB2 export: '{root_name}' -> {self.filepath} =====")
+        _log("  Revisions: DirectoryMeta 25, ObjectDir 20, Character 12, RndDir 10, "
+             "Mesh 34, Trans 9 (all byte-verified against retail PS3).")
+        _log("  Mat revision 47, Tex revision 10 - RB2's own material revision, which "
+             "differs from TBRB's 55 in nine separately-gated places.")
+
+        sub_dirs = []
+        resource_milo = (self.rb2_subdir_milo or "").strip()
+        if resource_milo:
+            sub_dirs = [resource_milo]
+            _log(f"  ObjectDir subdir: {resource_milo}")
+        else:
+            _log("  ObjectDir subdir: none (self-contained milo).")
+
+        # --- Meshes -----------------------------------------------------------------
+        # vertex_format='uncompressed' is what routes the rev-34 decisions: natural
+        # bone/weight pairing and handedness in the vertex dedup key. See
+        # collect_mesh_entries' docstring for why that is separate from `platform`.
+        _log("--- Meshes ---")
+        try:
+            entries, materials_by_name, armatures_used = collect_mesh_entries(
+                context, root_name, only_selected=self.only_selected,
+                bone_axis_correction=self.bone_axis_correction,
+                offset_multiply_order=self.offset_multiply_order,
+                stock_reference_armature=None,
+                platform='ps3',
+                include_tangents=self.export_tangents,
+                vertex_format='uncompressed')
+        except BoneLimitExceeded as e:
+            details = "; ".join(f"'{n}': {c} bones (max {MAX_BONES_PER_MESH})"
+                                for n, c in e.offenders)
+            _log(f"EXPORT FAILED: bone limit exceeded - {details}")
+            self.report({'ERROR'},
+                        f"Export blocked - exceeds the {MAX_BONES_PER_MESH}-bone-per-mesh "
+                        f"limit: {details}. Split the offending mesh(es).")
+            return {'CANCELLED'}
+        except ValueError as e:
+            _log(f"EXPORT FAILED: {e}")
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        if not entries:
+            _log("EXPORT FAILED: no mesh objects found.")
+            self.report({'ERROR'}, "No mesh objects found to export.")
+            return {'CANCELLED'}
+
+        # --- Bones ------------------------------------------------------------------
+        _log("--- Bones (Trans) ---")
+        bone_trans_entries = []
+        if not armatures_used:
+            _log("  No armature is bound to any exported mesh - writing a static milo "
+                 "with no Trans entries and no skin weights.")
+            self.report({'WARNING'},
+                        "No armature found on the exported meshes - the milo will be "
+                        "static (no bones, no skinning).")
+        elif self.rb2_bone_export == 'all':
+            if len(armatures_used) > 1:
+                names = ", ".join(sorted(armatures_used))
+                _log(f"EXPORT FAILED: meshes are bound to {len(armatures_used)} armatures "
+                     f"({names}).")
+                self.report({'ERROR'},
+                            f"Meshes are bound to {len(armatures_used)} different armatures "
+                            f"({names}). Bind them all to one rig - merging skeletons would "
+                            f"silently drop bones.")
+                return {'CANCELLED'}
+            armature_obj = next(iter(armatures_used.values()))
+            try:
+                bone_trans_entries = build_all_bone_trans_entries(
+                    armature_obj, root_name, label="RB2 skeleton")
+            except ValueError as e:
+                _log(f"EXPORT FAILED: {e}")
+                self.report({'ERROR'}, str(e))
+                return {'CANCELLED'}
+        else:
+            bone_trans_entries = build_armature_trans_entries(
+                armatures_used, root_name, skip_skeleton_bones=True,
+                label="RB2 custom bones")
+
+        bone_trans_entries.sort(key=lambda e: e[0])
+
+        # Every bone a mesh's bone list names must resolve at runtime. When the milo is
+        # self-contained (no resource milo) an unresolved name has nothing to fall back
+        # on, so check it here rather than letting it surface as a load failure.
+        exported_bones = {b[0] for b in bone_trans_entries}
+        referenced = set()
+        for entry in entries:
+            for (bone_name, _xfm) in entry[6]:
+                referenced.add(bone_name)
+        unresolved = sorted(referenced - exported_bones)
+        if unresolved:
+            if resource_milo:
+                _log(f"  {len(unresolved)} bone(s) referenced by meshes are not in this "
+                     f"milo and must come from '{resource_milo}': "
+                     f"{', '.join(unresolved[:8])}"
+                     f"{' ...' if len(unresolved) > 8 else ''}")
+            else:
+                _log(f"  WARNING: {len(unresolved)} bone(s) are referenced by mesh bone "
+                     f"lists but are NOT exported and there is no resource milo to supply "
+                     f"them:")
+                for n in unresolved:
+                    _log(f"    - {n}")
+                self.report({'WARNING'},
+                            f"{len(unresolved)} mesh-referenced bone(s) are missing from "
+                            f"the milo (e.g. {unresolved[0]}). Switch RB2 Bones to "
+                            f"'All bones', or set a resource milo. See the console.")
+        else:
+            _log(f"  All {len(referenced)} mesh-referenced bone(s) resolve within this milo.")
+
+        # --- Materials & textures ---------------------------------------------------
+        # Retail RB2 textures cap at 512 and bottom their mip chains out at a 16px
+        # smaller dimension (RB2_TEX_MIP_FLOOR), the same as TBRB. Mips are forced on:
+        # every retail texture ships a full chain, and a mip-less compressed surface is
+        # a known cause of black/garbage rendering on these older Harmonix shader paths.
+        _log("--- Materials & Textures ---")
+        materials, textures, _texture_images = gather_materials_and_textures(
+            materials_by_name, max_tex_size=512,
+            ignore_tex_size_limits=self.ignore_tex_size_limits,
+            platform='ps3', generate_mips=True,
+            mip_floor=RB2_TEX_MIP_FLOOR)
+        for (mname, _msettings) in materials:
+            _log(f"  Mat '{mname}' (revision {RB2_MAT_REVISION})")
+        for (tname, tw, th, enc, bpp, _blk, nmips) in textures:
+            _log(f"  Tex '{tname}': {tw}x{th} bpp={bpp} enc={enc} mipMaps={nmips}")
+        if not materials:
+            _log("  No materials on the exported meshes - geometry will render untextured.")
+        if self.rb2_force_mat_defaults:
+            _log("  RB2 material defaults are FORCED (retail render values). Blend, Z-mode, "
+                 "base color and texture names still come from the authored material.")
+        else:
+            _log("  RB2 material defaults are OFF - every field comes from the Blender "
+                 "material UI, which was authored against RB3's newer shader model.")
+
+        # --- Write ------------------------------------------------------------------
+        _log("--- Writing RB2 container ---")
+        data = build_rb2_mesh_milo_bytes(
+            root_name, entries, bone_trans_entries,
+            materials=materials, textures=textures,
+            sub_dirs=sub_dirs, sphere_base=None,
+            write_tangents=self.export_tangents,
+            platform='ps3',
+            force_rb2_mat_defaults=self.rb2_force_mat_defaults)
+
+        ok, detail = verify_rb2_milo_bytes(data)
+        if ok:
+            _log(f"  Structure check PASSED: {detail}")
+        else:
+            _log(f"  STRUCTURE CHECK FAILED: {detail}")
+            self.report({'ERROR'},
+                        f"The milo failed its own structure check ({detail}) - it was NOT "
+                        f"written. This is an exporter bug; please report it.")
+            return {'CANCELLED'}
+
+        with open(self.filepath, 'wb') as f:
+            f.write(data)
+
+        total_verts = sum(len(e[4]) for e in entries)
+        total_faces = sum(len(e[5]) for e in entries)
+        summary = (f"Exported RB2 milo '{root_name}': {len(entries)} mesh(es), "
+                   f"{len(bone_trans_entries)} bone(s), {len(materials)} material(s), "
+                   f"{len(textures)} texture(s), {total_verts} verts, {total_faces} tris "
+                   f"-> {self.filepath} ({len(data)} bytes)")
+        _log(f"===== SUCCESS: {summary} =====")
+        self.report({'INFO'}, summary)
+        return {'FINISHED'}
 
     def _export_tbrb_meshes(self, context):
         """Export a TBRB MESH milo: meshes + materials + textures, flat (no LOD groups).
@@ -1879,11 +2488,15 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
     def execute(self, context):
         if self.game == 'tbrb':
             return self._export_tbrb(context)
+        if self.game == 'rb2':
+            return self._export_rb2(context)
+        if self.game == 'gh2':
+            return self._export_gh2(context)
         if self.game not in ('rb3', 'dc1', 'dc3'):
             self.report(
                 {'ERROR'},
-                "Only Game=Rock Band 3, Dance Central 1 and Dance Central 3 are "
-                "implemented so far."
+                "Only Game=Rock Band 3, Rock Band 2, The Beatles: Rock Band, Dance "
+                "Central 1 and Dance Central 3 are implemented so far."
             )
             return {'CANCELLED'}
         if self.platform not in ('xbox360', 'ps3'):
@@ -3106,11 +3719,16 @@ def _build_gh2_mesh_object(mesh_dict, collection, material_cache, apply_world_xf
     uv_layer = me.uv_layers.new(name="UVMap")
     for loop in me.loops:
         v = verts_in[loop.vertex_index]
-        # Stored exactly as found in the file - no V-flip applied. If a texture ends
-        # up vertically mirrored once material import lands, GH2 may follow the usual
-        # DirectX top-down V convention and need this to become (v['u'], 1.0 - v['v'])
-        # - flagging now since it's unconfirmed either way.
-        uv_layer.data[loop.index].uv = (v['u'], v['v'])
+        # GH2 stores V top-down (DirectX convention); Blender's V is bottom-up, so it
+        # has to be flipped. This was flagged as an open question from the first mesh
+        # work and is now settled from retail data: across 3302 head-material vertices
+        # in goth2, the top of the head sits at mean V 0.08 and the bottom at 0.81
+        # (height/V correlation -0.65), i.e. V=0 is the TOP of the image.
+        #
+        # Flipping on BOTH import and export keeps a retail round-trip byte-identical
+        # (two flips cancel) while making Blender-authored UVs land the right way up
+        # in-game - which the first textured export got wrong.
+        uv_layer.data[loop.index].uv = (v['u'], 1.0 - v['v'])
 
     _apply_gh2_shading(me, verts_in)
     _apply_gh2_materials(me, mesh_dict, material_cache)
@@ -3473,6 +4091,243 @@ class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gh2_skeleton.bl_idname,
                         text="Guitar Hero 2 (.milo_xbox)",
                         icon_value=_milo_icon_id('GH2'))
+
+
+def _matrix_to_gh2_m12(mat):
+    """Blender column-vector Matrix -> Milo row-vector 4x3 twelve-float tuple.
+
+    Exact inverse of io.py's _milo_to_blender_matrix, which the GH2 import path uses,
+    so a milo imported and re-exported carries identical matrices.
+    """
+    return (mat[0][0], mat[1][0], mat[2][0],
+            mat[0][1], mat[1][1], mat[2][1],
+            mat[0][2], mat[1][2], mat[2][2],
+            mat[0][3], mat[1][3], mat[2][3])
+
+
+def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=False):
+    """Author real GH2 Mat and Tex entries from the Blender materials on `mesh_objs`.
+
+    Returns (extra_entries, mat_name_by_material) where extra_entries is a list of
+    (type, entry_name, serialized_bytes) ready to hand to the reverse-donor builder,
+    and mat_name_by_material maps a Blender material name to the .mat entry name its
+    meshes should reference.
+
+    Textures are read from the SAME place the RB3/DC/TBRB paths read them - each
+    material's `gltfmilo_settings` (diffuse_tex / normal_tex / specular_tex) -
+    so GH2 uses the existing material panel and autodetect rather than a parallel
+    authoring workflow the user would have to learn separately.
+
+    Two GH2-specific choices, both read off retail rather than inherited:
+
+      * Every role is encoded as DXT5. gather_materials_and_textures uses BC1 for
+        diffuse and BC5/ATI2 for normals, but retail GH2 ships 8bpp DXT5-sized payloads
+        for diffuse, specular AND normal maps alike - the encoding field (24 vs 32) is
+        what tells the shader a texture is a normal map, not a different block format.
+      * Mip chains stop at 16px (GH2_TEX_MIP_FLOOR), not 4px. A retail 512 texture
+        ships 5 mips and a 1024 ships 6; running to 4x4 would ship levels the game
+        never carries.
+
+    Images are deduplicated, so two materials sharing a texture produce one Tex entry.
+    """
+    from .texture_exporter import get_image_rgba8
+
+    extra_entries = []
+    mat_name_by_material = {}
+    tex_by_image = {}
+    seen_names = set()
+
+    materials = {}
+    for obj in mesh_objs:
+        for slot in obj.data.materials:
+            if slot is not None:
+                materials[slot.name] = slot
+    if not materials:
+        return extra_entries, mat_name_by_material
+
+    def register_texture(image, suffix, is_normal):
+        key = (image.name, suffix)
+        if key in tex_by_image:
+            return tex_by_image[key]
+        base = sanitize_milo_name(image.name.rsplit('.', 1)[0])
+        entry_name = f"{base}{suffix}.tex"
+        n = 2
+        while entry_name in seen_names:
+            entry_name = f"{base}{suffix}_{n}.tex"
+            n += 1
+        seen_names.add(entry_name)
+
+        width, height, rgba = get_image_rgba8(
+            image, max_size=max_tex_size,
+            ignore_size_limits=ignore_tex_size_limits)
+        block_data, encoding, bpp, num_mips = build_gh2_texture_blocks(
+            rgba, width, height, is_normal_map=is_normal, generate_mips=True)
+
+        w = MiloWriter(big_endian=False)
+        write_gh2_rnd_tex(w, width, height, encoding, bpp, block_data,
+                          external_path=f"../textures/{base}.bmp",
+                          platform='xbox360', num_mips=num_mips)
+        extra_entries.append(('Tex', entry_name, bytes(w.buf)))
+        tex_by_image[key] = entry_name
+        _log(f"  texture '{image.name}' -> '{entry_name}' "
+             f"({width}x{height}, {num_mips} mip(s), encoding {encoding})")
+        return entry_name
+
+    for mat_name, mat in sorted(materials.items()):
+        # The settings live on Material.gltfmilo_settings - the same PointerProperty
+        # the material panel and gather_materials_and_textures use. An earlier version
+        # of this read 'gltfmilo_material', which does not exist, so getattr() returned
+        # None and every texture slot silently came back empty: materials exported fine
+        # and the milo shipped with zero textures. Reading the same attribute name the
+        # rest of the addon reads is the fix.
+        s = getattr(mat, 'gltfmilo_settings', None)
+        diffuse = normal = specular = ""
+        if s is not None:
+            try:
+                if getattr(s, 'diffuse_tex', None) is not None:
+                    diffuse = register_texture(s.diffuse_tex, "", False)
+                if getattr(s, 'normal_tex', None) is not None:
+                    normal = register_texture(s.normal_tex, "_norm", True)
+                if getattr(s, 'specular_tex', None) is not None:
+                    specular = register_texture(s.specular_tex, "_spec", False)
+            except Exception as e:
+                _log(f"  WARNING: couldn't encode a texture for material "
+                     f"'{mat_name}': {e} - that slot is left empty.")
+
+        if s is None:
+            _log(f"  WARNING: material '{mat_name}' has no glTFMilo settings block - "
+                 f"exported with no textures.")
+        elif not (diffuse or normal or specular):
+            _log(f"  NOTE: material '{mat_name}' has no texture slots filled in "
+                 f"(Material Properties > glTFMilo Material Settings > Textures) - "
+                 f"exported untextured.")
+
+        entry_name = f"{sanitize_milo_name(mat_name)}.mat"
+        w = MiloWriter(big_endian=False)
+        write_gh2_rnd_mat(w, diffuse_tex=diffuse, normal_tex=normal,
+                          specular_tex=specular)
+        extra_entries.append(('Mat', entry_name, bytes(w.buf)))
+        mat_name_by_material[mat_name] = entry_name
+        _log(f"  material '{mat_name}' -> '{entry_name}' "
+             f"(diffuse={diffuse or '-'}, normal={normal or '-'}, "
+             f"specular={specular or '-'})")
+
+    return extra_entries, mat_name_by_material
+
+
+def _collect_gh2_bones(armature_obj):
+    """Build (bone_name, local_xfm12, world_xfm12, parent_name) tuples plus a
+    {bone_name: inverse-bind matrix} map, from a Blender armature.
+
+    local_xfm is the bone's REST matrix relative to its parent, because that is what
+    GH2 stores and what the import path composes back down the parent chain to place
+    bones (see _build_armature_from_skeleton's world_of). world_xfm is written too,
+    but it is NOT authoritative in retail files - confirmed during the import work,
+    where bone_pelvis's stored world disagreed with its real local-derived position -
+    so the engine recomputes it. Writing the true world here is still strictly better
+    than writing garbage, and costs nothing.
+
+    The inverse-bind map is what a mesh's four-slot bone palette stores. Confirmed
+    against retail: the palette matrix for bone_head.mesh carries translation ~-59.4
+    while bone_head itself sits at z~+59.8, i.e. it is the inverse of the bone's world
+    rest matrix.
+
+    Bone names are passed through EXACTLY as they appear in Blender, including GH2's
+    literal ".mesh" suffix. The import path deliberately preserves that suffix so
+    round-tripping needs no translation table; anyone hand-building a rig for GH2 has
+    to match retail's naming for the game to bind meshes to bones at all.
+    """
+    bones = []
+    inv_bind = {}
+    arm_world = armature_obj.matrix_world
+    for b in armature_obj.data.bones:
+        world = arm_world @ b.matrix_local
+        if b.parent is not None:
+            parent_world = arm_world @ b.parent.matrix_local
+            local = parent_world.inverted() @ world
+            parent_name = b.parent.name
+        else:
+            local = world
+            parent_name = ""
+        bones.append((b.name, _matrix_to_gh2_m12(local),
+                      _matrix_to_gh2_m12(world), parent_name))
+        inv_bind[b.name] = world.inverted()
+    return bones, inv_bind
+
+
+def _collect_gh2_mesh_data(obj, depsgraph):
+    """Evaluate one Blender mesh object and return (vertices, faces) in the dict shape
+    gh2_exporter expects - the SAME shape parse_gh2_meshes returns, so imported data
+    and freshly-authored data take identical paths from here on.
+
+    The mesh is read through the depsgraph (modifiers applied) and triangulated by
+    loop_triangles, since GH2 stores raw triangle indices with no polygon support.
+    Vertex positions and normals are baked into world space, matching how the import
+    path bakes world_xfm into merged geometry, so the exported mesh's own transform
+    can stay identity and there is exactly one place transforms are applied.
+
+    Per-vertex weights are taken from vertex groups whose names match armature bones;
+    groups that don't name a bone (stray or user groups) are ignored rather than
+    exported as bogus bone references. Weights are normalized per vertex.
+    """
+    eval_obj = obj.evaluated_get(depsgraph)
+    me = eval_obj.to_mesh()
+    try:
+        me.calc_loop_triangles()
+        mw = eval_obj.matrix_world
+        nm = mw.to_3x3().inverted().transposed()
+
+        try:
+            me.calc_normals_split()
+        except Exception:
+            pass
+
+        group_names = {i: g.name for i, g in enumerate(eval_obj.vertex_groups)}
+
+        # One exported vertex per (mesh vertex, split normal, uv) combination, so hard
+        # edges and UV seams survive instead of being averaged away.
+        uv_layer = me.uv_layers.active
+        key_to_index = {}
+        vertices = []
+        faces = []
+
+        for tri in me.loop_triangles:
+            idx = []
+            for li in tri.loops:
+                loop = me.loops[li]
+                vi = loop.vertex_index
+                n = loop.normal if hasattr(loop, "normal") else me.vertices[vi].normal
+                uv = uv_layer.data[li].uv if uv_layer else (0.0, 0.0)
+                key = (vi, round(n[0], 5), round(n[1], 5), round(n[2], 5),
+                       round(uv[0], 6), round(uv[1], 6))
+                out_i = key_to_index.get(key)
+                if out_i is None:
+                    co = mw @ me.vertices[vi].co
+                    wn = (nm @ n).normalized()
+                    weights = []
+                    for g in me.vertices[vi].groups:
+                        name = group_names.get(g.group)
+                        if name and g.weight > 1e-4:
+                            weights.append((name, g.weight))
+                    weights.sort(key=lambda bw: -bw[1])
+                    total = sum(w for _b, w in weights)
+                    if total > 1e-6:
+                        weights = [(b, w / total) for (b, w) in weights]
+                    out_i = len(vertices)
+                    key_to_index[key] = out_i
+                    vertices.append({
+                        "x": co.x, "y": co.y, "z": co.z,
+                        "nx": wn.x, "ny": wn.y, "nz": wn.z,
+                        # Flip back to GH2's top-down V - see the import side for
+                        # how that orientation was established.
+                        "u": uv[0], "v": 1.0 - uv[1],
+                        "weights": weights,
+                    })
+                idx.append(out_i)
+            faces.append(tuple(idx))
+        return vertices, faces
+    finally:
+        eval_obj.to_mesh_clear()
 
 
 def menu_func_import(self, context):
