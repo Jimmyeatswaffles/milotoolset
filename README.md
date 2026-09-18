@@ -12,6 +12,7 @@ Also includes various other tools to assist with game modification.
 - Armature importer for custom character creator for Rock Band 3, The Beatles Rock Band and Dance Central.
 - Experimental .coll exporter for adding collision boxes to custom characters for physics.
 - More detailed .mat exporter.
+- Inspect "Visemes" facial animations from Rock Band 3.
 
 Created by @jimmyeatwaffles
 
