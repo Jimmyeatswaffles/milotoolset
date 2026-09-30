@@ -35,6 +35,10 @@ from .model_exporter import *
 from .rb2_exporter import *
 from .gh2_exporter import *
 from .viseme_importer import *
+from .viseme_exporter import *
+from .mesh_importer import *
+from .anim_importer import *
+from .cam_importer import *
 from .lipsync_importer import *
 
 # `import *` skips names starting with underscore, so anything private that this file
@@ -2868,6 +2872,12 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
 def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_milo_scene.bl_idname, text="Milo Scene (.milo)",
                           icon_value=_milo_icon_id('MILO_EXPORT'))
+    # Patches an EXISTING viseme milo rather than producing a new scene, so it sits as
+    # its own entry. Needs an armature selected; the engine resolves the face's base
+    # pose by the clip name "Base", so only that one clip is rewritten.
+    self.layout.operator(EXPORT_OT_milo_inject_base_viseme.bl_idname,
+                          text="Inject New Base Viseme (Experimental)",
+                          icon_value=_milo_icon_id('TBRB'))
 
 
 def _coll_redraw(self, context):
@@ -3252,12 +3262,18 @@ class OBJECT_PT_gltfmilo_object(bpy.types.Panel):
                       icon='INFO')
 
 
-class IMPORT_OT_tbrb_skeleton(bpy.types.Operator, ImportHelper):
-    """Import a TBRB skeleton milo as a Blender armature"""
-    bl_idname = "import_scene.tbrb_skeleton"
-    bl_label = "Import TBRB Skeleton Milo"
+class _IMPORT_OT_milo_skeleton_rev25_base(bpy.types.Operator, ImportHelper):
+    """Shared base for the revision-25 Character milos (TBRB and GDRB).
+
+    These predate the directory layout that parse_milo_skeleton walks, so they go through
+    parse_tbrb_skeleton_milo instead. GDRB turned out to need no format work at all: a
+    retail billiejoe_skeleton.milo_xbox is milo revision 25, a Character dir, 128 Trans +
+    16 CharCollide entries, and the TBRB parser reads it byte-for-byte correctly including
+    every parent link and transform. Subclasses only set bl_idname/bl_label/_game_label
+    and their default extension."""
     bl_options = {'REGISTER', 'UNDO'}
 
+    _game_label = "Milo"
     filename_ext = ".milo_ps3"
     filter_glob: StringProperty(
         default="*.milo_ps3;*.milo_xbox;*.milo",
@@ -3302,7 +3318,8 @@ class IMPORT_OT_tbrb_skeleton(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, "No Trans bones found - is this a skeleton milo?")
             return {'CANCELLED'}
 
-        _log(f"===== Importing TBRB skeleton '{dir_name}' from {self.filepath} =====")
+        _log(f"===== Importing {self._game_label} skeleton '{dir_name}' "
+             f"from {self.filepath} =====")
         _log(f"  {len(bones)} bone(s), {len(collisions)} collision volume(s)")
 
         try:
@@ -3315,11 +3332,42 @@ class IMPORT_OT_tbrb_skeleton(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
 
-        summary = (f"Imported skeleton '{dir_name}': {len(bones)} bone(s), "
-                   f"{applied} collision volume(s) applied")
+        summary = (f"Imported {self._game_label} skeleton '{dir_name}': "
+                   f"{len(bones)} bone(s), {applied} collision volume(s) applied")
         _log(f"===== SUCCESS: {summary} =====")
         self.report({'INFO'}, summary)
         return {'FINISHED'}
+
+
+class IMPORT_OT_tbrb_skeleton(_IMPORT_OT_milo_skeleton_rev25_base):
+    """Import a The Beatles: Rock Band skeleton milo as a Blender armature"""
+    bl_idname = "import_scene.tbrb_skeleton"
+    bl_label = "Import TBRB Skeleton Milo"
+    _game_label = "TBRB"
+    filename_ext = ".milo_ps3"
+    filter_glob: StringProperty(
+        default="*.milo_ps3;*.milo_xbox;*.milo",
+        options={'HIDDEN'},
+    )
+
+
+class IMPORT_OT_gdrb_skeleton(_IMPORT_OT_milo_skeleton_rev25_base):
+    """Import a Green Day: Rock Band skeleton milo as a Blender armature.
+
+    GDRB shares TBRB's milo generation - revision 25 Character dirs holding Trans bones
+    and CharCollide volumes - so it reads through the same parser with no format-specific
+    handling. Verified against a retail billiejoe_skeleton.milo_xbox: 128 bones,
+    16 collision volumes, hierarchy 11 levels deep with every parent resolving, and the
+    same facial driver-bone naming (bone_L-brow1.mesh, bone_jaw.mesh, ...) used by TBRB
+    and RB3, which is what the viseme and lipsync importers match against."""
+    bl_idname = "import_scene.gdrb_skeleton"
+    bl_label = "Import GDRB Skeleton Milo"
+    _game_label = "GDRB"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(
+        default="*.milo_xbox;*.milo_ps3;*.milo",
+        options={'HIDDEN'},
+    )
 
 
 class _IMPORT_OT_milo_skeleton_base(bpy.types.Operator, ImportHelper):
@@ -4082,6 +4130,9 @@ class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_tbrb_skeleton.bl_idname,
                         text="The Beatles: Rock Band (.milo_ps3)",
                         icon_value=_milo_icon_id('TBRB'))
+        layout.operator(IMPORT_OT_gdrb_skeleton.bl_idname,
+                        text="Green Day: Rock Band (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
         layout.operator(IMPORT_OT_dc1_skeleton.bl_idname,
                         text="Dance Central 1 (.milo_xbox)",
                         icon_value=_milo_icon_id('DC1'))
@@ -4339,6 +4390,20 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
                           text="Guitar Hero 2 Meshes (.milo_xbox)",
                           icon_value=_milo_icon_id('GH2'))
+    # Sits beside the GH2 mesh importer rather than in the skeleton submenu - it builds
+    # meshes, and optionally binds them to whatever armature is already selected.
+    self.layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
+                          text="Green Day: Rock Band Meshes (.milo_xbox)",
+                          icon_value=_milo_icon_id('GDRB'))
+    # Needs an armature selected; the performance is keyed onto its pose bones, and the
+    # separate Bake Performance step retimes it against the song's MIDI tempo map.
+    self.layout.operator(IMPORT_OT_gdrb_animation.bl_idname,
+                          text="Green Day: Rock Band Animation (.milo_xbox)",
+                          icon_value=_milo_icon_id('GDRB'))
+    # Cameras are free objects in venue space, so this needs no armature selected.
+    self.layout.operator(IMPORT_OT_gdrb_cameras.bl_idname,
+                          text="Green Day: Rock Band Cameras (.milo_xbox)",
+                          icon_value=_milo_icon_id('GDRB'))
     # Also not nested in the skeleton submenu - this needs an existing armature
     # already selected (it writes viseme poses onto pose bones by name), it doesn't
     # build one, so it belongs with the other "import onto what's already in the
@@ -4346,6 +4411,11 @@ def menu_func_import(self, context):
     self.layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
                           text="Rock Band 3 Viseme Set (.milo_xbox)",
                           icon_value=_milo_icon_id('RB3'))
+    # Separate from the RB3 entry on purpose: each game gets its own viseme importer so
+    # archive-format differences stay isolated and can't regress another game.
+    self.layout.operator(IMPORT_OT_gdrb_viseme_set.bl_idname,
+                          text="Green Day: Rock Band Viseme Set (.milo_xbox)",
+                          icon_value=_milo_icon_id('GDRB'))
     # Depends on the viseme set above having been imported first - a .lipsync file
     # carries only weights, no pose data - so it sits directly beneath it.
     self.layout.operator(IMPORT_OT_rb3_lipsync.bl_idname,
@@ -4371,14 +4441,22 @@ classes = (
     BONE_PT_gltfmilo_collision,
     EXPORT_OT_milo_scene,
     IMPORT_OT_tbrb_skeleton,
+    IMPORT_OT_gdrb_skeleton,
+    IMPORT_OT_gdrb_meshes,
+    IMPORT_OT_gdrb_animation,
+    IMPORT_OT_gdrb_cameras,
+    POSE_OT_bake_gdrb_animation,
+    VIEW3D_MT_milo_animation,
     IMPORT_OT_rb3_skeleton,
     IMPORT_OT_dc1_skeleton,
     IMPORT_OT_dc3_skeleton,
     IMPORT_OT_gh2_skeleton,
     IMPORT_OT_gh2_meshes,
     IMPORT_OT_rb3_viseme_set,
+    IMPORT_OT_gdrb_viseme_set,
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
+    EXPORT_OT_milo_inject_base_viseme,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
 )
@@ -4399,9 +4477,13 @@ def register():
     # Object and Pose mode menus rather than living only in F3 search.
     bpy.types.VIEW3D_MT_object.append(menu_func_lipsync)
     bpy.types.VIEW3D_MT_pose.append(menu_func_lipsync)
+    bpy.types.VIEW3D_MT_object.append(menu_func_gdrb_animation)
+    bpy.types.VIEW3D_MT_pose.append(menu_func_gdrb_animation)
 
 
 def unregister():
+    bpy.types.VIEW3D_MT_pose.remove(menu_func_gdrb_animation)
+    bpy.types.VIEW3D_MT_object.remove(menu_func_gdrb_animation)
     bpy.types.VIEW3D_MT_pose.remove(menu_func_lipsync)
     bpy.types.VIEW3D_MT_object.remove(menu_func_lipsync)
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)

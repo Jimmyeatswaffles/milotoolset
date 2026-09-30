@@ -8,11 +8,20 @@ currently active armature. This is Phase 1 of the lipsync workflow: face-rig tes
 export) will read poses back out of.
 
 ===========================================================================================
-SCOPE: Xbox 360 only, RB3-era encoding only.
+SCOPE: Rock Band 3, plus the revision-25 games (TBRB, Green Day: Rock Band).
 ===========================================================================================
-This assumes the CharClip encoding found in retail X360 viseme milos: CharClip version 19,
-holding two CharBonesSamples blocks ("full" then "one") followed by a trailing CharBones
-name+weight list. All multi-byte values are big-endian.
+RB3 viseme milos (revision 28) store each viseme as a CharClip, version 19, holding two
+CharBonesSamples blocks ("full" then "one") followed by a trailing CharBones name+weight
+list, with positions as plain floats (compression 1). All multi-byte values are big-endian.
+
+The revision-25 games wrap the same pose data in CharClipSamples entries and quantise
+positions to int16 (compression 2), which needs the 1300 scale applied in read_pos. Their
+directories aren't walkable by io.py's generic walker, so they have their own finder,
+find_viseme_clips_rev25, which walks them by end marker, and their own operator. The RB3
+finder and operator are unchanged, so supporting another game can't regress RB3. Verified against GDRB's billiejoe viseme milo: 111 clips (the RB3
+phoneme and brow set, 56 bj_* expressions, 13 TBRB leftovers), every one resolving fully
+against billiejoe_skeleton, rotation convention measured as COLUMN (0.21 deg vs 58.4 deg),
+and Base matching the skeleton's rest pose for 35 of 36 bones within one quantisation step.
 
 Confirmed against 68/68 real CharClip entries in a retail viseme_male.milo_xbox with zero
 parse failures and zero ambiguous matches (see _locate_bone_samples below for what
@@ -142,6 +151,14 @@ from .utilities import _log
 # Low-level binary reader (big-endian only - X360 object streams)
 # ---------------------------------------------------------------------------------------
 
+# Radians per unit for a compressed single-axis rotation channel - see read_rotz.
+ROT_CHANNEL_SCALE = 0.00061035156
+
+# Real-unit range of a compressed (int16) position channel - see read_pos. Established
+# for TBRB by regenerating a vanilla Base from its skeleton; the same value holds for GDRB.
+POS_SCALE = 1300.0
+
+
 class _Reader:
     __slots__ = ('d', 'p')
 
@@ -265,7 +282,14 @@ def _read_char_bones_samples(r):
                 x, y, z = r.f32(), r.f32(), r.f32()
                 r.p += 4          # skip the 4th component
                 return (x, y, z)
-            return tuple(max(r.i16() / 32767.0, -1.0) for _ in range(3))
+            # Compressed positions are int16 over a fixed 1300-unit range, so they need
+            # scaling back to real units. RB3's visemes store plain floats and never hit
+            # this branch, which is why the viseme importer worked there without it. The
+            # revision-25 games (TBRB, GDRB) do: without the scale every brow and lip
+            # offset lands 1300x too small. Verified against GDRB's billiejoe Base, which
+            # matches billiejoe_skeleton's rest pose for 35 of 36 bones within one
+            # quantisation step once scaled.
+            return tuple(max(r.i16() / 32767.0, -1.0) * POS_SCALE for _ in range(3))
 
         def read_quat():
             if compression == 0:
@@ -277,7 +301,18 @@ def _read_char_bones_samples(r):
             return tuple((r.u8() / 127.5) - 1.0 for _ in range(4))
 
         def read_rotz():
-            return r.f32() if compression == 0 else max(r.i16() / 32767.0, -1.0)
+            # Single-axis rotation channels are an ANGLE in radians, not a normalised
+            # quaternion component. The engine unpacks a compressed one as
+            # short * 0.00061035156 (CharBones::StringVal in the RB3 decompilation, which
+            # then multiplies by RAD2DEG to print degrees). Dividing by 32767 instead -
+            # the quaternion normalisation - made every such angle 20x too small
+            # (0.00061035156 * 32767 == 20.0), which is what left knees, elbows and
+            # finger joints almost perfectly straight in imported performances.
+            # No viseme clip in a retail set uses these channels, so the correction only
+            # affects animation.
+            if compression == 0:
+                return r.f32()
+            return r.i16() * ROT_CHANNEL_SCALE
 
         expected = (len(pos_bones) * type_size(0)
                     + len(quat_bones) * type_size(2)
@@ -394,8 +429,12 @@ def parse_viseme_clip(entry_bytes):
 # ---------------------------------------------------------------------------------------
 
 def find_viseme_clips(filepath):
-    """Returns (dir_name, {clip_name: raw_bytes}) for every 'CharClip' typed entry found
-    anywhere in the milo (including inside nested subdirectories)."""
+    """RB3 (milo revision 28) only. Returns (dir_name, {clip_name: raw_bytes}) for every
+    'CharClip' entry, including inside nested subdirectories, via io.py's directory walker.
+
+    Deliberately left exactly as it was before GDRB support existed: other games get
+    their own finder (find_viseme_clips_rev25) and their own operator, so nothing done for
+    them can change what the RB3 importer does."""
     with open(filepath, 'rb') as f:
         data = f.read()
     body = read_milo_container_body(data)
@@ -416,6 +455,37 @@ def find_viseme_clips(filepath):
     for (etype, ename, estart, eend) in all_entries:
         if etype == 'CharClip':
             clips[ename] = body[estart:eend]
+    return dir_name, clips
+
+
+# Milo revision used by The Beatles: Rock Band and Green Day: Rock Band.
+REV25 = 25
+
+
+def find_viseme_clips_rev25(filepath):
+    """Revision-25 viseme milos (TBRB, GDRB). Returns (dir_name, {clip_name: raw_bytes}).
+
+    These differ from RB3 in two ways that each break the RB3 finder. io.py's directory
+    walker can't traverse the revision-25 layout - on GDRB's billiejoe viseme milo it
+    misreads a length field and requests a 153 GB buffer - so entries are delimited by end
+    marker instead, sharing the mesh importer's walk (which asserts the marker count
+    rather than risk a silent mis-split). And each viseme is a CharClipSamples entry
+    rather than a CharClip, so the RB3 type filter would find nothing."""
+    from .mesh_importer import _read_dir_entries, _entry_spans
+    with open(filepath, 'rb') as f:
+        data = f.read()
+    body = read_milo_container_body(data)
+    revision = struct.unpack_from('>I', body, 0)[0]
+    if revision != REV25:
+        raise VisemeImportError(
+            f"this milo is revision {revision}, not {REV25}. Use the importer for the game "
+            f"it came from - the Rock Band 3 viseme importer handles revision 28.")
+    _rev, _dtype, dir_name, entries = _read_dir_entries(body)
+    spans = _entry_spans(body, len(entries))
+    clips = {}
+    for (etype, ename), (s, e) in zip(entries, spans):
+        if etype == 'CharClipSamples':
+            clips[ename] = body[s:e]
     return dir_name, clips
 
 
@@ -827,17 +897,20 @@ def _build_viseme_action(armature_obj, clip_name, set_name, pose, bone_lookup=No
 # Operator
 # ---------------------------------------------------------------------------------------
 
-class IMPORT_OT_rb3_viseme_set(bpy.types.Operator, ImportHelper):
-    """Import a Rock Band 3 viseme CharClipSet milo (Xbox 360 only) as one Action per
-    named viseme on the active armature. Use this to test a custom face rig against
-    the real per-viseme poses, and as the pose source for the (separate) lipsync
-    import/export step."""
-    bl_idname = "import_scene.rb3_viseme_set"
-    bl_label = "Import RB3 Viseme Set (X360)"
+class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
+    """Shared viseme-set import logic. Not registered itself - each game subclasses it and
+    supplies only how its milo's clips are found (_find_clips), so a change made for one
+    game's archive format can't alter another's. Everything after the clips are in hand -
+    bone matching, rotation-convention measurement, Action building - is common, because
+    the pose data is the same once decoded."""
     bl_options = {'REGISTER', 'UNDO'}
 
+    _game_label = "Viseme"
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        raise NotImplementedError
 
     skip_base: BoolProperty(
         name="Skip 'Base' Clip",
@@ -902,7 +975,7 @@ class IMPORT_OT_rb3_viseme_set(bpy.types.Operator, ImportHelper):
             return {'CANCELLED'}
 
         try:
-            dir_name, clips = find_viseme_clips(self.filepath)
+            dir_name, clips = self._find_clips(self.filepath)
         except Exception as e:
             _log(f"VISEME IMPORT FAILED: {e}")
             self.report({'ERROR'}, f"Could not parse viseme milo: {e}")
@@ -913,7 +986,8 @@ class IMPORT_OT_rb3_viseme_set(bpy.types.Operator, ImportHelper):
                         "No CharClip entries found - is this a viseme CharClipSet milo?")
             return {'CANCELLED'}
 
-        _log(f"===== Importing viseme set '{dir_name}' from {self.filepath} =====")
+        _log(f"===== Importing {self._game_label} viseme set '{dir_name}' "
+             f"from {self.filepath} =====")
         _log(f"  {len(clips)} CharClip entries found")
 
         # Parse everything up front (cheap - this is all in-memory struct decoding, no
@@ -993,3 +1067,48 @@ class IMPORT_OT_rb3_viseme_set(bpy.types.Operator, ImportHelper):
 
         self.report({'WARNING' if (failed or total_unmatched) else 'INFO'}, summary)
         return {'FINISHED'}
+
+
+class IMPORT_OT_rb3_viseme_set(_IMPORT_OT_viseme_set_base):
+    """Import a Rock Band 3 viseme CharClipSet milo (Xbox 360 only) as one Action per
+    named viseme on the active armature. Use this to test a custom face rig against
+    the real per-viseme poses, and as the pose source for the (separate) lipsync
+    import/export step."""
+    bl_idname = "import_scene.rb3_viseme_set"
+    bl_label = "Import RB3 Viseme Set (X360)"
+    _game_label = "RB3"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        try:
+            return find_viseme_clips(filepath)
+        except Exception:
+            # Only reached once the RB3 walker has already failed, so valid RB3 files are
+            # unaffected. A revision-25 milo fails here with an unreadable "153 GB buffer"
+            # error; name the importer that actually handles it instead.
+            try:
+                with open(filepath, 'rb') as f:
+                    rev = struct.unpack_from('>I', read_milo_container_body(f.read()), 0)[0]
+            except Exception:
+                rev = None
+            if rev == REV25:
+                raise VisemeImportError(
+                    "this is a revision-25 viseme milo (The Beatles: Rock Band / Green Day: "
+                    "Rock Band), not Rock Band 3. Use File > Import > Green Day: Rock Band "
+                    "Viseme Set instead.")
+            raise
+
+
+class IMPORT_OT_gdrb_viseme_set(_IMPORT_OT_viseme_set_base):
+    """Import a Green Day: Rock Band viseme milo as one Action per named viseme on the
+    active armature. GDRB uses the same viseme names as Rock Band 3, so its .lipsync files
+    bake against these exactly as RB3's do"""
+    bl_idname = "import_scene.gdrb_viseme_set"
+    bl_label = "Import GDRB Viseme Set"
+    _game_label = "GDRB"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        return find_viseme_clips_rev25(filepath)
