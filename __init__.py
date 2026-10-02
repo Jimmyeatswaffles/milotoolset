@@ -4120,7 +4120,7 @@ class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
     """File > Import > Milo Skeleton Importer submenu grouping every game's skeleton
     importer in one place instead of scattering four entries across the Import menu."""
     bl_idname = "TOPBAR_MT_milo_skeleton_import"
-    bl_label = "Milo Skeleton Importer"
+    bl_label = "Milo Skeleton Import"
 
     def draw(self, context):
         layout = self.layout
@@ -4142,6 +4142,80 @@ class TOPBAR_MT_milo_skeleton_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gh2_skeleton.bl_idname,
                         text="Guitar Hero 2 (.milo_xbox)",
                         icon_value=_milo_icon_id('GH2'))
+
+
+class TOPBAR_MT_milo_mesh_import(bpy.types.Menu):
+    """File > Import > Milo Mesh Import: every game's mesh importer."""
+    bl_idname = "TOPBAR_MT_milo_mesh_import"
+    bl_label = "Milo Mesh Import"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(IMPORT_OT_tbrb_meshes.bl_idname,
+                        text="The Beatles: Rock Band (.milo_xbox)",
+                        icon_value=_milo_icon_id('TBRB'))
+        layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
+                        text="Green Day: Rock Band (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+        layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
+                        text="Guitar Hero 2 (.milo_xbox)",
+                        icon_value=_milo_icon_id('GH2'))
+
+
+class TOPBAR_MT_milo_charclip_import(bpy.types.Menu):
+    """File > Import > Milo CharClip Import: character performance animation (CharClips),
+    plus the song cameras. Cameras aren't CharClips - they're TransAnim/CamAnim objects -
+    but they're song animation keyed in real time alongside the performance, so they're
+    kept here below a divider rather than given a section of their own."""
+    bl_idname = "TOPBAR_MT_milo_charclip_import"
+    bl_label = "Milo CharClip Import"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(IMPORT_OT_gdrb_animation.bl_idname,
+                        text="Green Day: Rock Band Performance (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+        # Short clips such as idles: every clip in the file becomes its own Action, keyed
+        # in real time, so there's no bake step - the viseme workflow rather than the
+        # performance one.
+        layout.operator(IMPORT_OT_gdrb_clip_set.bl_idname,
+                        text="Green Day: Rock Band Clip Set (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+        layout.separator()
+        layout.operator(IMPORT_OT_gdrb_cameras.bl_idname,
+                        text="Green Day: Rock Band Cameras (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+
+
+class TOPBAR_MT_milo_viseme_import(bpy.types.Menu):
+    """File > Import > Milo Viseme Import: one importer per game, since each game's archive
+    format differs and must not regress another's."""
+    bl_idname = "TOPBAR_MT_milo_viseme_import"
+    bl_label = "Milo Viseme Import"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
+                        text="Rock Band 3 (.milo_xbox)",
+                        icon_value=_milo_icon_id('RB3'))
+        layout.operator(IMPORT_OT_tbrb_viseme_set.bl_idname,
+                        text="The Beatles: Rock Band (.milo_ps3/.milo_xbox)",
+                        icon_value=_milo_icon_id('TBRB'))
+        layout.operator(IMPORT_OT_gdrb_viseme_set.bl_idname,
+                        text="Green Day: Rock Band (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+
+
+class TOPBAR_MT_milo_lipsync_import(bpy.types.Menu):
+    """File > Import > Milo Lipsync Import. Needs the character's visemes imported first:
+    a .lipsync file carries only weights, no pose data."""
+    bl_idname = "TOPBAR_MT_milo_lipsync_import"
+    bl_label = "Milo Lipsync Import"
+
+    def draw(self, context):
+        self.layout.operator(IMPORT_OT_rb3_lipsync.bl_idname,
+                             text="Rock Band Lipsync (.lipsync)",
+                             icon_value=_milo_icon_id('RB3'))
 
 
 def _matrix_to_gh2_m12(mat):
@@ -4382,46 +4456,13 @@ def _collect_gh2_mesh_data(obj, depsgraph):
 
 
 def menu_func_import(self, context):
-    self.layout.menu(TOPBAR_MT_milo_skeleton_import.bl_idname,
-                      icon_value=_milo_icon_id('MILO_EXPORT'))
-    # Not nested inside the skeleton submenu above - this imports meshes, not a
-    # skeleton, and there's only one game's mesh importer so far, so a second
-    # submenu would be premature. Revisit if more games get mesh import later.
-    self.layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
-                          text="Guitar Hero 2 Meshes (.milo_xbox)",
-                          icon_value=_milo_icon_id('GH2'))
-    # Sits beside the GH2 mesh importer rather than in the skeleton submenu - it builds
-    # meshes, and optionally binds them to whatever armature is already selected.
-    self.layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
-                          text="Green Day: Rock Band Meshes (.milo_xbox)",
-                          icon_value=_milo_icon_id('GDRB'))
-    # Needs an armature selected; the performance is keyed onto its pose bones, and the
-    # separate Bake Performance step retimes it against the song's MIDI tempo map.
-    self.layout.operator(IMPORT_OT_gdrb_animation.bl_idname,
-                          text="Green Day: Rock Band Animation (.milo_xbox)",
-                          icon_value=_milo_icon_id('GDRB'))
-    # Cameras are free objects in venue space, so this needs no armature selected.
-    self.layout.operator(IMPORT_OT_gdrb_cameras.bl_idname,
-                          text="Green Day: Rock Band Cameras (.milo_xbox)",
-                          icon_value=_milo_icon_id('GDRB'))
-    # Also not nested in the skeleton submenu - this needs an existing armature
-    # already selected (it writes viseme poses onto pose bones by name), it doesn't
-    # build one, so it belongs with the other "import onto what's already in the
-    # scene" entries rather than the rig-creation submenu above.
-    self.layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
-                          text="Rock Band 3 Viseme Set (.milo_xbox)",
-                          icon_value=_milo_icon_id('RB3'))
-    # Separate from the RB3 entry on purpose: each game gets its own viseme importer so
-    # archive-format differences stay isolated and can't regress another game.
-    self.layout.operator(IMPORT_OT_gdrb_viseme_set.bl_idname,
-                          text="Green Day: Rock Band Viseme Set (.milo_xbox)",
-                          icon_value=_milo_icon_id('GDRB'))
-    # Depends on the viseme set above having been imported first - a .lipsync file
-    # carries only weights, no pose data - so it sits directly beneath it.
-    self.layout.operator(IMPORT_OT_rb3_lipsync.bl_idname,
-                          text="Rock Band Lipsync (.lipsync)",
-                          icon_value=_milo_icon_id('RB3'))
-
+    """File > Import: one submenu per kind of import, each listing every supported game -
+    the same pattern the skeleton importer started with."""
+    layout = self.layout
+    for menu in (TOPBAR_MT_milo_skeleton_import, TOPBAR_MT_milo_mesh_import,
+                 TOPBAR_MT_milo_charclip_import, TOPBAR_MT_milo_viseme_import,
+                 TOPBAR_MT_milo_lipsync_import):
+        layout.menu(menu.bl_idname, icon_value=_milo_icon_id('MILO_EXPORT'))
 
 classes = (
     GltfMiloMaterialSettings,
@@ -4443,9 +4484,12 @@ classes = (
     IMPORT_OT_tbrb_skeleton,
     IMPORT_OT_gdrb_skeleton,
     IMPORT_OT_gdrb_meshes,
+    IMPORT_OT_tbrb_meshes,
     IMPORT_OT_gdrb_animation,
+    IMPORT_OT_gdrb_clip_set,
     IMPORT_OT_gdrb_cameras,
     POSE_OT_bake_gdrb_animation,
+    POSE_OT_set_gdrb_character_milo,
     VIEW3D_MT_milo_animation,
     IMPORT_OT_rb3_skeleton,
     IMPORT_OT_dc1_skeleton,
@@ -4454,11 +4498,16 @@ classes = (
     IMPORT_OT_gh2_meshes,
     IMPORT_OT_rb3_viseme_set,
     IMPORT_OT_gdrb_viseme_set,
+    IMPORT_OT_tbrb_viseme_set,
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
     EXPORT_OT_milo_inject_base_viseme,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
+    TOPBAR_MT_milo_mesh_import,
+    TOPBAR_MT_milo_charclip_import,
+    TOPBAR_MT_milo_viseme_import,
+    TOPBAR_MT_milo_lipsync_import,
 )
 
 

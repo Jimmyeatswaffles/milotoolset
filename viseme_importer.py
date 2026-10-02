@@ -379,6 +379,17 @@ def _locate_bone_samples(entry, search_lo=32, search_hi=110):
             "couldn't locate a valid bone-samples block in this CharClip - its header "
             "layout doesn't match the retail X360 clips this importer was built against")
     if len(hits) > 1:
+        # A clip's two sample blocks are always written at the same version, so prefer the
+        # candidate where they agree. This is what TBRB's clips need: eight zero bytes
+        # before the real block also parse as a (fake) version-0 block that happens to end
+        # on the same byte, so both offsets validate. On all 58 clips in George's viseme
+        # milo exactly one candidate has matching versions - the genuine version-16 block -
+        # and the pose data read after it is identical either way, so this removes a wrong
+        # guess (and 58 warnings) without changing any output. RB3 and GDRB clips never
+        # produce a second candidate, so they never reach this.
+        agreeing = [h for h in hits if h[1]['version'] == h[2]['version']]
+        if len(agreeing) == 1:
+            return agreeing[0]
         _log(f"    WARNING: {len(hits)} candidate offsets validated for this clip - "
              f"using the first ({hits[0][0]}). Treat this clip's result as unverified.")
     return hits[0]
@@ -684,8 +695,14 @@ def report_rest_mismatches(armature_obj, bone_lookup, milo_rest_rot, convention=
         return checked, 0
 
     mismatched.sort(key=lambda r: -r[2])
-    _log(f"  Rest-orientation check: {len(mismatched)} of {checked} bone(s) differ from "
-         f"Milo's rest pose ('Milo Rest' compensates for this; 'Parent' does not):")
+    # Deliberately no advice to switch modes here: on COLUMN-convention data (TBRB, GDRB)
+    # 'Milo Rest' would be wrong, and on George's TBRB rig these differences are authored -
+    # his Base clip, the game's neutral face, genuinely differs from his skeleton's bind
+    # pose (eyelids by about 42 degrees). Visemes are added to the rig's rest pose in
+    # Blender but to Base in the game, so for these bones the neutral face will differ.
+    _log(f"  Rest-orientation check: {len(mismatched)} of {checked} bone(s) differ between "
+         f"the set's Base pose (the game's neutral face) and this rig's rest pose - the "
+         f"neutral face will differ from the game's for these bones:")
     for _stem, bone_name, diff in mismatched[:12]:
         _log(f"    {bone_name:28s} off by {diff:6.2f} deg")
     if len(mismatched) > 12:
@@ -1109,6 +1126,20 @@ class IMPORT_OT_gdrb_viseme_set(_IMPORT_OT_viseme_set_base):
     _game_label = "GDRB"
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        return find_viseme_clips_rev25(filepath)
+
+
+class IMPORT_OT_tbrb_viseme_set(_IMPORT_OT_viseme_set_base):
+    """Import a The Beatles: Rock Band viseme milo as one Action per named viseme on the
+    active armature. TBRB shares GDRB's revision-25 format, but uses its own FACS-style
+    viseme names (jaw_open, l_brow_dn, ...) rather than Rock Band 3's phoneme set"""
+    bl_idname = "import_scene.tbrb_viseme_set"
+    bl_label = "Import TBRB Viseme Set"
+    _game_label = "TBRB"
+    filename_ext = ".milo_ps3"
+    filter_glob: StringProperty(default="*.milo_ps3;*.milo_xbox", options={'HIDDEN'})
 
     def _find_clips(self, filepath):
         return find_viseme_clips_rev25(filepath)

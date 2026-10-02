@@ -105,11 +105,20 @@ class MeshImportError(Exception):
     pass
 
 
+_LOD_NUM_RE = re.compile(r'LOD\s*(\d+)', re.IGNORECASE)
+
+
 def is_lod_name(name):
-    """True for the reduced-detail copies. Matched on the name because the retail file
+    """True for the reduced-detail copies. Matched on the name because GDRB's retail file
     ships 'billiejoel_tongueLOD02.mesh' - a typo'd stem that no base-name pairing would
-    catch, but which the LOD suffix still identifies correctly."""
-    return bool(_LOD_RE.search(name))
+    catch, but which the LOD suffix still identifies correctly.
+
+    Only a LOD NUMBER above 0 counts. GDRB leaves its full-detail meshes unnumbered
+    ('billiejoe_head.1.mesh', then 'billiejoe_headLOD01'), but TBRB numbers every mesh, with
+    '_lod00' as the full-detail one ('g_head_lod00', '_lod01', '_lod02'). Treating any LOD
+    suffix as reduced, as an earlier version did, would have dropped every TBRB mesh."""
+    m = _LOD_NUM_RE.search(name)
+    return m is not None and int(m.group(1)) > 0
 
 
 def is_shadow_name(name):
@@ -311,6 +320,9 @@ def parse_mesh_entry(chunk, name):
     return dict(name=name, version=version, mat=mat_name, geom_owner=geom_owner,
                 verts=verts, faces=faces, bone_names=bone_names,
                 is_lod=is_lod_name(name), is_shadow=is_shadow_name(name),
+                # TBRB's Blend_* meshes: no bones, no material - region masks a TexBlender
+                # uses to place wrinkles, not part of the character's visible geometry.
+                is_helper=(not bone_names and not mat_name),
                 over_documented_bone_cap=bone_count > DOCUMENTED_MAX_BONES)
 
 
@@ -428,12 +440,11 @@ def build_mesh_object(context, mesh_data, armature_obj=None):
 # Operator
 # ---------------------------------------------------------------------------------------
 
-class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
-    """Import the meshes from a Green Day: Rock Band character milo, with UVs, per-bone
-    vertex groups and placeholder materials. Textures are not imported"""
-    bl_idname = "import_scene.gdrb_meshes"
-    bl_label = "Import GDRB Meshes Milo"
+class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
+    """Shared mesh-import logic for the revision-25 games. Not registered itself - GDRB and
+    TBRB each subclass it, setting only their id, label and _game_label."""
     bl_options = {'REGISTER', 'UNDO'}
+    _game_label = "Milo"
 
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(
@@ -455,6 +466,30 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_textures: BoolProperty(
+        name="Import Textures",
+        description="Decode the milo's textures and build a simple node tree for each "
+                     "material: diffuse to Base Color, normal map through a Normal Map node, "
+                     "specular to Specular Tint",
+        default=True,
+    )
+
+    flip_normal_green: BoolProperty(
+        name="Flip Normal Map Green",
+        description="Convert the normal maps' Y from DirectX (down) to Blender's OpenGL "
+                     "(up). The retail maps test as DirectX; turn this off only if bumps "
+                     "light up as dents",
+        default=True,
+    )
+
+    exclude_helpers: BoolProperty(
+        name="Exclude Helper Meshes",
+        description="Skip meshes with no bones and no material. In TBRB these are the "
+                     "Blend_* patches a TexBlender uses to place facial wrinkles; they "
+                     "aren't visible geometry and would float over the face",
+        default=True,
+    )
+
     parent_to_armature: BoolProperty(
         name="Parent To Active Armature",
         description="Parent the imported meshes to the selected armature and add an "
@@ -472,7 +507,7 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
         try:
             dir_name, meshes, failed = parse_gdrb_meshes(self.filepath)
         except Exception as e:
-            _log(f"GDRB MESH IMPORT FAILED: {e}")
+            _log(f"{self._game_label} MESH IMPORT FAILED: {e}")
             self.report({'ERROR'}, f"Could not parse mesh milo: {e}")
             return {'CANCELLED'}
 
@@ -482,7 +517,8 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
                         "(A skeleton milo holds only Trans and CharCollide entries.)")
             return {'CANCELLED'}
 
-        _log(f"===== Importing GDRB meshes from '{dir_name}' ({self.filepath}) =====")
+        _log(f"===== Importing {self._game_label} meshes from '{dir_name}' "
+             f"({self.filepath}) =====")
         lods = [m for m in meshes if m['is_lod']]
         shadows = [m for m in meshes if m['is_shadow']]
         _log(f"  {len(meshes)} mesh(es) parsed, {len(lods)} LOD, {len(shadows)} shadow"
@@ -496,7 +532,12 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
 
         wanted = [m for m in meshes
                   if not (self.exclude_lod and m['is_lod'])
-                  and not (self.exclude_shadow and m['is_shadow'])]
+                  and not (self.exclude_shadow and m['is_shadow'])
+                  and not (self.exclude_helpers and m.get('is_helper'))]
+        helpers = [m for m in meshes if m.get('is_helper')]
+        if helpers and self.exclude_helpers:
+            _log(f"  {len(helpers)} helper mesh(es) skipped (no bones, no material): "
+                 f"{', '.join(m['name'] for m in helpers)}")
 
         # A mesh that exists ONLY as a LOD has no full-detail counterpart, so excluding
         # LODs removes that piece of the character entirely rather than just downgrading
@@ -530,6 +571,24 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
         for nm, reason in failed:
             _log(f"    SKIPPED {nm}: {reason}")
 
+        tex_summary = ""
+        if self.import_textures:
+            # Imported here rather than at module level: texture_importer itself uses this
+            # module's directory helpers.
+            from .texture_importer import apply_textures
+            wanted_mats = sorted({m['mat'] for m in wanted if m['mat']})
+            try:
+                done, n_images, tex_notes = apply_textures(
+                    self.filepath, wanted_mats, self.flip_normal_green)
+                _log(f"  textures: {done} of {len(wanted_mats)} material(s) textured, "
+                     f"{n_images} image(s) decoded")
+                for n in tex_notes:
+                    _log(f"    {n}")
+                tex_summary = f"; {done} material(s) textured"
+            except Exception as e:
+                _log(f"  textures: could not be imported ({e})")
+                tex_summary = "; textures failed (see log)"
+
         if unmatched_bones:
             sample = ', '.join(sorted(unmatched_bones)[:8])
             _log(f"  {len(unmatched_bones)} vertex group(s) name bones the armature "
@@ -541,9 +600,33 @@ class IMPORT_OT_gdrb_meshes(bpy.types.Operator, ImportHelper):
                    + (f"; {len(lods)} LOD skipped" if self.exclude_lod and lods else "")
                    + (f"; {len(shadows)} shadow skipped"
                       if self.exclude_shadow and shadows else "")
-                   + (f"; {len(failed)} failed (see log)" if failed else ""))
+                   + (f"; {len(failed)} failed (see log)" if failed else "")
+                   + tex_summary)
         if armature_obj is not None:
             summary += f"; parented to '{armature_obj.name}'"
         _log(f"===== {summary} =====")
         self.report({'WARNING' if failed else 'INFO'}, summary)
         return {'FINISHED'}
+
+
+class IMPORT_OT_gdrb_meshes(_IMPORT_OT_milo_meshes_base):
+    """Import the meshes from a Green Day: Rock Band character milo, with UVs, per-bone
+    vertex groups and textured materials"""
+    bl_idname = "import_scene.gdrb_meshes"
+    bl_label = "Import GDRB Meshes Milo"
+    _game_label = "GDRB"
+
+
+class IMPORT_OT_tbrb_meshes(_IMPORT_OT_milo_meshes_base):
+    """Import the meshes from a The Beatles: Rock Band character milo, with UVs, per-bone
+    vertex groups and textured materials.
+
+    TBRB is one revision behind GDRB on every object it uses - RndMesh 36, RndTex 10,
+    RndMat 55 against 37, 11 and 56 - with the same vertex layout, so it shares GDRB's
+    reader. Verified on two retail Xbox 360 milos (george_headhands_long, straw): all 44
+    meshes parse with unit normals, weights summing to exactly 1.0 and no stray bone slots.
+    What differs is handled where it's read: '_lod00' naming (see is_lod_name), helper
+    meshes, and a render-target head normal map (see texture_importer)."""
+    bl_idname = "import_scene.tbrb_meshes"
+    bl_label = "Import TBRB Meshes Milo"
+    _game_label = "TBRB"

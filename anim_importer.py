@@ -102,11 +102,19 @@ from .utilities import _log
 from .mesh_importer import _read_dir_entries, _entry_spans, MeshImportError
 from .viseme_importer import (
     _Reader, _locate_bone_samples, _channel_stem, build_bone_lookup,
+    _read_char_bones_samples, VisemeImportError,
 )
 
 
 # The frame table is indexed at this many subdivisions per beat - see the module docstring.
-BEAT_SUBDIVISIONS = 20
+# The frame table maps clip time to a fractional sample index at 30 entries per SECOND of
+# clip time (clip time = beat / the clip's own beats_per_sec). Checked exactly on two clips:
+# 21 Guns' main_anim (491.3 beats at 1.5 beats/s = 327.53 s -> 9826 + 1 entries) and the
+# j_e_idle_01 idle (26.929 beats at 2.143 beats/s = 12.567 s -> 377 + 1 entries).
+# An earlier version used "20 entries per beat"; that was a coincidence of main_anim's
+# 1.5 beats/s (20 x 1.5 = 30), gives identical results for any clip at that tempo, and the
+# wrong speed for any other.
+FRAME_TABLE_RATE = 30.0
 DEFAULT_FALLBACK_BPM = 120.0
 MIDI_TEMPO_META = 0x51
 
@@ -116,6 +124,9 @@ _ANIM_END_BEAT = "milo_anim_end_beat"
 _ANIM_BEAT_TABLE = "milo_anim_beat_table"
 _ANIM_SAMPLES = "milo_anim_samples"
 _ANIM_BPS = "milo_anim_beats_per_sec"
+# Custom property on the armature remembering which character milo supplies its twist
+# solver settings, so the animation import can fill it in.
+CHARACTER_PATH_PROP = "milo_character_path"
 
 
 class AnimImportError(Exception):
@@ -280,10 +291,51 @@ def _parse_clip_header(chunk):
                 end_beat=end_beat, beats_per_sec=beats_per_sec)
 
 
+# How far into a clip the wide search looks for its sample block. GDRB's j_e_idle_01 puts it
+# at byte 243 behind a 17-entry transition table; a clip with many more transitions would
+# sit further in, so this leaves plenty of room.
+_WIDE_SEARCH_LIMIT = 65536
+# Bytes a clip may hold after its sample blocks. Both the 21 Guns performance and
+# j_e_idle_01 end exactly 4 bytes after them.
+_MAX_TRAILING = 16
+
+
+def _locate_bone_samples_wide(chunk):
+    """Fallback for clips whose header is longer than a performance's.
+
+    A song performance's samples start right after a short header, which is all
+    _locate_bone_samples searches. GDRB's idle clips add a transition table after the clip
+    name - j_e_idle_01 carries 17 pairs of beat values naming where it can loop or hand off -
+    so their samples start further in (byte 243 there). Scanning further raises the chance of
+    a false match, so this demands more: the two blocks must share a version, as every real
+    clip's do, and they must end within a few bytes of the end of the entry."""
+    for off in range(0, min(len(chunk), _WIDE_SEARCH_LIMIT)):
+        try:
+            r = _Reader(chunk, off)
+            full = _read_char_bones_samples(r)
+            one = _read_char_bones_samples(r)
+        except Exception:
+            continue
+        if full['version'] != one['version']:
+            continue
+        if not (0 <= len(chunk) - r.p <= _MAX_TRAILING):
+            continue
+        if not full['samples'] and not one['samples']:
+            continue
+        return off, full, one, r.p
+    raise AnimImportError("couldn't locate this clip's sample data, even with a wide search")
+
+
 def parse_animation_clip(chunk, name):
     """Decodes one CharClipSamples entry into a clip dict."""
     header = _parse_clip_header(chunk)
-    _off, full, one, _end = _locate_bone_samples(chunk)
+    try:
+        _off, full, one, _end = _locate_bone_samples(chunk)
+    except VisemeImportError:
+        # Clips with a transition table in their header (idles, for instance) push the
+        # sample block past the window _locate_bone_samples searches. See
+        # _locate_bone_samples_wide.
+        _off, full, one, _end = _locate_bone_samples_wide(chunk)
 
     if not full['samples']:
         raise AnimImportError("clip has no animated samples")
@@ -291,14 +343,16 @@ def parse_animation_clip(chunk, name):
     table = list(full['frame_times'])
     num_samples = full['num_samples']
 
-    # The table is a beat->sample lookup, so its length should be end_beat*20 + 1 and its
-    # final entry should be the last sample index. If either fails, the interpretation is
-    # wrong for this clip and the timing would be silently bogus.
-    expected = int(round(header['end_beat'] * BEAT_SUBDIVISIONS)) + 1
+    # The table maps clip time to sample index at FRAME_TABLE_RATE entries per second, so its
+    # length should be (end_beat / beats_per_sec) * 30 + 1 and its final entry the last sample
+    # index. If either fails, the interpretation is wrong for this clip and the timing would
+    # be silently bogus.
+    bps = header['beats_per_sec'] or 1.0
+    expected = int(round(header['end_beat'] / bps * FRAME_TABLE_RATE)) + 1
     if table and abs(len(table) - expected) > 1:
         _log(f"    WARNING: '{name}' frame table has {len(table)} entries but end_beat "
-             f"{header['end_beat']:.2f} predicts {expected} at {BEAT_SUBDIVISIONS} "
-             f"subdivisions/beat - timing for this clip is unverified.")
+             f"{header['end_beat']:.2f} predicts {expected} at {FRAME_TABLE_RATE:g} "
+             f"entries per second of clip time - timing for this clip is unverified.")
     if table and abs(table[-1] - (num_samples - 1)) > 1.0:
         _log(f"    WARNING: '{name}' frame table ends at {table[-1]:.1f} but the clip has "
              f"{num_samples} samples - timing for this clip is unverified.")
@@ -321,7 +375,8 @@ def parse_animation_milo(filepath):
             continue
         try:
             clips.append(parse_animation_clip(body[s:e], ename))
-        except (AnimImportError, MeshImportError, ValueError, struct.error) as ex:
+        except (AnimImportError, MeshImportError, VisemeImportError, ValueError,
+                struct.error) as ex:
             failed.append((ename, str(ex)))
     return dir_name, clips, failed
 
@@ -527,6 +582,96 @@ def write_twist_keys(cache, pose_bones, rig, channels, frame, conjugate, prev, c
         counters['twist_keys'] += 4
 
 
+def build_twist_rigs(arm_obj, lookup, solve, character_path):
+    """Builds the arm twist rigs for an armature, or returns ([], notes). Shared by the
+    performance and clip-set importers. A character milo path that reads successfully is
+    remembered on the armature."""
+    if not solve:
+        return [], []
+    configs = None
+    notes = []
+    if character_path:
+        try:
+            with open(bpy.path.abspath(character_path), 'rb') as f:
+                configs = read_twist_configs(read_milo_container_body(f.read()))
+            notes.append(f"read {len(configs['fore'])} forearm and "
+                         f"{len(configs['upper'])} upper-arm solver(s) from the "
+                         f"character milo")
+        except Exception as e:
+            configs = None
+            notes.append(f"could not read the character milo ({e}); using defaults")
+        # Remembering the path is separate from reading it, so a failure here can't be
+        # reported as a failure to read the file.
+        if configs and (configs['fore'] or configs['upper']):
+            try:
+                arm_obj[CHARACTER_PATH_PROP] = character_path
+            except (TypeError, AttributeError):
+                pass
+    parents = {}
+    for pb in arm_obj.pose.bones:
+        parents[pb.bone.name] = pb.bone.parent.name if pb.bone.parent else None
+
+    def rest(name):
+        bone = arm_obj.pose.bones[name].bone
+        if bone.parent is not None:
+            rl = bone.parent.matrix_local.inverted() @ bone.matrix_local
+        else:
+            rl = bone.matrix_local
+        # Blender's columns are the basis vectors; the solvers want them as rows.
+        rows = tuple(tuple(rl[j][i] for j in range(3)) for i in range(3))
+        t = rl.to_translation()
+        return rows, (t.x, t.y, t.z)
+
+    rigs, more = build_rigs(lookup, parents, rest, configs)
+    return rigs, notes + more
+
+
+def _interp_channels(clip, sample_pos):
+    """The clip's channels at a FRACTIONAL sample index, blending the two neighbouring
+    samples: positions and hinge angles linearly, quaternions by sign-aligned normalised
+    blend. The frame table points between samples because the motion capture was decimated
+    unevenly, so this is what playback between stored samples looks like."""
+    n = clip['num_samples']
+    sample_pos = max(0.0, min(float(sample_pos), n - 1.0))
+    i0 = int(sample_pos)
+    i1 = min(i0 + 1, n - 1)
+    t = sample_pos - i0
+    a = sample_channels(clip, i0)
+    if t <= 1e-6 or i1 == i0:
+        return a
+    b = sample_channels(clip, i1)
+    out = {}
+    for chan, (kind, v0) in a.items():
+        v1 = b.get(chan, (kind, v0))[1]
+        if kind == 'quat':
+            if sum(x * y for x, y in zip(v0, v1)) < 0.0:
+                v1 = tuple(-x for x in v1)
+            q = [x + (y - x) * t for x, y in zip(v0, v1)]
+            mag = math.sqrt(sum(x * x for x in q)) or 1.0
+            out[chan] = (kind, tuple(x / mag for x in q))
+        elif kind == 'pos':
+            out[chan] = (kind, tuple(x + (y - x) * t for x, y in zip(v0, v1)))
+        else:
+            out[chan] = (kind, v0 + (v1 - v0) * t)
+    return out
+
+
+def _clip_groups(body, entries, spans, clip_names):
+    """{clip name: [group names]} from the milo's CharClipGroups. A group lists its member
+    clips by name (GDRB's 'stand' holds just j_e_idle_01), so member names are matched
+    against the file's own clips."""
+    groups = {}
+    for (etype, ename), (s, e) in zip(entries, spans):
+        if etype != 'CharClipGroup':
+            continue
+        data = body[s:e]
+        for clip in clip_names:
+            tag = struct.pack('>I', len(clip)) + clip.encode('latin-1')
+            if tag in data:
+                groups.setdefault(clip, []).append(ename)
+    return groups
+
+
 # ---------------------------------------------------------------------------------------
 # Operators
 # ---------------------------------------------------------------------------------------
@@ -536,7 +681,7 @@ class IMPORT_OT_gdrb_animation(bpy.types.Operator, ImportHelper):
     Action keyed at the clip's own sample resolution; use Bake Performance afterwards to
     retime it onto the scene timeline with the song's tempo"""
     bl_idname = "import_scene.gdrb_animation"
-    bl_label = "Import GDRB Animation Milo"
+    bl_label = "Import GDRB CharClip Milo"
     bl_options = {'REGISTER', 'UNDO'}
 
     filename_ext = ".milo_xbox"
@@ -562,47 +707,30 @@ class IMPORT_OT_gdrb_animation(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    # A plain text field on purpose. This dialog is itself a file browser, and Blender can't
+    # open a second one from inside it, so a file-path field's folder button here only ever
+    # produced "Cannot activate a file selector dialog, one already open". Use Object >
+    # Rock Band Animation > Set Character Milo to pick the file instead; it's remembered on
+    # the armature and filled in here automatically.
     character_path: StringProperty(
         name="Character Milo",
         description="Optional: the character's own milo (e.g. billiejoe.milo_xbox), to "
-                     "read its twist solvers' settings. Without it, the standard settings "
-                     "are used, which match Billie Joe's",
-        subtype='FILE_PATH',
+                     "read its twist solvers' settings. Filled in automatically from Object "
+                     "> Rock Band Animation > Set Character Milo, or paste a path. Without "
+                     "it, the standard settings are used, which match Billie Joe's",
         default="",
     )
 
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is not None and obj.type == 'ARMATURE':
+            stored = obj.get(CHARACTER_PATH_PROP)
+            if stored:
+                self.character_path = stored
+        return ImportHelper.invoke(self, context, event)
+
     def _twist_rigs(self, arm_obj, lookup):
-        """Builds the arm twist rigs for this armature, or returns ([], notes)."""
-        if not self.solve_arm_twist:
-            return [], []
-        configs = None
-        notes = []
-        if self.character_path:
-            try:
-                with open(bpy.path.abspath(self.character_path), 'rb') as f:
-                    configs = read_twist_configs(read_milo_container_body(f.read()))
-                notes.append(f"read {len(configs['fore'])} forearm and "
-                             f"{len(configs['upper'])} upper-arm solver(s) from the "
-                             f"character milo")
-            except Exception as e:
-                notes.append(f"could not read the character milo ({e}); using defaults")
-        parents = {}
-        for pb in arm_obj.pose.bones:
-            parents[pb.bone.name] = pb.bone.parent.name if pb.bone.parent else None
-
-        def rest(name):
-            bone = arm_obj.pose.bones[name].bone
-            if bone.parent is not None:
-                rl = bone.parent.matrix_local.inverted() @ bone.matrix_local
-            else:
-                rl = bone.matrix_local
-            # Blender's columns are the basis vectors; the solvers want them as rows.
-            rows = tuple(tuple(rl[j][i] for j in range(3)) for i in range(3))
-            t = rl.to_translation()
-            return rows, (t.x, t.y, t.z)
-
-        rigs, more = build_rigs(lookup, parents, rest, configs)
-        return rigs, notes + more
+        return build_twist_rigs(arm_obj, lookup, self.solve_arm_twist, self.character_path)
 
     def execute(self, context):
         arm_obj = context.active_object
@@ -752,6 +880,10 @@ class POSE_OT_bake_gdrb_animation(bpy.types.Operator):
 
         table = list(source[_ANIM_BEAT_TABLE])
         end_beat = float(source[_ANIM_END_BEAT])
+        # The clip's own tempo converts its beats to the clip time the frame table is indexed
+        # by. Actions imported before this was stored are from 1.5 beats/s clips - the only
+        # tempo the old 20-per-beat rule was right for - so that's the fallback.
+        clip_bps = float(source.get(_ANIM_BPS) or 1.5)
         if not table:
             self.report({'ERROR'}, "This Action has no beat table stored.")
             return {'CANCELLED'}
@@ -820,7 +952,7 @@ class POSE_OT_bake_gdrb_animation(bpy.types.Operator):
             if beat > end_beat:
                 past_end += 1
                 continue
-            idx = beat * BEAT_SUBDIVISIONS
+            idx = beat / clip_bps * FRAME_TABLE_RATE
             # Interpolate the beat table, then interpolate between the two samples it
             # points at - the table stores a FRACTIONAL sample index, and sample spacing
             # is uneven because the mocap was adaptively decimated.
@@ -864,6 +996,42 @@ def _group_of(fcurve):
     return "Animation"
 
 
+class POSE_OT_set_gdrb_character_milo(bpy.types.Operator, ImportHelper):
+    """Choose the character milo whose arm twist solver settings the animation import
+    should use. It's remembered on the selected armature and filled in automatically"""
+    bl_idname = "pose.set_gdrb_character_milo"
+    bl_label = "Set Character Milo"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3;*.milo", options={'HIDDEN'})
+
+    def execute(self, context):
+        arm_obj = context.active_object
+        if arm_obj is None or arm_obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the character's armature first.")
+            return {'CANCELLED'}
+        try:
+            with open(self.filepath, 'rb') as f:
+                configs = read_twist_configs(read_milo_container_body(f.read()))
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not read that milo: {e}")
+            return {'CANCELLED'}
+        found = len(configs['fore']) + len(configs['upper'])
+        if not found:
+            # Most likely the skeleton, outfit or head milo rather than the character's own.
+            self.report({'ERROR'},
+                        "No arm twist solvers in that milo. Pick the character's own milo "
+                        "(e.g. billiejoe.milo_xbox), not its skeleton, outfit or head milo.")
+            return {'CANCELLED'}
+        arm_obj[CHARACTER_PATH_PROP] = self.filepath
+        msg = (f"Character milo set on '{arm_obj.name}': {os.path.basename(self.filepath)} "
+               f"({len(configs['fore'])} forearm, {len(configs['upper'])} upper-arm solver(s))")
+        _log(msg)
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class VIEW3D_MT_milo_animation(bpy.types.Menu):
     bl_idname = "VIEW3D_MT_milo_animation"
     bl_label = "Rock Band Animation"
@@ -871,9 +1039,144 @@ class VIEW3D_MT_milo_animation(bpy.types.Menu):
     def draw(self, context):
         self.layout.operator(POSE_OT_bake_gdrb_animation.bl_idname,
                              text="Bake Performance", icon='ACTION')
+        self.layout.operator(POSE_OT_set_gdrb_character_milo.bl_idname,
+                             text="Set Character Milo...", icon='FILEBROWSER')
 
 
 def menu_func_gdrb_animation(self, context):
     obj = context.active_object
     if obj is not None and obj.type == 'ARMATURE':
         self.layout.menu(VIEW3D_MT_milo_animation.bl_idname)
+
+
+class IMPORT_OT_gdrb_clip_set(bpy.types.Operator, ImportHelper):
+    """Import every animation clip in a Green Day: Rock Band clip-set milo (idles and other
+    short clips) as one Action each on the active armature, already playing at the right
+    speed - no bake step. For full-song performances use the CharClip importer above"""
+    bl_idname = "import_scene.gdrb_clip_set"
+    bl_label = "Import GDRB Clip Set Milo"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3;*.milo", options={'HIDDEN'})
+
+    conjugate_rotations: BoolProperty(
+        name="Convert Rotation Convention",
+        description="Leave off for GDRB, as for performances: conjugating rotations "
+                     "deforms the character",
+        default=False,
+    )
+    solve_arm_twist: BoolProperty(
+        name="Solve Arm Twist Bones",
+        description="Compute the arm twist bones the way the game's twist solvers do",
+        default=True,
+    )
+    character_path: StringProperty(
+        name="Character Milo",
+        description="Optional: the character's own milo, for its twist solver settings. "
+                     "Filled in from Object > Rock Band Animation > Set Character Milo",
+        default="",
+    )
+
+    def invoke(self, context, event):
+        obj = context.active_object
+        if obj is not None and obj.type == 'ARMATURE' and obj.get(CHARACTER_PATH_PROP):
+            self.character_path = obj[CHARACTER_PATH_PROP]
+        return ImportHelper.invoke(self, context, event)
+
+    def execute(self, context):
+        arm_obj = context.active_object
+        if arm_obj is None or arm_obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the target armature first.")
+            return {'CANCELLED'}
+        try:
+            with open(self.filepath, 'rb') as f:
+                body = read_milo_container_body(f.read())
+            _rev, _dt, dir_name, entries = _read_dir_entries(body)
+            spans = _entry_spans(body, len(entries))
+            dir_name_, clips, failed = parse_animation_milo(self.filepath)
+        except Exception as e:
+            _log(f"GDRB CLIP SET IMPORT FAILED: {e}")
+            self.report({'ERROR'}, f"Could not parse clip-set milo: {e}")
+            return {'CANCELLED'}
+        if not clips:
+            self.report({'ERROR'}, "No animation clips (CharClipSamples) in this milo.")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
+        groups = _clip_groups(body, entries, spans, [c['name'] for c in clips])
+        lookup = build_bone_lookup(arm_obj)
+        pose_bones = arm_obj.pose.bones
+        rigs, notes = build_twist_rigs(arm_obj, lookup, self.solve_arm_twist,
+                                       self.character_path)
+        _log(f"===== Importing GDRB clip set '{dir_name}' from {self.filepath} =====")
+        for n in notes:
+            _log(f"  {n}")
+
+        made = 0
+        unmatched = set()
+        for clip in clips:
+            name = clip['name']
+            bps = clip['beats_per_sec'] or 1.0
+            seconds = clip['end_beat'] / bps
+            table = clip['beat_table']
+            frames = int(math.ceil(seconds * fps)) + 1
+
+            action_name = f"CLIP_{name}"
+            existing = bpy.data.actions.get(action_name)
+            if existing is not None:
+                bpy.data.actions.remove(existing)
+            action = bpy.data.actions.new(action_name)
+            action["milo_clip"] = True
+            action["milo_clip_name"] = name
+            action["milo_clip_set"] = dir_name
+            action["milo_clip_groups"] = groups.get(name, [])
+            action["milo_clip_seconds"] = seconds
+            # A library of clips nothing is assigned to yet would otherwise have zero users
+            # and be discarded when the file is saved and reopened.
+            action.use_fake_user = True
+            slot = action.slots.new(id_type='OBJECT', name=arm_obj.name)
+            cache = _CurveCache(_get_channelbag(action, slot))
+            counters = {'keys': 0, 'unmatched': set(), 'twist_keys': 0}
+            twist_prev = {}
+
+            # Keyed straight onto the scene timeline: frame k is k/fps seconds into the
+            # clip, the frame table turns that into a fractional sample index at
+            # FRAME_TABLE_RATE entries per second, and the two neighbouring samples are
+            # blended.
+            for k in range(frames):
+                idx = min(k / fps, seconds) * FRAME_TABLE_RATE
+                if table:
+                    i0 = max(0, min(int(idx), len(table) - 1))
+                    i1 = min(i0 + 1, len(table) - 1)
+                    t = idx - i0
+                    sample_pos = table[i0] * (1.0 - t) + table[i1] * t
+                else:
+                    sample_pos = idx / max(seconds * FRAME_TABLE_RATE, 1e-6) \
+                        * (clip['num_samples'] - 1)
+                channels = _interp_channels(clip, sample_pos)
+                write_pose_keys(cache, pose_bones, lookup, channels, k + 1,
+                                self.conjugate_rotations, counters)
+                for rig in rigs:
+                    write_twist_keys(cache, pose_bones, rig, channels, k + 1,
+                                     self.conjugate_rotations, twist_prev, counters)
+            cache.finish()
+            unmatched |= counters['unmatched']
+            made += 1
+            grp = f", group {', '.join(groups[name])}" if name in groups else ""
+            _log(f"  '{name}': {seconds:.2f}s at {bps * 60:.1f} BPM -> {frames} frame(s), "
+                 f"{counters['keys']} keyframe(s){grp}")
+
+        for nm, reason in failed:
+            _log(f"  SKIPPED {nm}: {reason}")
+        if unmatched:
+            stems = sorted({_channel_stem(c) for c in unmatched})
+            _log(f"  {len(stems)} animated bone(s) aren't on '{arm_obj.name}' and were "
+                 f"skipped: {', '.join(stems)}")
+        summary = (f"Imported {made} clip(s) from '{dir_name}' as CLIP_ Actions"
+                   + (f", {len(failed)} failed" if failed else ""))
+        _log(f"===== {summary} =====")
+        _log("  Each Action plays at the clip's own speed - assign one to preview it.")
+        self.report({'WARNING' if failed else 'INFO'}, summary)
+        return {'FINISHED'}
