@@ -199,6 +199,19 @@ class VisemeImportError(Exception):
     pass
 
 
+class EmptyVisemeClip(VisemeImportError):
+    """A clip whose structure is valid but whose sample blocks hold no channels at all.
+
+    That's real retail data, not a decoding failure: Paul's TBRB l_open_pucker is laid out
+    exactly like its mirror r_open_pucker - header, both sample blocks, then the list of
+    channels it drives (53 of them), with every byte of the entry accounted for - but both
+    sample blocks are empty, where r_open_pucker's carries 10 channels and George's own
+    l_open_pucker carries 7. A clip with no offsets means "no change from Base", so the
+    operator imports it as an empty Action rather than skipping it: the name still exists
+    for the lipsync bake, and it moves nothing, which is what the file says."""
+    pass
+
+
 # ---------------------------------------------------------------------------------------
 # CharBonesSamples / CharBones decoding
 # ---------------------------------------------------------------------------------------
@@ -429,7 +442,7 @@ def parse_viseme_clip(entry_bytes):
         pose.update(one['samples'][0])
 
     if not pose:
-        raise VisemeImportError("this clip has no bone samples in either block")
+        raise EmptyVisemeClip("this clip's sample blocks are present but hold no channels")
     return pose, full, one
 
 
@@ -914,6 +927,97 @@ def _build_viseme_action(armature_obj, clip_name, set_name, pose, bone_lookup=No
 # Operator
 # ---------------------------------------------------------------------------------------
 
+# Tags on the neutral Action built from a set's Base clip. It deliberately does NOT carry
+# _MILO_VISEME_TAG: it isn't a viseme to blend, it's the layer every viseme sits on.
+_MILO_NEUTRAL_TAG = "milo_viseme_neutral"
+_MILO_NEUTRAL_ARMATURE = "milo_viseme_armature"
+NEUTRAL_ACTION_NAME = "VISEME_Base"
+
+# Below these, a bone's Base offset is quantisation noise rather than a real difference
+# from the rest pose, so it isn't keyed. One int16 position step is 1300/32767 = 0.0397
+# units; Billie Joe's GDRB Base matches his skeleton within one step on 35 of 36 bones and
+# within a degree on every rotation, so rigs whose Base matches their rest pose get an
+# (almost) empty neutral and their bakes stay as they were.
+_NEUTRAL_MIN_LOC = 0.04
+_NEUTRAL_MIN_ANGLE = math.radians(1.0)
+
+
+def build_neutral_action(armature_obj, set_name, base_pose, bone_lookup, convention):
+    """Builds 'VISEME_Base': the pose that moves each bone from the rig's rest pose to the
+    set's Base clip - the game's neutral face.
+
+    The game builds a face as Base plus the weighted viseme offsets (every viseme clip is
+    stored relative to Base; Paul's TBRB character confirms each clip names Base as its
+    reference). The visemes are imported as offsets from the rig's REST pose instead, which
+    is only the same thing when the rest pose matches Base. On RB3 and Billie Joe's GDRB rig
+    it does. On George's TBRB rig it doesn't - his Base eyelids sit about 42 degrees from
+    his skeleton's rest pose - so without this layer his neutral face is wrong.
+
+    Base stores absolute local transforms, so each bone's offset is the rest pose divided
+    out of Base: location = rest_rot^-1 * (Base_pos - rest_pos), rotation = rest_rot^-1 *
+    Base_rot. Visemes then compose on top of it: positions add, rotations compose as
+    neutral then viseme. Returns (action, keyed bone count)."""
+    # Replace this armature's previous neutral, whatever Blender named it - with several
+    # characters in one file the later ones become 'VISEME_Base.001' and so on.
+    for old in [a for a in bpy.data.actions
+                if a.get(_MILO_NEUTRAL_TAG)
+                and a.get(_MILO_NEUTRAL_ARMATURE) == armature_obj.name]:
+        bpy.data.actions.remove(old)
+    action = bpy.data.actions.new(NEUTRAL_ACTION_NAME)
+    action[_MILO_NEUTRAL_TAG] = True
+    action[_MILO_NEUTRAL_ARMATURE] = armature_obj.name
+    action[_MILO_VISEME_SET] = set_name
+    action.use_fake_user = True
+    slot = action.slots.new(id_type='OBJECT', name=armature_obj.name)
+    cb = _get_or_create_channelbag(action, slot)
+
+    def key(path, index, group, value):
+        fc = cb.fcurves.new(path, index=index)
+        grp = cb.groups.get(group) or cb.groups.new(group)
+        fc.group = grp
+        fc.keyframe_points.insert(1, value).interpolation = 'CONSTANT'
+
+    keyed = set()
+    pose_bones = armature_obj.pose.bones
+    for chan, (kind, value) in base_pose.items():
+        bone_name = bone_lookup.get(_channel_stem(chan))
+        pb = pose_bones.get(bone_name) if bone_name else None
+        if pb is None or kind not in ('pos', 'quat'):
+            continue
+        bone = pb.bone
+        if bone.parent is not None:
+            rest_local = bone.parent.matrix_local.inverted() @ bone.matrix_local
+        else:
+            rest_local = bone.matrix_local
+        rest_rot = rest_local.to_quaternion()
+        path = f'pose.bones["{bone_name}"]'
+        if kind == 'pos':
+            loc = rest_rot.inverted() @ (Vector(value) - rest_local.to_translation())
+            if loc.length < _NEUTRAL_MIN_LOC:
+                continue
+            for i in range(3):
+                key(f'{path}.location', i, bone_name, loc[i])
+        else:
+            x, y, z, w = value
+            q = Quaternion((w, x, y, z))
+            if convention == 'ROW':
+                q = q.conjugated()
+            q.normalize()
+            basis = rest_rot.inverted() @ q
+            if basis[0] < 0.0:
+                basis = Quaternion((-basis[0], -basis[1], -basis[2], -basis[3]))
+            if basis.angle < _NEUTRAL_MIN_ANGLE:
+                continue
+            if pb.rotation_mode != 'QUATERNION':
+                pb.rotation_mode = 'QUATERNION'
+            for i in range(4):
+                key(f'{path}.rotation_quaternion', i, bone_name, basis[i])
+        keyed.add(bone_name)
+    for fc in cb.fcurves:
+        fc.update()
+    return action, len(keyed)
+
+
 class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
     """Shared viseme-set import logic. Not registered itself - each game subclasses it and
     supplies only how its milo's clips are found (_find_clips), so a change made for one
@@ -929,13 +1033,17 @@ class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
     def _find_clips(self, filepath):
         raise NotImplementedError
 
-    skip_base: BoolProperty(
-        name="Skip 'Base' Clip",
-        description="Don't import the clip literally named 'Base' - in every retail "
-                     "viseme set checked it holds the rig's absolute rest-space bone "
-                     "layout rather than a playable delta pose, and it never appears "
-                     "in real .lipsync viseme tables",
-        default=True,
+    neutral_from_base: BoolProperty(
+        name="Import Base Viseme",
+        description="Create VISEME_Base: the pose that moves the face from the skeleton's "
+                     "rest pose to the set's Base clip, the game's neutral face. The lipsync "
+                     "bake layers it under the visemes automatically. Off by default: it "
+                     "cleans up George's TBRB face (his Base eyelids sit about 42 degrees from "
+                     "his skeleton's rest pose), but on other Beatles tested so far it "
+                     "deforms the face - Paul's looks puffier and his eyelids distort. "
+                     "Turning it off also removes this armature's existing VISEME_Base, so "
+                     "re-baking goes back to the plain visemes",
+        default=False,
     )
 
     pos_space: EnumProperty(
@@ -1014,12 +1122,18 @@ class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
         # and the only signal was a WARNING buried at the end of a long log.
         parsed = {}
         failed = []
+        empty = []
         for clip_name, entry_bytes in clips.items():
-            if self.skip_base and clip_name == 'Base':
-                continue
+            if clip_name == 'Base':
+                continue          # absolute values, not an offset - see build_neutral_action
             try:
                 pose, _full, _one = parse_viseme_clip(entry_bytes)
                 parsed[clip_name] = pose
+            except EmptyVisemeClip:
+                parsed[clip_name] = {}
+                empty.append(clip_name)
+                _log(f"  '{clip_name}': the file stores no motion for this viseme (its "
+                     f"sample blocks are empty) - imported as an empty Action")
             except VisemeImportError as e:
                 _log(f"  SKIP '{clip_name}': {e}")
                 failed.append(clip_name)
@@ -1052,6 +1166,24 @@ class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
         elif self.rot_space in ('AUTO', 'MILO_REST'):
             _log("  No 'Base' clip in this set - can't measure the rotation convention, "
                  "assuming row-vector.")
+        if not self.neutral_from_base:
+            # Remove a neutral left from an earlier import with the option on, or the
+            # lipsync bake would keep layering it under this armature's visemes.
+            for act in [a for a in bpy.data.actions
+                        if a.get(_MILO_NEUTRAL_TAG)
+                        and a.get(_MILO_NEUTRAL_ARMATURE) == arm_obj.name]:
+                _log(f"  Neutral: removed '{act.name}' from an earlier import "
+                     f"(Import Base Viseme is off)")
+                bpy.data.actions.remove(act)
+        elif 'Base' in clips:
+            try:
+                base_pose, _f, _o = parse_viseme_clip(clips['Base'])
+                _act, n_keyed = build_neutral_action(arm_obj, dir_name, base_pose,
+                                                     bone_lookup, convention)
+                _log(f"  Neutral: {NEUTRAL_ACTION_NAME} built from Base - {n_keyed} bone(s) "
+                     f"differ from the rest pose and are keyed")
+            except VisemeImportError as e:
+                _log(f"  Neutral: could not build {NEUTRAL_ACTION_NAME} ({e})")
 
         imported = 0
         total_unmatched = set()
@@ -1063,7 +1195,9 @@ class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
                 conjugate_rotations=self.conjugate_rotations,
                 milo_rest_rot=milo_rest_rot, convention=convention)
             total_unmatched.update(unmatched)
-            if matched == 0:
+            if clip_name in empty:
+                action["milo_viseme_empty"] = True
+            elif matched == 0:
                 _log(f"  '{clip_name}': 0 bone name(s) matched the armature - "
                      f"Action created but empty.")
             imported += 1
@@ -1071,7 +1205,9 @@ class _IMPORT_OT_viseme_set_base(bpy.types.Operator, ImportHelper):
         skipped = len(clips) - len(parsed) - len(failed)
         summary = (f"Imported {imported} viseme Action(s) onto '{arm_obj.name}'"
                    + (f", skipped {skipped}" if skipped else "")
-                   + (f", {len(failed)} clip(s) failed to parse" if failed else ""))
+                   + (f", {len(failed)} clip(s) failed to parse" if failed else "")
+                   + (f"; {len(empty)} hold no motion in the file "
+                      f"({', '.join(empty)}), imported empty" if empty else ""))
         _log(f"===== {summary} =====")
         if total_unmatched:
             sample = ', '.join(sorted(total_unmatched)[:8])

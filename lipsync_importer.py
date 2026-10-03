@@ -88,6 +88,7 @@ from mathutils import Quaternion
 from .utilities import _log
 from .viseme_importer import (
     _MILO_VISEME_TAG, _MILO_VISEME_NAME, _get_or_create_channelbag,
+    _MILO_NEUTRAL_TAG, _MILO_NEUTRAL_ARMATURE,
 )
 
 
@@ -374,6 +375,38 @@ def collect_viseme_poses():
     return poses
 
 
+def collect_neutral(armature_name):
+    """The neutral layer for an armature - the VISEME_Base Action built from its viseme set's
+    Base clip - as {'loc': {bone: [x,y,z]}, 'quat': {bone: Quaternion}}, or None.
+
+    The game builds a face as Base plus the weighted visemes, so the bake puts this under
+    every frame. Only a neutral imported onto THIS armature is used: falling back to "the
+    only one in the file" would layer one character's Base under another's face - George's
+    under Paul's, for instance - since each Beatle's Base is his own."""
+    mine = [a for a in bpy.data.actions
+            if a.get(_MILO_NEUTRAL_TAG) and a.get(_MILO_NEUTRAL_ARMATURE) == armature_name]
+    if not mine:
+        return None
+    pick = mine[0]
+    cb = _action_channelbag(pick)
+    if cb is None:
+        return None
+    loc, quat = {}, {}
+    for fc in cb.fcurves:
+        if not len(fc.keyframe_points) or not fc.data_path.startswith('pose.bones["'):
+            continue
+        bone = fc.data_path[len('pose.bones["'):fc.data_path.index('"]')]
+        value = fc.keyframe_points[0].co[1]
+        if fc.data_path.endswith('.location'):
+            loc.setdefault(bone, [0.0, 0.0, 0.0])[fc.array_index] = value
+        elif fc.data_path.endswith('.rotation_quaternion'):
+            quat.setdefault(bone, [1.0, 0.0, 0.0, 0.0])[fc.array_index] = value
+    if not loc and not quat:
+        return None          # rest pose already matches Base - nothing to layer
+    return {'loc': loc, 'quat': {b: Quaternion(v) for b, v in quat.items()},
+            'name': pick.name}
+
+
 def blend_pose(active):
     """Blends weighted viseme poses into a single pose.
 
@@ -568,6 +601,70 @@ class POSE_OT_bake_lipsync_preview(bpy.types.Operator):
         default=False,
     )
 
+    def _bake_with_neutral(self, neutral, usable, poses, pose_bones, curve, start, end):
+        """Bakes Base + the blended visemes, as the game builds a face.
+
+        Every bone the neutral moves, and every bone any viseme drives, is keyed on every
+        frame - including frames where no viseme is active, which then show the neutral face
+        rather than holding whatever the last viseme left behind. Positions add (both are
+        offsets in the bone's rest frame); rotations compose as neutral then viseme, matching
+        how the viseme offsets were authored relative to Base. Returns the keyframe count."""
+        loc_bones = set(neutral['loc'])
+        quat_bones = set(neutral['quat'])
+        euler_bones = set()
+        for name in usable:
+            p = poses[name]
+            loc_bones |= set(p['loc'])
+            quat_bones |= set(p['quat'])
+            euler_bones |= set(p['euler'])
+        loc_bones = {b for b in loc_bones if b in pose_bones}
+        quat_bones = {b for b in quat_bones if b in pose_bones}
+        euler_bones = {b for b in euler_bones if b in pose_bones}
+        for b in quat_bones:
+            if pose_bones[b].rotation_mode != 'QUATERNION':
+                pose_bones[b].rotation_mode = 'QUATERNION'
+
+        identity = Quaternion((1.0, 0.0, 0.0, 0.0))
+        prev = {}
+        keys = 0
+        for frame in range(start, end + 1):
+            active = []
+            for name, fc in usable.items():
+                w = fc.evaluate(frame)
+                if w > 1e-4:
+                    active.append((w, poses[name]))
+            if active:
+                loc, quat, euler = blend_pose(active)
+            else:
+                loc, quat, euler = {}, {}, {}
+            for bone in loc_bones:
+                base = neutral['loc'].get(bone, (0.0, 0.0, 0.0))
+                v = loc.get(bone, (0.0, 0.0, 0.0))
+                path = f'pose.bones["{bone}"].location'
+                for i in range(3):
+                    curve(path, i, bone).keyframe_points.insert(
+                        frame, base[i] + v[i], options={'FAST'})
+                keys += 3
+            for bone in quat_bones:
+                q = neutral['quat'].get(bone, identity) @ quat.get(bone, identity)
+                last = prev.get(bone)
+                if last is not None and sum(a * b for a, b in zip(q, last)) < 0.0:
+                    q = Quaternion((-q[0], -q[1], -q[2], -q[3]))
+                prev[bone] = q
+                path = f'pose.bones["{bone}"].rotation_quaternion'
+                for i in range(4):
+                    curve(path, i, bone).keyframe_points.insert(
+                        frame, q[i], options={'FAST'})
+                keys += 4
+            for bone in euler_bones:
+                curve(f'pose.bones["{bone}"].rotation_euler', 2, bone
+                      ).keyframe_points.insert(frame, euler.get(bone, 0.0),
+                                               options={'FAST'})
+                keys += 1
+        _log(f"  Neutral: layered '{neutral['name']}' under the visemes "
+             f"({len(neutral['loc'])} position, {len(neutral['quat'])} rotation offset(s))")
+        return keys
+
     def invoke(self, context, event):
         self.frame_start = context.scene.frame_start
         self.frame_end = context.scene.frame_end
@@ -660,7 +757,11 @@ class POSE_OT_bake_lipsync_preview(bpy.types.Operator):
 
         _log(f"===== Baking lipsync preview '{song}' frames {start}-{end} =====")
         keys = 0
-        for frame in range(start, end + 1):
+        neutral = collect_neutral(arm_obj.name)
+        if neutral is not None:
+            keys += self._bake_with_neutral(neutral, usable, poses, pose_bones, curve,
+                                            start, end)
+        for frame in (range(start, end + 1) if neutral is None else ()):
             active = []
             for name, fc in usable.items():
                 w = fc.evaluate(frame)
