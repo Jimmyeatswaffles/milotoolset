@@ -42,7 +42,9 @@ strip.
 Choices made here, not read from the data:
   * The final move of an easy/medium routine has no next move to pick a transition from, so
     it uses the move's own repeat clip, A_A.
-  * The game's crossfades between clips aren't reproduced; strips butt end to end.
+  * Crossfades (on by default) use the NLA's own blend in/out over a fixed overlap - 16
+    frames, the overlap the retail section clips carry past their cut point - rather than
+    each clip's transition beats.
 """
 
 import math
@@ -226,11 +228,25 @@ class IMPORT_OT_dc_routine(bpy.types.Operator, ImportHelper):
         items=[('expert', "Expert", ""), ('medium', "Medium", ""), ('easy', "Easy", "")],
         default='expert',
     )
+    crossfade: BoolProperty(
+        name="Crossfade Between Clips",
+        description="Blend each clip into the next over a short overlap, using the NLA's own "
+                     "blend in/out, as the game blends between clips. Clips alternate between "
+                     "two tracks so they can overlap. Off: clips butt end to end on one track",
+        default=True,
+    )
+    crossfade_frames: bpy.props.FloatProperty(
+        name="Crossfade Length",
+        description="Overlap between consecutive clips, in the game's 30 fps frames. 16 is "
+                     "the overlap the retail section clips carry past their cut point",
+        default=16.0, min=1.0, max=60.0,
+    )
     hold_gaps: BoolProperty(
         name="Hold Between Clips",
-        description="Hold each clip's last pose until the next one starts. A move clip "
-                     "covers about 3 of its 4 beats; in the game the rest is a blend into "
-                     "the next move. Slots with no clip are left empty either way",
+        description="Without crossfading: hold each clip's last pose until the next one "
+                     "starts. (Crossfading always holds through the gap.) A move clip covers "
+                     "about 3 of its 4 beats; in the game the rest is a blend into the next "
+                     "move. Slots with no clip are left empty either way",
         default=True,
     )
 
@@ -274,28 +290,48 @@ class IMPORT_OT_dc_routine(bpy.types.Operator, ImportHelper):
         if ad.action is not None:
             _log(f"  note: the armature's active Action ('{ad.action.name}') plays on top of "
                  f"the NLA - clear it to see the routine")
-        track_name = f"DC Routine ({self.difficulty})"
-        for old in [t for t in ad.nla_tracks if t.name == track_name]:
+        base_name = f"DC Routine ({self.difficulty})"
+        for old in [t for t in ad.nla_tracks
+                    if t.name in (base_name, base_name + " A", base_name + " B")]:
             ad.nla_tracks.remove(old)
-        track = ad.nla_tracks.new()
-        track.name = track_name
+        if self.crossfade:
+            # Two tracks so neighbouring clips can overlap; B sits above A.
+            tracks = [ad.nla_tracks.new(), ad.nla_tracks.new()]
+            tracks[0].name, tracks[1].name = base_name + " A", base_name + " B"
+        else:
+            tracks = [ad.nla_tracks.new()]
+            tracks[0].name = base_name
 
-        placed, empty = 0, []
+        placed, empty, strips = 0, [], []
         filled = [s[2] is not None for s in slots]
         last_frame = 1.0
+        fade = self.crossfade_frames * scale
         for i, (start, end, clip, note) in enumerate(slots):
             if note:
-                (empty if clip is None else []).append(f"frame {start:.1f}: {note}")
-                if clip is not None:
+                if clip is None:
+                    empty.append(f"frame {start:.1f}: {note}")
+                else:
                     _log(f"  frame {start:.1f}: {note}")
             if clip is None:
                 continue
             action = actions[clip]
             a0, a1 = action.frame_range
             s0 = 1.0 + start * scale
-            length = a1 - a0
-            if end is not None:
-                length = min(length, (end - start) * scale - 1e-3)
+            nxt_filled = i + 1 < len(slots) and filled[i + 1]
+            overlap = 0.0
+            if end is None:
+                length = a1 - a0
+            elif self.crossfade and nxt_filled:
+                # Run past the next key by the crossfade, holding the last pose if the clip
+                # ends first (an F-curve holds its last value beyond its final key). Capped
+                # below the next slot so clip i never reaches clip i+2 on the same track.
+                nxt_end = slots[i + 2][0] if i + 2 < len(slots) else None
+                room = ((nxt_end - end) * scale * 0.9) if nxt_end is not None else fade
+                overlap = max(0.0, min(fade, room))
+                length = (end - start) * scale + overlap
+            else:
+                length = min(a1 - a0, (end - start) * scale - 1e-3)
+            track = tracks[placed % len(tracks)]
             strip = track.strips.new(f"{clip} @{start:.0f}", int(math.ceil(s0)), action)
             try:
                 strip.action_slot = action.slots[0]
@@ -308,17 +344,39 @@ class IMPORT_OT_dc_routine(bpy.types.Operator, ImportHelper):
             except (AttributeError, TypeError):
                 pass
             strip.blend_type = 'REPLACE'
-            nxt_filled = i + 1 < len(slots) and filled[i + 1]
-            strip.extrapolation = 'HOLD_FORWARD' if (self.hold_gaps and nxt_filled) \
-                else 'NOTHING'
+            try:
+                strip.use_auto_blend = False
+            except AttributeError:
+                pass
+            if self.crossfade:
+                strip.extrapolation = 'NOTHING'
+            else:
+                strip.extrapolation = 'HOLD_FORWARD' if (self.hold_gaps and nxt_filled) \
+                    else 'NOTHING'
+            strips.append((strip, placed % len(tracks), overlap, nxt_filled))
             placed += 1
             last_frame = max(last_frame, s0 + length)
+
+        # Crossfades: whichever of the two strips is on the upper track ramps its influence -
+        # the incoming one blends in, or the outgoing one blends out over the one beneath.
+        fades = 0
+        if self.crossfade:
+            for (sa, ta, ov, nxt), (sb, tb, _o, _n) in zip(strips, strips[1:]):
+                if not nxt or ov <= 0.0:
+                    continue
+                if tb == 1:
+                    sb.blend_in = ov
+                else:
+                    sa.blend_out = ov
+                fades += 1
+            _log(f"  crossfades: {fades}, {self.crossfade_frames:g} game frame(s) each "
+                 f"(shorter where the next slot is too short)")
 
         for e in empty:
             _log(f"  EMPTY {e}")
         scene.frame_start = 1
         scene.frame_end = max(scene.frame_end, int(math.ceil(last_frame)))
-        summary = (f"Placed {placed} clip(s) on NLA track '{track_name}'"
+        summary = (f"Placed {placed} clip(s) on {len(tracks)} NLA track(s) '{base_name}'"
                    + (f"; {len(empty)} slot(s) left empty (see log)" if empty else ""))
         _log(f"===== {summary} =====")
         self.report({'WARNING' if empty else 'INFO'}, summary)
