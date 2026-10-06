@@ -39,6 +39,9 @@ from .viseme_exporter import *
 from .mesh_importer import *
 from .anim_importer import *
 from .cam_importer import *
+from .gh2_lipsync import *
+from .dc_clip_importer import *
+from .dc_routine_importer import *
 from .lipsync_importer import *
 
 # `import *` skips names starting with underscore, so anything private that this file
@@ -74,6 +77,7 @@ from .skeleton_exporter import _read_skeleton_milo_trans, _trans_world_translati
 _ICON_FILES = {
     'RB3': "RB3.jpg",
     'DC1': "DC1.png",
+    'DC2': "DC2.png",      # not shipped yet - drop a DC2.png in icons/ and it's used
     'DC3': "DC3.png",
     'RB2': "RB2.jpg",
     'TBRB': "TBRB.jpg",
@@ -4181,6 +4185,22 @@ class TOPBAR_MT_milo_charclip_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_clip_set.bl_idname,
                         text="Green Day: Rock Band Clip Set (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        # RB3-era CharClips (version 19), read by dc_clip_importer. Every clip in the file
+        # becomes its own real-time Action, like the GDRB clip set.
+        layout.operator(IMPORT_OT_dc1_clip_set.bl_idname,
+                        text="Dance Central (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC1'))
+        layout.operator(IMPORT_OT_dc2_clip_set.bl_idname,
+                        text="Dance Central 2 (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC2'))
+        layout.operator(IMPORT_OT_dc3_clip_set.bl_idname,
+                        text="Dance Central 3 (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC3'))
+        # Lays the clips imported above out on the NLA in song order (song.anim). DC2 and
+        # DC3 routines share a format, so one entry serves both.
+        layout.operator(IMPORT_OT_dc_routine.bl_idname,
+                        text="Dance Central 2/3 Routine To NLA (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC3'))
         layout.separator()
         layout.operator(IMPORT_OT_gdrb_cameras.bl_idname,
                         text="Green Day: Rock Band Cameras (.milo_xbox)",
@@ -4204,6 +4224,9 @@ class TOPBAR_MT_milo_viseme_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_viseme_set.bl_idname,
                         text="Green Day: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        layout.operator(IMPORT_OT_gh2_viseme_set.bl_idname,
+                        text="Guitar Hero 2 (.milo_xbox)",
+                        icon_value=_milo_icon_id('GH2'))
 
 
 class TOPBAR_MT_milo_lipsync_import(bpy.types.Menu):
@@ -4216,6 +4239,11 @@ class TOPBAR_MT_milo_lipsync_import(bpy.types.Menu):
         self.layout.operator(IMPORT_OT_rb3_lipsync.bl_idname,
                              text="Rock Band Lipsync (.lipsync)",
                              icon_value=_milo_icon_id('RB3'))
+        # GH2's keyframed .voc format, read by gh2_lipsync. It produces the same weight
+        # channels as .lipsync, so the same Bake Lipsync Preview step plays it.
+        self.layout.operator(IMPORT_OT_gh2_voc.bl_idname,
+                             text="Guitar Hero 2 Lipsync (.voc)",
+                             icon_value=_milo_icon_id('GH2'))
 
 
 def _matrix_to_gh2_m12(mat):
@@ -4487,6 +4515,10 @@ classes = (
     IMPORT_OT_tbrb_meshes,
     IMPORT_OT_gdrb_animation,
     IMPORT_OT_gdrb_clip_set,
+    IMPORT_OT_dc1_clip_set,
+    IMPORT_OT_dc2_clip_set,
+    IMPORT_OT_dc3_clip_set,
+    IMPORT_OT_dc_routine,
     IMPORT_OT_gdrb_cameras,
     POSE_OT_bake_gdrb_animation,
     POSE_OT_set_gdrb_character_milo,
@@ -4499,6 +4531,8 @@ classes = (
     IMPORT_OT_rb3_viseme_set,
     IMPORT_OT_gdrb_viseme_set,
     IMPORT_OT_tbrb_viseme_set,
+    IMPORT_OT_gh2_viseme_set,
+    IMPORT_OT_gh2_voc,
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
     EXPORT_OT_milo_inject_base_viseme,

@@ -582,7 +582,7 @@ def write_twist_keys(cache, pose_bones, rig, channels, frame, conjugate, prev, c
         counters['twist_keys'] += 4
 
 
-def build_twist_rigs(arm_obj, lookup, solve, character_path):
+def build_twist_rigs(arm_obj, lookup, solve, character_path, offset_correction=None):
     """Builds the arm twist rigs for an armature, or returns ([], notes). Shared by the
     performance and clip-set importers. A character milo path that reads successfully is
     remembered on the armature."""
@@ -622,7 +622,10 @@ def build_twist_rigs(arm_obj, lookup, solve, character_path):
         t = rl.to_translation()
         return rows, (t.x, t.y, t.z)
 
-    rigs, more = build_rigs(lookup, parents, rest, configs)
+    if offset_correction is None:
+        rigs, more = build_rigs(lookup, parents, rest, configs)      # GDRB's correction
+    else:
+        rigs, more = build_rigs(lookup, parents, rest, configs, offset_correction)
     return rigs, notes + more
 
 
