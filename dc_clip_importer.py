@@ -1,5 +1,5 @@
 """
-Dance Central 1, 2 and 3 CharClip import.
+Dance Central 1, 2 and 3, and Rock Band 2, CharClip import.
 
 Imports every clip in a Dance Central clip milo (e.g. clips.milo_xbox: intros, idles, win
 poses) as its own Action on the active armature, keyed in real time - no bake step. It sits
@@ -26,6 +26,19 @@ ranges (elbow -100 to -14 deg, knee -33 to -18, finger joints 0 to 27).
 
 No clip animates a twist bone (59 distinct channels across all 17), so as in GDRB the arm
 twist bones are solved from the arm pose (twist_solvers), here with the standard settings.
+
+===========================================================================================
+ROCK BAND 2 - verified on the retail medium_dramatic.milo_ps3
+===========================================================================================
+A revision-25 milo, the TBRB/GDRB generation, with 72 CharClipSamples at version 14 wrapping
+a version-9 CharClip (type 'musician'). The sample blocks are GDRB's own - version 16,
+compression 1, a frame table - and only the clip header differs: a data tree pairing a facial
+expression with the clip, then start beat, end beat and tempo. Clips start part-way in, so
+the length is (end - start) / tempo, which matches each frame table exactly.
+
+Every clip carries bone_facing.pos and bone_facing.rotz, and unlike Dance Central's they
+TURN - all 72 rotate their facing, some through nearly 190 degrees - so the turning half of
+the root motion is exercised here for the first time on real data.
 
 ===========================================================================================
 DANCE CENTRAL 2 - verified on the retail forgetyou.milo_xbox (DLC)
@@ -226,9 +239,98 @@ def _scan_samples(chunk, start):
 _HEADER_TREE_VERSIONS = {'DC2': (20,), 'DC3': (22,)}
 
 
+# ---------------------------------------------------------------------------------------
+# Rock Band 2
+# ---------------------------------------------------------------------------------------
+
+RB2_SAMPLES_REV = 14
+TABLE_RATE = 30.0       # frame-table entries per second of clip time (as in GDRB)
+
+
+def _rb2_clip_header(c):
+    """(start_beat, end_beat, beats_per_sec) from an RB2 CharClipSamples (version 14
+    wrapping a version-9 CharClip). After the object header - revision, type ('musician'),
+    has-tree flag, the data tree if present, note - come the start beat, end beat and
+    tempo. The tree pairs a facial expression with the clip (viseme_group /
+    exp_rocker_teethgrit_happy) and is walked node by node; both tree-header sizes are
+    tried and a walk is only accepted if it lands on a sane tempo."""
+    if struct.unpack_from('>I', c, 0)[0] != RB2_SAMPLES_REV:
+        raise DCClipImportError("not an RB2 CharClipSamples (version 14)")
+    meta_rev = struct.unpack_from('>I', c, 8)[0]
+    p = 12
+    n = struct.unpack_from('>I', c, p)[0]; p += 4 + n            # type symbol
+    has_tree = c[p]; p += 1
+    starts = [p]
+    if has_tree:
+        starts = []
+        for header in (6, 8):
+            try:
+                starts.append(_skip_dtb_array(c, p, header=header))
+            except (DCClipImportError, struct.error, IndexError):
+                pass
+    for q in starts:
+        try:
+            if meta_rev > 0:
+                n = struct.unpack_from('>I', c, q)[0]
+                if n > 4096:
+                    continue
+                q += 4 + n                                         # note symbol
+            start, end, bps = struct.unpack_from('>3f', c, q)
+        except struct.error:
+            continue
+        if 0.05 <= bps <= 20.0 and end >= start and abs(start) < 1e6:
+            return start, end, bps
+    raise DCClipImportError("couldn't read this RB2 clip's header")
+
+
+def read_rb2_clips(filepath):
+    """Rock Band 2 clip milo -> same tuple as read_dc_clips. RB2 is a revision-25 milo
+    (the TBRB/GDRB generation) holding CharClipSamples whose sample blocks are GDRB's own
+    layout (version 16, a frame table); only the clip header differs. Verified on the retail
+    medium_dramatic.milo_ps3: all 72 clips."""
+    from .viseme_importer import find_viseme_clips_rev25
+    from .anim_importer import _locate_bone_samples_wide
+    from .mesh_importer import _read_dir_entries, _entry_spans
+    dir_name, raw = find_viseme_clips_rev25(filepath)
+    clips, failed = [], []
+    for name, chunk in raw.items():
+        try:
+            start, end, bps = _rb2_clip_header(chunk)
+            _off, full, one, _end = _locate_bone_samples_wide(chunk)
+        except Exception as e:
+            failed.append((name, str(e)))
+            continue
+        n = max(full['num_samples'], 1 if one['samples'] else 0)
+        if n == 0:
+            failed.append((name, "no samples"))
+            continue
+        # Length comes from the beat range, not the end beat alone: RB2 clips start part-way
+        # in (stand_idle_ext_c_med_05: beats 2.66 to 15.46 at 2.132/s = 6.0 s), and the
+        # frame table - 30 entries per second - has exactly 6.0 x 30 + 1 entries.
+        seconds = (end - start) / bps
+        clips.append(dict(name=name, fps=TABLE_RATE, full=full, one=one, num_samples=n,
+                          seconds=seconds, table=list(full['frame_times'])))
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    _rev, _dt, _dn, entries = _read_dir_entries(body)
+    spans = _entry_spans(body, len(entries))
+    groups = {}
+    for (etype, ename), (s, e) in zip(entries, spans):
+        if etype != 'CharClipGroup':
+            continue
+        data = body[s:e]
+        for c in clips:
+            tag = struct.pack('>I', len(c['name'])) + c['name'].encode('latin-1')
+            if tag in data:
+                groups.setdefault(c['name'], []).append(ename)
+    return dir_name, clips, groups, failed
+
+
 def read_dc_clips(filepath, game='DC1'):
     """Returns (dir_name, [clip dicts], {clip: [groups]}, [(name, reason)] failures).
     `game` is 'DC1' (version-19 clips), 'DC2' (version 20) or 'DC3' (version 22)."""
+    if game == 'RB2':
+        return read_rb2_clips(filepath)
     dir_name, raw = find_viseme_clips(filepath)
     clips, failed = [], []
     for name, chunk in raw.items():
@@ -573,7 +675,16 @@ class _IMPORT_OT_dc_clip_base(bpy.types.Operator, ImportHelper):
             rest_cache = {}
             targets = facing_targets(arm, lookup, clip) if self.apply_facing else set()
             for k in range(frames):
-                sample_pos = min(k / fps, clip['seconds']) * clip['fps']
+                t = min(k / fps, clip['seconds'])
+                table = clip.get('table')
+                if table:
+                    # Frame table: clip time (30 entries per second) -> fractional sample.
+                    idx = t * TABLE_RATE
+                    i0 = max(0, min(int(idx), len(table) - 1))
+                    i1 = min(i0 + 1, len(table) - 1)
+                    sample_pos = table[i0] + (table[i1] - table[i0]) * (idx - i0)
+                else:
+                    sample_pos = t * clip['fps']
                 channels = _interp_channels(clip, sample_pos)
                 if targets:
                     channels = apply_facing(channels, targets, conjugate)
@@ -631,3 +742,23 @@ class IMPORT_OT_dc2_clip_set(_IMPORT_OT_dc_clip_base):
     bl_idname = "import_scene.dc2_clip_set"
     bl_label = "Import DC2 CharClip Milo"
     _game = "DC2"
+
+
+class IMPORT_OT_rb2_clip_set(_IMPORT_OT_dc_clip_base):
+    """Import every animation clip in a Rock Band 2 clip milo (a musician's idles, rhythm
+    and solo moves) as its own Action on the active armature, keyed in real time at the
+    clip's own tempo, with the musician's movement and turning around the stage applied"""
+    bl_idname = "import_scene.rb2_clip_set"
+    bl_label = "Import RB2 CharClip Milo"
+    _game = "RB2"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
+
+    # No RB2 skeleton or character milo has been available to check the twist solvers'
+    # settings against, as was done for GDRB and Dance Central, so this starts off.
+    solve_arm_twist: BoolProperty(
+        name="Solve Twist Bones",
+        description="Compute twist bones with the standard forearm solver settings. Off by "
+                     "default for Rock Band 2: its settings haven't been verified",
+        default=False,
+    )

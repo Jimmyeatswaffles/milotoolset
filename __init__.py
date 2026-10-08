@@ -42,6 +42,7 @@ from .cam_importer import *
 from .gh2_lipsync import *
 from .dc_clip_importer import *
 from .dc_routine_importer import *
+from .gdrb_clip_exporter import *
 from .lipsync_importer import *
 
 # `import *` skips names starting with underscore, so anything private that this file
@@ -2882,6 +2883,11 @@ def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_milo_inject_base_viseme.bl_idname,
                           text="Inject New Base Viseme (Experimental)",
                           icon_value=_milo_icon_id('TBRB'))
+    # Loose GDRB animation clips (CharClipSamples) to compile into a milo by hand, like
+    # the TBRB custom song asset export.
+    self.layout.operator(EXPORT_OT_gdrb_raw_charclips.bl_idname,
+                         text="Green Day: Rock Band Raw CharClips",
+                         icon_value=_milo_icon_id('GDRB'))
 
 
 def _coll_redraw(self, context):
@@ -4185,6 +4191,9 @@ class TOPBAR_MT_milo_charclip_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_clip_set.bl_idname,
                         text="Green Day: Rock Band Clip Set (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        layout.operator(IMPORT_OT_rb2_clip_set.bl_idname,
+                        text="Rock Band 2 (.milo_xbox/.milo_ps3)",
+                        icon_value=_milo_icon_id('RB2'))
         # RB3-era CharClips (version 19), read by dc_clip_importer. Every clip in the file
         # becomes its own real-time Action, like the GDRB clip set.
         layout.operator(IMPORT_OT_dc1_clip_set.bl_idname,
@@ -4518,6 +4527,7 @@ classes = (
     IMPORT_OT_dc1_clip_set,
     IMPORT_OT_dc2_clip_set,
     IMPORT_OT_dc3_clip_set,
+    IMPORT_OT_rb2_clip_set,
     IMPORT_OT_dc_routine,
     IMPORT_OT_gdrb_cameras,
     POSE_OT_bake_gdrb_animation,
@@ -4536,6 +4546,7 @@ classes = (
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
     EXPORT_OT_milo_inject_base_viseme,
+    EXPORT_OT_gdrb_raw_charclips,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
     TOPBAR_MT_milo_mesh_import,
