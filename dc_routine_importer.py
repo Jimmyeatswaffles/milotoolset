@@ -111,6 +111,7 @@ def _parse_track(c, p):
         raise ValueError
     target, q = _sym(c, p + 4)
     prop, q = _prop_path(c, q)
+    interp = struct.unpack_from('>I', c, q)[0]
     q += 4                                    # interpolation
     _handler, q = _sym(c, q)
     q += 4                                    # exception id
@@ -132,7 +133,7 @@ def _parse_track(c, p):
             v = struct.unpack_from('>4f', c, q); q += 16
         f = struct.unpack_from('>f', c, q)[0]; q += 4
         keys.append((v, f))
-    return dict(type=_KEY_TYPES[kt], target=target, prop=prop, keys=keys), q
+    return dict(type=_KEY_TYPES[kt], target=target, prop=prop, interp=interp, keys=keys), q
 
 
 def parse_song_anim(c):
@@ -380,4 +381,138 @@ class IMPORT_OT_dc_routine(bpy.types.Operator, ImportHelper):
                    + (f"; {len(empty)} slot(s) left empty (see log)" if empty else ""))
         _log(f"===== {summary} =====")
         self.report({'WARNING' if empty else 'INFO'}, summary)
+        return {'FINISHED'}
+
+
+# ---------------------------------------------------------------------------------------
+# Face animation ("lipsync")
+# ---------------------------------------------------------------------------------------
+#
+# Each difficulty directory holds a CharLipSync, dancer_face.lipsync, but it carries no
+# timeline - only the list of expressions and a starting preset, about 700 bytes. The song's
+# face is animated by the PropAnim beside it, dancer_face.anim: one float track per
+# expression (Angry, Grin, Smirk ... and brow_* tracks), each keying that expression's weight
+# (0-1) on dancer_face.lipsync at the game's 30 fps. Verified on all nine (three songs x three
+# difficulties): DC2 writes PropAnim revision 14 and DC3 revision 15, same layout. The tracks
+# use linear (kLinear) or smooth (kHermite) interpolation, never stepped.
+#
+# The expression names are the DC viseme set's own clip names, so the weights land on the
+# same viseme_<name> channels a .lipsync import creates, and Bake Lipsync Preview drives the
+# DC visemes (imported with the Rock Band 3 viseme option) from them unchanged.
+
+_INTERP_TO_BLENDER = {0: 'CONSTANT', 1: 'LINEAR', 2: 'BEZIER', 3: 'BEZIER', 4: 'BEZIER',
+                      5: 'BEZIER', 6: 'BEZIER'}
+
+
+def read_face_anims(filepath):
+    """(dir_name, {difficulty: [(expression, interpolation, [(weight, frame)])]})."""
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    _, entries = _mw_collect_directory_meta(body, 0)
+    _dtype, q = _sym(body, 4)
+    dir_name, _q = _sym(body, q)
+    dirs = [(n, s, e) for t, n, s, e in entries if t == 'ObjectDir' and n in _DIFFICULTIES]
+    out = {}
+    for t, n, s, e in entries:
+        if t != 'PropAnim' or n != 'dancer_face.anim':
+            continue
+        owner = next((d for d, ds, de in dirs if ds <= s and e <= de), None)
+        if owner is None:
+            continue
+        c = body[s:e]
+        p, tracks = 0, []
+        while p < len(c) - 12:
+            try:
+                tr, q2 = _parse_track(c, p)
+                frames = [k[1] for k in tr['keys']]
+                if (tr['type'] == 'float' and tr['prop']
+                        and all(b >= a for a, b in zip(frames, frames[1:]))):
+                    tracks.append((str(tr['prop'][-1]), tr['interp'], tr['keys']))
+                    p = q2
+                    continue
+            except (ValueError, struct.error, IndexError, UnicodeDecodeError):
+                pass
+            p += 1
+        out[owner] = tracks
+    return dir_name, out
+
+
+class IMPORT_OT_dc_lipsync(bpy.types.Operator, ImportHelper):
+    """Import a Dance Central 2/3 song's facial animation from its milo as viseme weight
+    channels - the same kind a .lipsync import creates - for Bake Lipsync Preview to drive
+    the DC visemes with"""
+    bl_idname = "import_scene.dc_lipsync"
+    bl_label = "Import DC Face Animation"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+
+    difficulty: EnumProperty(
+        name="Difficulty",
+        description="Each difficulty has its own facial animation",
+        items=[('expert', "Expert", ""), ('medium', "Medium", ""), ('easy', "Easy", "")],
+        default='expert',
+    )
+    set_scene_range: BoolProperty(
+        name="Set Scene Frame Range",
+        description="Set the scene's frame range to cover the facial animation",
+        default=True,
+    )
+
+    def execute(self, context):
+        from .lipsync_importer import (ensure_weight_props, build_lipsync_action,
+                                       _action_channelbag, LIPSYNC_FPS)
+        obj = context.active_object
+        if obj is None or obj.type != 'ARMATURE':
+            self.report({'ERROR'}, "Select the dancer's armature first.")
+            return {'CANCELLED'}
+        try:
+            dir_name, anims = read_face_anims(self.filepath)
+        except Exception as e:
+            _log(f"DC FACE ANIMATION IMPORT FAILED: {e}")
+            self.report({'ERROR'}, f"Could not read the song milo: {e}")
+            return {'CANCELLED'}
+        tracks_in = anims.get(self.difficulty)
+        if not tracks_in:
+            self.report({'ERROR'}, f"No {self.difficulty} facial animation "
+                                   f"(dancer_face.anim) in this milo.")
+            return {'CANCELLED'}
+
+        tracks = {name: [(frame, weight) for weight, frame in keys]
+                  for name, _interp, keys in tracks_in}
+        names = sorted(tracks)
+        ensure_weight_props(obj, names)
+        song = f"{dir_name}_{self.difficulty}"
+        action, total = build_lipsync_action(obj, song, tracks, 'LINEAR')
+        modes = {name: _INTERP_TO_BLENDER.get(interp, 'BEZIER')
+                 for name, interp, _keys in tracks_in}
+        cb = _action_channelbag(action)
+        if cb is not None:
+            for fc in cb.fcurves:
+                name = fc.data_path.split('viseme_', 1)[-1].rstrip('"]')
+                mode = modes.get(name, 'LINEAR')
+                for kp in fc.keyframe_points:
+                    kp.interpolation = mode
+                    if mode == 'BEZIER':
+                        kp.handle_left_type = kp.handle_right_type = 'AUTO_CLAMPED'
+                fc.update()
+        ad = obj.animation_data or obj.animation_data_create()
+        ad.action = action
+        try:
+            ad.action_slot = action.slots[0]
+        except (AttributeError, IndexError, TypeError):
+            pass
+
+        last = max((f for keys in tracks.values() for f, _w in keys), default=0.0)
+        if self.set_scene_range:
+            context.scene.frame_start = 1
+            context.scene.frame_end = int(math.ceil(last)) + 1
+        used = [n for n in names if any(w > 0.0 for _f, w in tracks[n])]
+        _log(f"===== DC face animation '{song}': {len(names)} expression track(s), "
+             f"{total} key(s), {last / LIPSYNC_FPS:.1f}s =====")
+        _log(f"  used: {', '.join(used)}")
+        _log("  Import the song's DC visemes (Milo Viseme Import > Rock Band 3) onto the same "
+             "armature, then Bake Lipsync Preview.")
+        self.report({'INFO'}, f"Imported {len(names)} DC face track(s) as '{action.name}'")
         return {'FINISHED'}

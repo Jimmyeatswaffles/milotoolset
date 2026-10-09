@@ -243,6 +243,15 @@ def _parse_lipsync_body(data):
     propanim = ''
     if version == 1:
         propanim = numstring()
+    elif len(data) - p >= 4:
+        # Onyx (the custom-song toolkit) writes that same propanim reference - empty, a bare
+        # 00 00 00 00 - while labelling the file version 0. Seen on its TBRB lipsync
+        # (john.lipsync: version 0, subversion 2, 3903 frames, a keyframe block exactly as
+        # long as it declares, then those four zero bytes). Accepted only when it's a
+        # well-formed string that ends the file exactly, so other leftovers still fail.
+        n = struct.unpack_from('>I', data, p)[0]
+        if p + 4 + n == len(data) and n <= 4096:
+            propanim = numstring()
 
     if p != len(data):
         raise LipsyncImportError(

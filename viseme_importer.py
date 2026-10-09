@@ -942,6 +942,16 @@ _NEUTRAL_MIN_LOC = 0.04
 _NEUTRAL_MIN_ANGLE = math.radians(1.0)
 
 
+def _is_in_subtree(bone, root_name):
+    """Whether a bone is root_name or one of its descendants."""
+    b = bone
+    while b is not None:
+        if b.name == root_name:
+            return True
+        b = b.parent
+    return False
+
+
 def build_neutral_action(armature_obj, set_name, base_pose, bone_lookup, convention):
     """Builds 'VISEME_Base': the pose that moves each bone from the rig's rest pose to the
     set's Base clip - the game's neutral face.
@@ -979,12 +989,24 @@ def build_neutral_action(armature_obj, set_name, base_pose, bone_lookup, convent
 
     keyed = set()
     pose_bones = armature_obj.pose.bones
+    head_bone = bone_lookup.get('bone_head')
+    skipped = []
     for chan, (kind, value) in base_pose.items():
         bone_name = bone_lookup.get(_channel_stem(chan))
         pb = pose_bones.get(bone_name) if bone_name else None
         if pb is None or kind not in ('pos', 'quat'):
             continue
         bone = pb.bone
+        # The neutral FACE only covers the face: bones inside the head. A Base bone above
+        # bone_head orients the whole head, which the body animation and head IK own in the
+        # game. TBRB's Base carries one: bone_head_nod, at George's skeleton's angle exactly
+        # (12.89 degrees) - so on Ringo, whose own rest is 22.83, it tipped the head down
+        # about 10 degrees, shading his eyes under the brows. Every other Base bone matches
+        # Ringo's skeleton to a median 0.00 degrees.
+        if head_bone and head_bone in pose_bones and not _is_in_subtree(bone, head_bone):
+            if bone_name not in skipped:
+                skipped.append(bone_name)
+            continue
         if bone.parent is not None:
             rest_local = bone.parent.matrix_local.inverted() @ bone.matrix_local
         else:
@@ -1015,6 +1037,9 @@ def build_neutral_action(armature_obj, set_name, base_pose, bone_lookup, convent
         keyed.add(bone_name)
     for fc in cb.fcurves:
         fc.update()
+    if skipped:
+        _log(f"  Neutral layer: left out {', '.join(skipped)} - outside the head, so it orients "
+             f"the whole head rather than the face (the body animation and head IK own it)")
     return action, len(keyed)
 
 

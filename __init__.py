@@ -4253,6 +4253,11 @@ class TOPBAR_MT_milo_lipsync_import(bpy.types.Menu):
         self.layout.operator(IMPORT_OT_gh2_voc.bl_idname,
                              text="Guitar Hero 2 Lipsync (.voc)",
                              icon_value=_milo_icon_id('GH2'))
+        # DC songs keep their facial animation inside the song milo (dancer_face.anim),
+        # keyed on the DC viseme names; read straight from the milo.
+        self.layout.operator(IMPORT_OT_dc_lipsync.bl_idname,
+                             text="Dance Central Face Animation (.milo_xbox)",
+                             icon_value=_milo_icon_id('DC3'))
 
 
 def _matrix_to_gh2_m12(mat):
@@ -4529,6 +4534,7 @@ classes = (
     IMPORT_OT_dc3_clip_set,
     IMPORT_OT_rb2_clip_set,
     IMPORT_OT_dc_routine,
+    IMPORT_OT_dc_lipsync,
     IMPORT_OT_gdrb_cameras,
     POSE_OT_bake_gdrb_animation,
     POSE_OT_set_gdrb_character_milo,

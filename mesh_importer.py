@@ -239,6 +239,50 @@ def _find_vertex_block(chunk):
         start = h + 1
 
 
+def _find_trans(chunk, limit):
+    """(local, world, parent) from a mesh's RndTrans data, or None. The two 4x3 matrices are
+    followed by a constraint (int), a target symbol, a preserve-scale flag and the parent's
+    name; located by that structure - both matrices' rotation parts orthonormal (or uniformly
+    scaled), sane small fields after them, a printable parent name - rather than at a fixed
+    offset, since the header in front of them varies."""
+    for o in range(4, max(5, min(limit, 400) - 110)):
+        try:
+            local = struct.unpack_from('>12f', chunk, o)
+            world = struct.unpack_from('>12f', chunk, o + 48)
+        except struct.error:
+            return None
+        if not all(abs(x) < 1e5 for x in local + world):
+            continue
+        ok = True
+        for m in (local, world):
+            rows = [m[0:3], m[3:6], m[6:9]]
+            lens = [sum(x * x for x in r) ** 0.5 for r in rows]
+            if not all(0.01 < ln < 100 for ln in lens) or max(lens) - min(lens) > 1e-3 * max(lens):
+                ok = False
+                break
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    if abs(sum(a * b for a, b in zip(rows[i], rows[j]))) > 1e-3 * lens[i] * lens[j]:
+                        ok = False
+        if not ok:
+            continue
+        q = o + 96
+        constraint = _u32(chunk, q); q += 4
+        if constraint > 16:
+            continue
+        target, q = _numstring(chunk, q, max_len=128)
+        if target is None:
+            continue
+        if chunk[q] not in (0, 1):
+            continue
+        q += 1
+        parent, q2 = _numstring(chunk, q, max_len=128)
+        if parent is None or not all(32 <= ord(ch) < 127 for ch in parent):
+            continue
+        return local, world, parent
+    return None
+
+
 def parse_mesh_entry(chunk, name):
     """Decodes one Mesh entry into a dict, or raises MeshImportError."""
     version = _u32(chunk, 0)
@@ -310,20 +354,352 @@ def parse_mesh_entry(chunk, name):
             f"mesh claims {bone_count} bones, which is implausible - the bone table was "
             f"probably mis-located")
     bone_names = []
+    bone_mats = []
     for _ in range(bone_count):
         nm, o = _numstring(chunk, o)
         if nm is None:
             raise MeshImportError("malformed bone table")
-        o += 48                       # 4x3 transform matrix, unused for import
+        # 4x3 row-vector matrix the engine skins through: vertex x this x bone's pose. For
+        # nearly every mesh it's the inverse of the bone's rest pose, so it cancels at rest;
+        # see apply_bind_corrections for the meshes where it doesn't.
+        bone_mats.append(struct.unpack_from('>12f', chunk, o))
+        o += 48
         bone_names.append(nm)
 
+    trans = _find_trans(chunk, vstart)
     return dict(name=name, version=version, mat=mat_name, geom_owner=geom_owner,
-                verts=verts, faces=faces, bone_names=bone_names,
+                verts=verts, faces=faces, bone_names=bone_names, bone_mats=bone_mats,
+                local_xfm=trans[0] if trans else None,
+                world_xfm=trans[1] if trans else None,
+                trans_parent=trans[2] if trans else '',
                 is_lod=is_lod_name(name), is_shadow=is_shadow_name(name),
                 # TBRB's Blend_* meshes: no bones, no material - region masks a TexBlender
                 # uses to place wrinkles, not part of the character's visible geometry.
                 is_helper=(not bone_names and not mat_name),
                 over_documented_bone_cap=bone_count > DOCUMENTED_MAX_BONES)
+
+
+# ---------------------------------------------------------------------------------------
+# Bind matrices
+# ---------------------------------------------------------------------------------------
+#
+# The engine skins a vertex as  vertex x (the mesh's matrix for that bone) x (the bone's
+# current pose). Nearly every mesh stores the inverse of the bone's rest pose there, so at
+# rest the two cancel and the stored positions are already in place - which is all the
+# importer used to rely on. Not every mesh does: Ringo's teeth (ringo_headhands_long) are
+# modelled oversized and shrunk into the mouth by SCALED matrices (row lengths 0.899, 0.945,
+# 0.814 on both bone_head and bone_jaw, where every other mesh's are 1.0). Stored as-is they
+# float about 13.5 units above the head; skinned through their matrices they land in the
+# mouth around the tongue (upper Z 59.5-60.0, lower 59.1-59.6; tongue 59.0-59.7).
+#
+# So each mesh's vertices are put through  matrix x rest pose  for their bones, which is
+# where the game draws them at rest - and is left untouched whenever that's the identity.
+# Each bone's rest pose comes from the file itself - the inverse of the unscaled matrix its
+# meshes store for that bone - keeping the character consistent with itself. Where the
+# meshes disagree, the selected armature's skeleton decides (without one, meshes using that
+# bone are left as stored); and for bones no mesh stores unscaled, the armature's rest pose is
+# used.
+#
+# Other cases, checked on retail files. Corrected: Billie Joe's lowest-detail eye is scaled
+# like Ringo's teeth (2.60 units off the full-detail eye as stored, 0.03 corrected), and
+# George's LOD0 and LOD1 hands are bound up to 3 units off his skeleton (his LOD2 hands match
+# it exactly) - corrected when his armature is selected. Left alone: matrices that would MIRROR a mesh (negative determinant) -
+# 21st's LOD01 shoes and shadow - since no placement fix mirrors; see apply_bind_corrections.
+
+def _m4(m):
+    return [[m[0], m[1], m[2], 0.0], [m[3], m[4], m[5], 0.0],
+            [m[6], m[7], m[8], 0.0], [m[9], m[10], m[11], 1.0]]
+
+
+def _mul4(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def _inv4(m):
+    n = 4
+    a = [row[:] + [1.0 if i == j else 0.0 for j in range(n)] for i, row in enumerate(m)]
+    for c in range(n):
+        p = max(range(c, n), key=lambda r: abs(a[r][c]))
+        if abs(a[p][c]) < 1e-12:
+            raise ValueError("singular matrix")
+        a[c], a[p] = a[p], a[c]
+        pv = a[c][c]
+        a[c] = [x / pv for x in a[c]]
+        for r in range(n):
+            if r != c:
+                f = a[r][c]
+                a[r] = [x - f * y for x, y in zip(a[r], a[c])]
+    return [row[n:] for row in a]
+
+
+def _is_rigid(m, tol=1e-3):
+    rows = [m[0:3], m[3:6], m[6:9]]
+    for i in range(3):
+        if abs(sum(x * x for x in rows[i]) - 1.0) > tol:
+            return False
+        for j in range(i + 1, 3):
+            if abs(sum(x * y for x, y in zip(rows[i], rows[j]))) > tol:
+                return False
+    return True
+
+
+def _det3(m):
+    return (m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]))
+
+
+def _is_identity(m, tol=1e-3):
+    return all(abs(m[i][j] - (1.0 if i == j else 0.0)) <= tol for i in range(4) for j in range(4))
+
+
+def _armature_rest(armature_obj, bone_name):
+    """A bone's rest pose from the armature, as an engine row-vector matrix."""
+    if armature_obj is None:
+        return None
+    b = armature_obj.data.bones.get(bone_name)
+    if b is None:
+        return None
+    ml = b.matrix_local
+    return [[ml[0][0], ml[1][0], ml[2][0], 0.0], [ml[0][1], ml[1][1], ml[2][1], 0.0],
+            [ml[0][2], ml[1][2], ml[2][2], 0.0], [ml[0][3], ml[1][3], ml[2][3], 1.0]]
+
+
+def apply_bind_corrections(meshes, armature_obj=None, rest_lookup=None, extra_rest=None):
+    """Moves vertices (and normals) of any mesh whose bone-table matrices don't cancel at
+    rest to where the game draws them. Returns [(mesh name, note)] for the log.
+
+    `rest_lookup(bone name)` -> the bone's rest pose as an engine row-vector matrix, or None;
+    by default it reads the armature.
+
+    Rest poses: with this character's skeleton (the armature), the skeleton is the reference
+    for every bone - the game skins against it. George's full-detail hands show why: they're
+    bound to a slightly different skeleton (every hand and finger bone turned 3 degrees, up to
+    3 units off), and only his lowest-detail hands match the real one, so trusting the file's
+    own majority moved the wrong mesh. Without a skeleton, each bone's rest pose comes from the
+    unscaled matrix its meshes store; where they disagree, nothing is guessed and those meshes
+    stay as stored. An armature that doesn't match the file (another character's) is ignored.
+
+    Corrections are skipped when they would only nudge a mesh imperceptibly (under 0.05
+    units), mirror it (negative determinant: 21st's LOD01 shoes and shadow), or only spin it
+    in place (its centre moving under 0.1 units: George's eyeballs, which the skeleton would
+    turn 8 and 90 degrees about their centres - the game aims the eyes every frame anyway)."""
+    if rest_lookup is None:
+        def rest_lookup(name):
+            return _armature_rest(armature_obj, name)
+
+    variants = {}
+    for m in meshes:
+        for name, mat in zip(m.get('bone_names', []), m.get('bone_mats', [])):
+            if not _is_rigid(mat):
+                continue
+            groups = variants.setdefault(name, [])
+            for g in groups:
+                if max(abs(a - b) for a, b in zip(g[0], mat)) < 1e-3:
+                    g[1] += 1
+                    break
+            else:
+                groups.append([mat, 1])
+
+    def _mismatch(mat, sk):
+        c = _mul4(_m4(mat), sk)
+        return max(abs(c[i][j] - (1.0 if i == j else 0.0)) for i in range(4) for j in range(4))
+
+    notes = []
+    # Is the armature this character's skeleton? Compare it with the file's own rest poses.
+    skeleton = {}
+    for name in variants:
+        sk = rest_lookup(name)
+        if sk is not None:
+            skeleton[name] = sk
+    use_skeleton = False
+    armature_ok = True                  # nothing to compare against: trust it as a fallback
+    if skeleton:
+        fits = sorted(min(_mismatch(g[0], skeleton[n]) for g in variants[n]) for n in skeleton)
+        use_skeleton = fits[len(fits) // 2] <= 0.5
+        armature_ok = use_skeleton
+        if not use_skeleton:
+            notes.append(("(armature)", f"its rest pose doesn't match this file (median "
+                                        f"mismatch {fits[len(fits) // 2]:.2f}) - using the "
+                                        f"file's own data instead"))
+
+    rest = {}
+    for name, groups in variants.items():
+        if use_skeleton and name in skeleton:
+            rest[name] = skeleton[name]
+            continue
+        if len(groups) > 1:
+            continue                       # the file disagrees with itself: don't guess
+        try:
+            rest[name] = _inv4(_m4(groups[0][0]))
+        except ValueError:
+            pass
+
+    for m in meshes:
+        names, mats = m.get('bone_names', []), m.get('bone_mats', [])
+        if not names:
+            continue
+        corr, missing = [], []
+        for name, mat in zip(names, mats):
+            r = rest.get(name)
+            # The armature fills in bones the file has no usable matrix for - but never once
+            # it's been rejected as another character's skeleton.
+            if r is None and armature_ok and (use_skeleton or name not in variants):
+                r = rest_lookup(name)
+            # Bones the file defines itself (an outfit's Trans objects) carry their own rest
+            # pose: straw's hair bones, which no skeleton has.
+            if r is None and extra_rest and name in extra_rest:
+                r = extra_rest[name]
+            if r is None:
+                missing.append(name)
+                corr.append(None)
+                continue
+            corr.append(_mul4(_m4(mat), r))
+        if all(c is None or _is_identity(c) for c in corr):
+            continue
+        mirrored = [n for n, c in zip(names, corr) if c is not None and _det3(c) < 0.0]
+        if mirrored:
+            notes.append((m['name'], f"bone-table matrices would mirror it ("
+                                     f"{', '.join(mirrored[:3])}"
+                                     f"{'...' if len(mirrored) > 3 else ''}) - left as stored"))
+            continue
+        if missing:
+            notes.append((m['name'], f"bone-table matrices don't cancel at rest, but no rest "
+                                     f"pose is known for {', '.join(missing[:3])}"
+                                     f"{'...' if len(missing) > 3 else ''} - left as stored"))
+            continue
+        # Normals take the inverse transpose of each matrix's 3x3 part (the teeth are
+        # scaled unevenly).
+        ninv = []
+        for c in corr:
+            a3 = [row[:3] + [0.0] for row in c[:3]] + [[0.0, 0.0, 0.0, 1.0]]
+            ninv.append(_inv4(a3))
+        new_cos, new_nrm = [], []
+        for v in m['verts']:
+            px, py, pz = v['co']
+            nx, ny, nz = v['normal']
+            acc = [0.0, 0.0, 0.0]
+            nacc = [0.0, 0.0, 0.0]
+            total = 0.0
+            for slot in range(4):
+                w = v['weights'][slot]
+                bi = v['bones'][slot]
+                if w <= WEIGHT_EPSILON or bi >= len(corr):
+                    continue
+                c, ni = corr[bi], ninv[bi]
+                for j in range(3):
+                    acc[j] += w * (px * c[0][j] + py * c[1][j] + pz * c[2][j] + c[3][j])
+                    # n x (C^-1)^T  ==  sum_k n_k * C^-1[j][k]
+                    nacc[j] += w * (nx * ni[j][0] + ny * ni[j][1] + nz * ni[j][2])
+                total += w
+            if total <= 0.0:
+                new_cos.append(v['co'])
+                new_nrm.append(v['normal'])
+                continue
+            ln = sum(x * x for x in nacc) ** 0.5 or 1.0
+            new_cos.append(tuple(x / total for x in acc))
+            new_nrm.append(tuple(x / ln for x in nacc))
+        moves = [sum((a - b) ** 2 for a, b in zip(n, v['co'])) ** 0.5
+                 for n, v in zip(new_cos, m['verts'])]
+        shift = max(moves) if moves else 0.0
+        if shift < 0.05:
+            continue                                   # imperceptible
+        cnt = len(new_cos)
+        c_old = [sum(v['co'][i] for v in m['verts']) / cnt for i in range(3)]
+        c_new = [sum(p[i] for p in new_cos) / cnt for i in range(3)]
+        if sum((a - b) ** 2 for a, b in zip(c_old, c_new)) ** 0.5 < 0.1:
+            notes.append((m['name'], f"bone-table matrices would only spin it in place (up to "
+                                     f"{shift:.2f} units at the edge, centre fixed) - left as "
+                                     f"stored"))
+            continue
+        for v, co, n in zip(m['verts'], new_cos, new_nrm):
+            v['co'] = co
+            v['normal'] = n
+        notes.append((m['name'], f"placed through its bone-table matrices (moved up to "
+                                 f"{shift:.2f} units)"))
+    return notes
+
+
+def read_trans_bones(filepath):
+    """{name: (world 4x4, parent)} for the Trans objects in a milo - bones an outfit defines
+    for itself, like straw's four hair bones (bone_hair_l1-01 ...), each parented to
+    bone_head with a stored world placement. Those placements are the bones' rest poses."""
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    _rev, _dt, _dn, entries = _read_dir_entries(body)
+    spans = _entry_spans(body, len(entries))
+    out = {}
+    for (etype, ename), (s, e) in zip(entries, spans):
+        if etype != 'Trans':
+            continue
+        tr = _find_trans(body[s:e], e - s)
+        if tr is not None:
+            out[ename] = (_m4(tr[1]), tr[2])
+    return out
+
+
+def remap_unknown_bones(meshes, trans_bones, armature_obj):
+    """Points weights for bones the armature doesn't have at the nearest ancestor it does,
+    following the file's own Trans parents. Outfit hair bones aren't on the character's
+    skeleton, so without this their vertices would deform with nothing and the hair would
+    stay behind when the head moves; this way it moves rigidly with bone_head. Returns
+    [(mesh, note)]."""
+    if armature_obj is None:
+        return []
+    bones = armature_obj.data.bones
+    notes = []
+    for m in meshes:
+        remap = {}
+        for bn in m.get('bone_names', []):
+            if bn in bones:
+                continue
+            cur, seen = bn, set()
+            while cur in trans_bones and cur not in seen:
+                seen.add(cur)
+                cur = trans_bones[cur][1]
+                if cur in bones:
+                    remap[bn] = cur
+                    break
+        if remap:
+            m['bone_remap'] = remap
+            notes.append((m['name'], "weights for bones the armature lacks moved to their "
+                                     "parent: " + ", ".join(f"{a} -> {b}" for a, b in
+                                                             sorted(remap.items()))))
+    return notes
+
+
+def place_rigid_meshes(meshes):
+    """Meshes with no bones aren't skinned: the game draws them through their own transform,
+    hanging from a parent. john_headhands_long's eyeballs are like this - modelled around the
+    origin, no bone table, parented to bone_L-eye / bone_R-eye with a stored world placement
+    that puts them in the sockets (left eye at X -1.25, Z 65.65). Ignoring the transform left
+    them on the floor at the scene's centre. Their vertices are put through the stored world
+    transform here, and build_mesh_object binds them to the parent bone. Skinned meshes are
+    left alone - the game places those through their bones, not their own transform."""
+    notes = []
+    for m in meshes:
+        w = m.get('world_xfm')
+        if m.get('bone_names') or w is None or m.get('is_helper'):
+            continue
+        M = _m4(w)
+        if _is_identity(M, tol=1e-5):
+            continue
+        rows = [w[0:3], w[3:6], w[6:9]]
+        ninv = _inv4([list(r) + [0.0] for r in rows] + [[0.0, 0.0, 0.0, 1.0]])
+        for v in m['verts']:
+            px, py, pz = v['co']
+            nx, ny, nz = v['normal']
+            v['co'] = tuple(px * M[0][j] + py * M[1][j] + pz * M[2][j] + M[3][j]
+                            for j in range(3))
+            n = [nx * ninv[j][0] + ny * ninv[j][1] + nz * ninv[j][2] for j in range(3)]
+            ln = sum(x * x for x in n) ** 0.5 or 1.0
+            v['normal'] = tuple(x / ln for x in n)
+        m['rigid_parent'] = m.get('trans_parent', '')
+        notes.append((m['name'], f"no bones - placed by its own transform at "
+                                 f"({w[9]:.2f}, {w[10]:.2f}, {w[11]:.2f})"
+                                 + (f", parented to {m['rigid_parent']}"
+                                    if m['rigid_parent'] else "")))
+    return notes
 
 
 def parse_gdrb_meshes(filepath):
@@ -397,9 +773,16 @@ def build_mesh_object(context, mesh_data, armature_obj=None):
     # Vertex groups. Bone indices are local to this mesh's own bone table, so they're
     # resolved through it rather than used directly.
     bone_names = mesh_data['bone_names']
+    # Bones the armature lacks but the file parents to one it has (outfit hair bones hang
+    # from bone_head) hand their weights to that parent; see remap_unknown_bones. Several
+    # table entries can then share a group, so groups are keyed - and weights totalled - by
+    # destination name.
+    remap = mesh_data.get('bone_remap', {})
+    dest = [remap.get(bn, bn) for bn in bone_names]
     groups = {}
-    for bn in bone_names:
-        groups[bn] = obj.vertex_groups.new(name=bn)
+    for d in dest:
+        if d not in groups:
+            groups[d] = obj.vertex_groups.get(d) or obj.vertex_groups.new(name=d)
     dropped = 0
     for vi, v in enumerate(verts):
         # Total the weight per bone BEFORE writing it. The same bone often appears in more
@@ -421,12 +804,22 @@ def build_mesh_object(context, mesh_data, armature_obj=None):
                 # decode error rather than rounding, so it's worth surfacing.
                 dropped += 1
                 continue
-            per_bone[bi] = per_bone.get(bi, 0.0) + w
-        for bi, w in per_bone.items():
-            groups[bone_names[bi]].add([vi], w, 'REPLACE')
+            per_bone[dest[bi]] = per_bone.get(dest[bi], 0.0) + w
+        for d, w in per_bone.items():
+            groups[d].add([vi], w, 'REPLACE')
     if dropped:
         _log(f"    '{name}': {dropped} weight(s) referenced a bone outside this mesh's "
              f"bone table and were skipped")
+
+    rigid_parent = mesh_data.get('rigid_parent')
+    if rigid_parent and armature_obj is not None and rigid_parent in armature_obj.data.bones:
+        # A bone-less mesh hangs from its parent bone: give every vertex full weight to it
+        # so it follows that bone like the skinned meshes follow theirs.
+        vg = obj.vertex_groups.get(rigid_parent) or obj.vertex_groups.new(name=rigid_parent)
+        vg.add(list(range(len(verts))), 1.0, 'REPLACE')
+    elif rigid_parent and armature_obj is not None:
+        _log(f"    '{name}': its parent '{rigid_parent}' isn't on the armature, so it won't "
+             f"follow any bone")
 
     if armature_obj is not None:
         obj.parent = armature_obj
@@ -519,6 +912,18 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
 
         _log(f"===== Importing {self._game_label} meshes from '{dir_name}' "
              f"({self.filepath}) =====")
+        try:
+            trans_bones = read_trans_bones(self.filepath)
+        except Exception as e:
+            _log(f"  couldn't read the file's own bones ({e}) - carrying on without them")
+            trans_bones = {}
+        for name, note in place_rigid_meshes(meshes):
+            _log(f"  '{name}': {note}")
+        for name, note in apply_bind_corrections(
+                meshes, armature_obj, extra_rest={n: t[0] for n, t in trans_bones.items()}):
+            _log(f"  '{name}': {note}")
+        for name, note in remap_unknown_bones(meshes, trans_bones, armature_obj):
+            _log(f"  '{name}': {note}")
         lods = [m for m in meshes if m['is_lod']]
         shadows = [m for m in meshes if m['is_shadow']]
         _log(f"  {len(meshes)} mesh(es) parsed, {len(lods)} LOD, {len(shadows)} shadow"
