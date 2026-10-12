@@ -245,7 +245,11 @@ def _find_trans(chunk, limit):
     name; located by that structure - both matrices' rotation parts orthonormal (or uniformly
     scaled), sane small fields after them, a printable parent name - rather than at a fixed
     offset, since the header in front of them varies."""
-    for o in range(4, max(5, min(limit, 400) - 110)):
+    # The last possible start leaves room for both matrices (96 bytes) and the shortest tail
+    # (constraint 4, empty target 4, flag 1, empty parent 4). RB2's root bones end exactly
+    # there - bone_head_nod and bone_spine2, whose empty parent makes them 14 bytes shorter -
+    # and a tighter bound missed them.
+    for o in range(4, max(5, min(limit, 400) - 108)):
         try:
             local = struct.unpack_from('>12f', chunk, o)
             world = struct.unpack_from('>12f', chunk, o + 48)
@@ -668,6 +672,140 @@ def remap_unknown_bones(meshes, trans_bones, armature_obj):
     return notes
 
 
+# ---------------------------------------------------------------------------------------
+# The file's own bones (optional)
+# ---------------------------------------------------------------------------------------
+#
+# Character files often define bones of their own as Trans objects: RB2's head milos carry
+# their whole face rig (56 bones - jaw, eyes, lids, brows, lips, tongue - plus head, neck and
+# spine), and outfits can carry physics bones (straw's hair bones). With "Add Bones From This
+# File", any of them the selected armature lacks are added to it before the meshes are built,
+# so the meshes bind to their real bones. Bones already on the armature are never touched.
+#
+# Each bone is placed the way the skeleton importer places bones: from its LOCAL transform,
+# chained through its parents (the stored world transform is unreliable). A parent already on
+# the armature anchors the chain, so a head's face rig attaches wherever the armature's own
+# bone_head is.
+
+def read_file_bones(filepath):
+    """{bone name: (local 4x3, parent)} for the Trans objects in a milo. Files whose nested
+    directories defeat the object split (RB2's heads) are read by content: objects are
+    stored in table order, and a file's bones are one unbroken run of small objects of a
+    single version, exactly as long as the table's Trans list - named by position. On head_1
+    that gives all 56 bones a parent among its own bones (the two roots have none)."""
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    _rev, _dt, _dn, entries = _read_dir_entries(body)
+    names = [n for t, n in entries if t == 'Trans']
+    if not names:
+        return {}
+    out = {}
+    try:
+        spans = _entry_spans(body, len(entries))
+        for (etype, ename), (a, b) in zip(entries, spans):
+            if etype == 'Trans':
+                tr = _find_trans(body[a:b], b - a)
+                if tr is not None:
+                    out[ename] = (tr[0], tr[2])
+        return out
+    except MeshImportError:
+        pass
+    marker = b'\xAD\xDE\xAD\xDE'
+    starts, i = [0], 0
+    while True:
+        j = body.find(marker, i)
+        if j < 0:
+            break
+        starts.append(j + 4)
+        i = j + 4
+    chunks = [body[a:b - 4] for a, b in zip(starts, starts[1:])]
+    kinds = [(_u32(c, 0) if len(c) >= 4 else None, len(c) < 600) for c in chunks]
+    n = len(names)
+    for k in range(len(chunks) - n + 1):
+        v = kinds[k][0]
+        if v is None or not all(kinds[k + i][1] and kinds[k + i][0] == v for i in range(n)):
+            continue
+        if k > 0 and kinds[k - 1][1] and kinds[k - 1][0] == v:
+            continue
+        if k + n < len(chunks) and kinds[k + n][1] and kinds[k + n][0] == v:
+            continue
+        for name, c in zip(names, chunks[k:k + n]):
+            tr = _find_trans(c, len(c))
+            if tr is not None:
+                out[name] = (tr[0], tr[2])
+        return out
+    return {}
+
+
+def add_file_bones(context, armature_obj, file_bones, bone_length=0.5, bind_world=None):
+    """Adds the file's bones that the armature lacks. Returns [(bone, parent or '')].
+
+    bind_world: {bone: Blender matrix} - where the file's meshes are bound to each bone (the
+    inverse of their bone-table matrices). A bone whose parent is neither an armature bone
+    nor one of the file's bones is placed there instead of at its bare local transform:
+    libertyspikes_resource's bone_hair hangs from the milo's own root, which is turned 180
+    degrees, so its local transform alone faces it - and the hair bound to it - backwards.
+    Such a hair bone is then parented to the armature's head, which the game attaches hair
+    to, so it follows the head."""
+    from .io import _milo_to_blender_matrix
+    bind_world = bind_world or {}
+    arm_bones = armature_obj.data.bones
+    missing = [n for n in file_bones if n not in arm_bones]
+    if not missing:
+        return []
+    world = {}
+
+    def world_of(name, stack=()):
+        if name in world:
+            return world[name]
+        local12, parent = file_bones[name]
+        local = _milo_to_blender_matrix(local12)
+        if parent and parent != name and parent not in stack:
+            if parent in arm_bones:
+                m = arm_bones[parent].matrix_local @ local
+            elif parent in file_bones:
+                m = world_of(parent, stack + (name,)) @ local
+            else:
+                m = bind_world.get(name, local)     # parent is a non-bone root
+        else:
+            m = local
+        world[name] = m
+        return m
+
+    prev_active = context.view_layer.objects.active
+    prev_mode = armature_obj.mode
+    context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode='EDIT')
+    try:
+        ebones = armature_obj.data.edit_bones
+        created = {}
+        for name in missing:
+            eb = ebones.new(name)
+            # A non-zero length must exist before assigning .matrix (see the skeleton
+            # importer); the matrix then sets head, orientation and roll together.
+            eb.head = (0.0, 0.0, 0.0)
+            eb.tail = (0.0, bone_length, 0.0)
+            eb.matrix = world_of(name)
+            created[name] = eb
+        added = []
+        for name, eb in created.items():
+            parent = file_bones[name][1]
+            if parent in created and parent != name:
+                eb.parent = created[parent]
+            elif parent and parent in ebones:
+                eb.parent = ebones[parent]
+            elif 'hair' in name.lower():
+                head = next((ebones[h] for h in ('bone_head.mesh', 'bone_head')
+                             if h in ebones), None)
+                if head is not None:
+                    eb.parent = head                  # keeps its place; follows the head
+            added.append((name, eb.parent.name if eb.parent else ''))
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT' if prev_mode != 'EDIT' else 'EDIT')
+        context.view_layer.objects.active = prev_active
+    return added
+
+
 def place_rigid_meshes(meshes):
     """Meshes with no bones aren't skinned: the game draws them through their own transform,
     hanging from a parent. john_headhands_long's eyeballs are like this - modelled around the
@@ -681,6 +819,11 @@ def place_rigid_meshes(meshes):
         w = m.get('world_xfm')
         if m.get('bone_names') or w is None or m.get('is_helper'):
             continue
+        # Record the parent for every bone-less mesh, whether or not it needs moving: if an
+        # armature is selected and has that bone, build_mesh_object binds the mesh to it with
+        # the Armature modifier (RB2's teeth and eyes hang from bone_jaw, bone_head and the
+        # eye bones). If it doesn't, the mesh is left as it is.
+        m['rigid_parent'] = m.get('trans_parent', '')
         M = _m4(w)
         if _is_identity(M, tol=1e-5):
             continue
@@ -694,12 +837,191 @@ def place_rigid_meshes(meshes):
             n = [nx * ninv[j][0] + ny * ninv[j][1] + nz * ninv[j][2] for j in range(3)]
             ln = sum(x * x for x in n) ** 0.5 or 1.0
             v['normal'] = tuple(x / ln for x in n)
-        m['rigid_parent'] = m.get('trans_parent', '')
         notes.append((m['name'], f"no bones - placed by its own transform at "
                                  f"({w[9]:.2f}, {w[10]:.2f}, {w[11]:.2f})"
                                  + (f", parented to {m['rigid_parent']}"
                                     if m['rigid_parent'] else "")))
     return notes
+
+
+# ---------------------------------------------------------------------------------------
+# Rock Band 2 meshes (RndMesh version 34)
+# ---------------------------------------------------------------------------------------
+#
+# Verified on the retail head_1.milo_xbox (a Character: eight meshes, MeshDeforms, a viseme
+# clip set). RB2's RndMesh is two versions behind TBRB's, and differs in two places:
+#
+#   * After the transform and drawable data: material symbol, geometry-owner symbol, two
+#     32-bit fields (37 and 1 in every mesh checked), one byte (0), then the vertex count.
+#   * The vertices are plain floats, 80 bytes each: position (3 floats + a 0), normal (3 + a
+#     0), four bone weights, UV, four 16-bit bone indices, tangent (3 + a sign). Normals and
+#     tangents are unit length and the weights sum to exactly 1.0 on every vertex.
+#
+# Weight i goes with index i - the opposite of TBRB, which pairs them in reverse. Unused
+# slots repeat a bone with weight 0. Paired in order, only 6 of head1's 1959 vertices name a
+# bone that gets no weight (bones genuinely listed at zero); paired in reverse, 659 do, with
+# both real weights landing on one bone while the other named bone gets nothing.
+#
+# Faces, group sizes and the bone table (name + 4x3 matrix per bone) follow exactly as in
+# TBRB, and each mesh ends exactly where its bone table does.
+#
+# The Character's nested directories defeat both directory walkers, so meshes are found by
+# content: every end-marker-delimited object at version 34 that parses this way, end to end.
+
+RB2_MESH_VERSION = 34
+RB2_VERTEX_SIZE = 80
+
+
+def _rb2_vertex_ok(chunk, o):
+    try:
+        x, y, z, w0, nx, ny, nz, w1 = struct.unpack_from('>8f', chunk, o)
+        wts = struct.unpack_from('>4f', chunk, o + 32)
+    except struct.error:
+        return False
+    if w0 != 0.0 or w1 != 0.0 or not all(abs(c) < 1e5 for c in (x, y, z)):
+        return False
+    if abs(nx * nx + ny * ny + nz * nz - 1.0) > 0.02:
+        return False
+    if all(abs(w - 1.0) < 1e-6 for w in wts):
+        return True             # a rigid mesh's placeholder weights; see parse_rb2_mesh_entry
+    return all(-1e-4 <= w <= 1.0001 for w in wts) and abs(sum(wts) - 1.0) < 0.01
+
+
+def parse_rb2_mesh_entry(chunk, name):
+    """One RB2 RndMesh (version 34) -> the same record parse_mesh_entry returns."""
+    version = _u32(chunk, 0)
+    if version != RB2_MESH_VERSION:
+        raise MeshImportError(f"RndMesh version {version} (expected {RB2_MESH_VERSION} for RB2)")
+    # The vertex count: the first offset where a count is followed by vertices that all
+    # check out, faces that index them, and a bone table that ends the object exactly.
+    for p in range(16, min(len(chunk) - 8, 1024)):
+        n = _u32(chunk, p)
+        vstart = p + 4
+        if not 1 <= n <= 65535 or vstart + n * RB2_VERTEX_SIZE + 8 > len(chunk):
+            continue
+        if not all(_rb2_vertex_ok(chunk, vstart + k * RB2_VERTEX_SIZE)
+                   for k in (0, n // 2, n - 1)):
+            continue
+        if not all(_rb2_vertex_ok(chunk, vstart + k * RB2_VERTEX_SIZE) for k in range(n)):
+            continue
+        o = vstart + n * RB2_VERTEX_SIZE
+        fcount = _u32(chunk, o); o += 4
+        if o + fcount * 6 > len(chunk):
+            continue
+        faces = [struct.unpack_from('>3H', chunk, o + i * 6) for i in range(fcount)]
+        if any(max(f) >= n for f in faces):
+            continue
+        o += fcount * 6
+        try:
+            groups = _u32(chunk, o); o += 4 + groups
+            bone_count = _u32(chunk, o); o += 4
+            if bone_count > MAX_MESH_BONES:
+                continue
+            bone_names, bone_mats = [], []
+            for _ in range(bone_count):
+                nm, o = _numstring(chunk, o)
+                if nm is None:
+                    raise MeshImportError("malformed bone table")
+                bone_mats.append(struct.unpack_from('>12f', chunk, o))
+                o += 48
+                bone_names.append(nm)
+        except (MeshImportError, struct.error):
+            continue
+        if o != len(chunk):
+            continue
+        break
+    else:
+        raise MeshImportError("couldn't find an RB2 vertex block that parses end to end")
+
+    # Material and geometry owner: two symbols ending 9 bytes before the count.
+    names = []
+    end = p - 9
+    for _ in range(2):
+        found = None
+        for q in range(end - 4, max(-1, end - 4 - 256), -1):
+            if _u32(chunk, q) == end - q - 4:
+                txt = chunk[q + 4:end]
+                if all(32 <= c < 127 for c in txt):
+                    found = (q, txt.decode('latin-1'))
+                    break
+        if found is None:
+            break
+        names.insert(0, found[1])
+        end = found[0]
+    mat_name = names[0] if len(names) == 2 else ''
+    geom_owner = names[-1] if names else ''
+
+    # Rigid meshes (the eyes and teeth) have no bone table, and every vertex carries the
+    # placeholder weights (1, 1, 1, 1) with indices (0, 1, 2, 3). They hang from a bone
+    # through their own transform instead - see place_rigid_meshes.
+    rigid = not bone_names
+    verts = []
+    for k in range(n):
+        o = vstart + k * RB2_VERTEX_SIZE
+        x, y, z = struct.unpack_from('>3f', chunk, o)
+        nx, ny, nz = struct.unpack_from('>3f', chunk, o + 16)
+        wts = struct.unpack_from('>4f', chunk, o + 32)
+        u, v = struct.unpack_from('>2f', chunk, o + 48)
+        idx = struct.unpack_from('>4H', chunk, o + 56)
+        verts.append(dict(co=(x, y, z), normal=(nx, ny, nz),
+                          # V flipped, as for TBRB/GDRB
+                          uv=(u, 1.0 - v), colour=0xFFFFFFFF,
+                          weights=(0.0, 0.0, 0.0, 0.0) if rigid else tuple(wts),
+                          bones=(0, 0, 0, 0) if rigid else tuple(idx)))
+    if any(i >= len(bone_names) for vtx in verts
+           for i, w in zip(vtx['bones'], vtx['weights']) if w > WEIGHT_EPSILON):
+        raise MeshImportError("a weighted bone index points past the bone table")
+    trans = _find_trans(chunk, p)
+    return dict(name=name, version=version, mat=mat_name, geom_owner=geom_owner,
+                verts=verts, faces=faces, bone_names=bone_names, bone_mats=bone_mats,
+                local_xfm=trans[0] if trans else None,
+                world_xfm=trans[1] if trans else None,
+                trans_parent=trans[2] if trans else '',
+                is_lod=is_lod_name(name), is_shadow=is_shadow_name(name),
+                is_helper=(not bone_names and not mat_name),
+                over_documented_bone_cap=bone_count > DOCUMENTED_MAX_BONES)
+
+
+def parse_rb2_meshes(filepath):
+    """(dir_name, meshes, failed) from an RB2 milo, finding the meshes by content."""
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    rev, dir_type, dir_name, entries = _read_dir_entries(body)
+    mesh_names = [n for t, n in entries if t == 'Mesh']
+    marker = b'\xAD\xDE\xAD\xDE'
+    starts, i = [0], 0
+    while True:
+        j = body.find(marker, i)
+        if j < 0:
+            break
+        starts.append(j + 4)
+        i = j + 4
+    meshes, failed, unnamed = [], [], list(mesh_names)
+    for a, b in zip(starts, starts[1:]):
+        chunk = body[a:b - 4]
+        if len(chunk) < 64 or _u32(chunk, 0) != RB2_MESH_VERSION:
+            continue
+        try:
+            m = parse_rb2_mesh_entry(chunk, "")
+        except MeshImportError as e:
+            failed.append((f"object at {a:#x}", str(e)))
+            continue
+        # A mesh is its own geometry owner, so that names it. A mesh the character's own
+        # table doesn't list belongs to a nested directory - in head_1, head1_patch.mesh in
+        # 'head_skin_proxy', a skin patch the character creator renders into the head
+        # texture, not visible geometry - so it's flagged as a helper (skipped by default).
+        name = m['geom_owner'] or (unnamed[0] if unnamed else f"mesh_{len(meshes)}")
+        if name in unnamed:
+            unnamed.remove(name)
+        elif name not in mesh_names:
+            m['is_helper'] = True
+        m['name'] = name
+        m['is_lod'] = is_lod_name(name) or name.lower().endswith('_lod.mesh')
+        m['is_shadow'] = is_shadow_name(name)
+        meshes.append(m)
+    if not meshes:
+        raise MeshImportError("no Rock Band 2 meshes (RndMesh version 34) found")
+    return dir_name, meshes, failed
 
 
 def parse_gdrb_meshes(filepath):
@@ -817,6 +1139,7 @@ def build_mesh_object(context, mesh_data, armature_obj=None):
         # so it follows that bone like the skinned meshes follow theirs.
         vg = obj.vertex_groups.get(rigid_parent) or obj.vertex_groups.new(name=rigid_parent)
         vg.add(list(range(len(verts))), 1.0, 'REPLACE')
+        _log(f"    '{name}': bound to '{rigid_parent}' (its parent bone)")
     elif rigid_parent and armature_obj is not None:
         _log(f"    '{name}': its parent '{rigid_parent}' isn't on the armature, so it won't "
              f"follow any bone")
@@ -838,6 +1161,10 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
     TBRB each subclass it, setting only their id, label and _game_label."""
     bl_options = {'REGISTER', 'UNDO'}
     _game_label = "Milo"
+    _textures_supported = True
+
+    def _parse_meshes(self, filepath):
+        return parse_gdrb_meshes(filepath)
 
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(
@@ -861,10 +1188,22 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
 
     import_textures: BoolProperty(
         name="Import Textures",
-        description="Decode the milo's textures and build a simple node tree for each "
-                     "material: diffuse to Base Color, normal map through a Normal Map node, "
-                     "specular to Specular Tint",
+        description="Decode the milo's textures and rebuild each material from the game's "
+                     "own settings: added Blinn-Phong specular with the gloss map, rim "
+                     "light, detail normals, two-lobe hair highlights, alpha and culling, "
+                     "through a shared Milo Character Shader node group. Also fills each "
+                     "material's glTFMilo settings panel",
         default=True,
+    )
+
+    shared_texture_milo: StringProperty(
+        name="Shared Texture Milo",
+        description="A milo holding textures this one uses but doesn't contain - TBRB "
+                     "outfits keep their clothing textures in a shared outfit milo (e.g. "
+                     "shared/outfit/budokan01_share.milo_xbox). Optional: milos the file "
+                     "points at are also searched for automatically in the folders around it",
+        subtype='FILE_PATH',
+        default="",
     )
 
     flip_normal_green: BoolProperty(
@@ -883,6 +1222,14 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    import_file_bones: BoolProperty(
+        name="Add Bones From This File",
+        description="Add the bones this file defines itself (an RB2 head's face rig, an "
+                     "outfit's physics bones) to the selected armature when it lacks them, "
+                     "so the meshes bind to their real bones. Bones already on the armature "
+                     "are left alone",
+        default=False,
+    )
     parent_to_armature: BoolProperty(
         name="Parent To Active Armature",
         description="Parent the imported meshes to the selected armature and add an "
@@ -898,7 +1245,7 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
             armature_obj = active
 
         try:
-            dir_name, meshes, failed = parse_gdrb_meshes(self.filepath)
+            dir_name, meshes, failed = self._parse_meshes(self.filepath)
         except Exception as e:
             _log(f"{self._game_label} MESH IMPORT FAILED: {e}")
             self.report({'ERROR'}, f"Could not parse mesh milo: {e}")
@@ -912,6 +1259,29 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
 
         _log(f"===== Importing {self._game_label} meshes from '{dir_name}' "
              f"({self.filepath}) =====")
+        if self.import_file_bones and armature_obj is not None:
+            try:
+                from .io import _milo_to_blender_matrix
+                bind_world = {}
+                for m in meshes:
+                    for bn, bm in zip(m.get('bone_names') or (), m.get('bone_mats') or ()):
+                        if bn not in bind_world:
+                            try:
+                                bind_world[bn] = _milo_to_blender_matrix(bm).inverted()
+                            except Exception:
+                                pass
+                added = add_file_bones(context, armature_obj, read_file_bones(self.filepath),
+                                       bind_world=bind_world)
+            except Exception as e:
+                _log(f"  couldn't add this file's bones ({e}) - carrying on without them")
+                added = []
+            if added:
+                _log(f"  added {len(added)} bone(s) from this file to '{armature_obj.name}': "
+                     + ", ".join(n.rsplit('.', 1)[0] for n, _p in added[:12])
+                     + (" ..." if len(added) > 12 else ""))
+            else:
+                _log(f"  no bones added - '{armature_obj.name}' already has every bone this "
+                     f"file defines, or the file defines none")
         try:
             trans_bones = read_trans_bones(self.filepath)
         except Exception as e:
@@ -977,14 +1347,17 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
             _log(f"    SKIPPED {nm}: {reason}")
 
         tex_summary = ""
-        if self.import_textures:
+        if self.import_textures and self._textures_supported:
             # Imported here rather than at module level: texture_importer itself uses this
             # module's directory helpers.
             from .texture_importer import apply_textures
             wanted_mats = sorted({m['mat'] for m in wanted if m['mat']})
             try:
+                shared = bpy.path.abspath(self.shared_texture_milo) \
+                    if self.shared_texture_milo else ""
                 done, n_images, tex_notes = apply_textures(
-                    self.filepath, wanted_mats, self.flip_normal_green)
+                    self.filepath, wanted_mats, self.flip_normal_green,
+                    shared_paths=(shared,) if shared else ())
                 _log(f"  textures: {done} of {len(wanted_mats)} material(s) textured, "
                      f"{n_images} image(s) decoded")
                 for n in tex_notes:
@@ -1035,3 +1408,21 @@ class IMPORT_OT_tbrb_meshes(_IMPORT_OT_milo_meshes_base):
     bl_idname = "import_scene.tbrb_meshes"
     bl_label = "Import TBRB Meshes Milo"
     _game_label = "TBRB"
+
+
+class IMPORT_OT_rb2_meshes(_IMPORT_OT_milo_meshes_base):
+    """Import the meshes from a Rock Band 2 character milo, with UVs, per-bone vertex groups
+    and placeholder materials. RB2's textures come from its character creator, so they
+    aren't imported"""
+    bl_idname = "import_scene.rb2_meshes"
+    bl_label = "Import RB2 Meshes"
+    _game_label = "RB2"
+    _textures_supported = False
+
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
+    import_textures: BoolProperty(default=False, options={'HIDDEN'})
+    flip_normal_green: BoolProperty(default=False, options={'HIDDEN'})
+    shared_texture_milo: StringProperty(default="", options={'HIDDEN'})
+
+    def _parse_meshes(self, filepath):
+        return parse_rb2_meshes(filepath)

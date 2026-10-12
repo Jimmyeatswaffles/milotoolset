@@ -44,6 +44,9 @@ from .dc_clip_importer import *
 from .dc_routine_importer import *
 from .gdrb_clip_exporter import *
 from .lipsync_importer import *
+from . import rb2_creator_textures
+from . import rb2_character_importer
+from . import rb2_proportions
 
 # `import *` skips names starting with underscore, so anything private that this file
 # calls directly (rather than through a public wrapper) has to be imported explicitly.
@@ -325,9 +328,9 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
 
 
 class MATERIAL_OT_gltfmilo_autodetect_textures(bpy.types.Operator):
-    """Scans this material's node tree for a Principled BSDF and fills the texture
-    slots above from whatever Image Texture nodes feed its Base Color, Normal,
-    Specular, and Emission inputs."""
+    """Scans this material's node tree for a Principled BSDF (or an imported material's
+    Milo Character Shader node) and fills the texture slots above from whatever Image
+    Texture nodes feed its Base Color, Normal, Specular, and Emission inputs."""
     bl_idname = "material.gltfmilo_autodetect_textures"
     bl_label = "Auto-Detect Textures From Nodes"
     bl_options = {'REGISTER', 'UNDO'}
@@ -368,12 +371,35 @@ class MATERIAL_OT_gltfmilo_autodetect_textures(bpy.types.Operator):
             self.report({'WARNING'}, "This material has no node tree to scan.")
             return {'CANCELLED'}
 
+        settings = mat.gltfmilo_settings
+
+        # Materials imported from GDRB/TBRB use the shared "Milo Character Shader" group
+        # (texture_importer) rather than a Principled BSDF; read its texture inputs.
+        milo_group = next((n for n in mat.node_tree.nodes
+                           if n.type == 'GROUP' and n.node_tree is not None
+                           and n.node_tree.get("milo_shader_version") is not None), None)
+        if milo_group is not None:
+            found = []
+            for sock_name, attr, label in (("Diffuse", 'diffuse_tex', "Diffuse"),
+                                           ("Normal Map", 'normal_tex', "Normal"),
+                                           ("Specular Map", 'specular_tex', "Specular"),
+                                           ("Emissive", 'emissive_tex', "Emissive")):
+                img = self._trace_image(milo_group.inputs.get(sock_name))
+                if img:
+                    setattr(settings, attr, img)
+                    found.append(label)
+            if found:
+                self.report({'INFO'}, f"Auto-detected: {', '.join(found)}")
+            else:
+                self.report({'WARNING'}, "No image textures connected to the Milo "
+                                         "Character Shader node.")
+            return {'FINISHED'}
+
         principled = next((n for n in mat.node_tree.nodes if n.type == 'BSDF_PRINCIPLED'), None)
         if principled is None:
             self.report({'WARNING'}, "No Principled BSDF node found in this material.")
             return {'CANCELLED'}
 
-        settings = mat.gltfmilo_settings
         found = []
 
         img = self._trace_image(principled.inputs.get('Base Color'))
@@ -4167,6 +4193,14 @@ class TOPBAR_MT_milo_mesh_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
                         text="Green Day: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        # RndMesh 34: plain-float vertices, read by content (see parse_rb2_meshes).
+        # Placeholder materials only - RB2's textures come from its character creator.
+        self.layout.operator(IMPORT_OT_rb2_meshes.bl_idname,
+                             text="Rock Band 2 (.milo_xbox)",
+                             icon_value=_milo_icon_id('RB2'))
+        layout.operator(rb2_character_importer.IMPORT_OT_rb2_character.bl_idname,
+                        text="Rock Band 2 Character (prefabs.dta) (Experimental)",
+                        icon_value=_milo_icon_id('RB2'))
         layout.operator(IMPORT_OT_gh2_meshes.bl_idname,
                         text="Guitar Hero 2 (.milo_xbox)",
                         icon_value=_milo_icon_id('GH2'))
@@ -4227,6 +4261,9 @@ class TOPBAR_MT_milo_viseme_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_rb3_viseme_set.bl_idname,
                         text="Rock Band 3 (.milo_xbox)",
                         icon_value=_milo_icon_id('RB3'))
+        layout.operator(IMPORT_OT_rb2_viseme_set.bl_idname,
+                        text="Rock Band 2 (.milo_xbox)",
+                        icon_value=_milo_icon_id('RB2'))
         layout.operator(IMPORT_OT_tbrb_viseme_set.bl_idname,
                         text="The Beatles: Rock Band (.milo_ps3/.milo_xbox)",
                         icon_value=_milo_icon_id('TBRB'))
@@ -4526,6 +4563,7 @@ classes = (
     IMPORT_OT_tbrb_skeleton,
     IMPORT_OT_gdrb_skeleton,
     IMPORT_OT_gdrb_meshes,
+    IMPORT_OT_rb2_meshes,
     IMPORT_OT_tbrb_meshes,
     IMPORT_OT_gdrb_animation,
     IMPORT_OT_gdrb_clip_set,
@@ -4546,6 +4584,7 @@ classes = (
     IMPORT_OT_gh2_meshes,
     IMPORT_OT_rb3_viseme_set,
     IMPORT_OT_gdrb_viseme_set,
+    IMPORT_OT_rb2_viseme_set,
     IMPORT_OT_tbrb_viseme_set,
     IMPORT_OT_gh2_viseme_set,
     IMPORT_OT_gh2_voc,
@@ -4570,6 +4609,9 @@ def register():
     bpy.types.Armature.gltfmilo_hair = PointerProperty(type=GltfMiloHairSettings)
     bpy.types.Bone.gltfmilo_collision = PointerProperty(type=GltfMiloCollisionSettings)
     bpy.types.Object.gltfmilo_object = PointerProperty(type=GltfMiloObjectSettings)
+    rb2_creator_textures.register()
+    rb2_proportions.register()
+    rb2_character_importer.register()
     _register_coll_draw_handler()
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -4589,6 +4631,9 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     _unregister_coll_draw_handler()
+    rb2_character_importer.unregister()
+    rb2_proportions.unregister()
+    rb2_creator_textures.unregister()
     del bpy.types.Object.gltfmilo_object
     del bpy.types.Bone.gltfmilo_collision
     del bpy.types.Armature.gltfmilo_hair

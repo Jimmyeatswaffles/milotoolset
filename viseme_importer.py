@@ -278,9 +278,34 @@ def _read_char_bones_samples(r):
         if sample_size > 1_000_000 or sample_size * num_samples + r.p > len(r.d):
             raise ValueError("sample payload doesn't fit in the remaining bytes")
 
-        pos_bones = [n for n, _ in bones if n.endswith('.pos')]
-        quat_bones = [n for n, _ in bones if n.endswith('.quat')]
-        rotz_bones = [n for n, _ in bones if n.endswith('.rotz')]
+        # Channels are laid out in the order the counts define - positions, scales,
+        # quaternions, then single-axis X, Y and Z rotations - so each channel's type comes
+        # from where it falls in those ranges, not from its name. Grouping by name suffix
+        # (as this used to) silently skipped any type it didn't list: RB2's visemes carry
+        # four lip .scale channels between the positions and the quaternions, so every
+        # quaternion was read from the scale data instead - zeros and nonsense rotations -
+        # while the skipped bytes were absorbed as end-of-sample padding.
+        # Only the 7-count layout (version 16, every retail file checked) is mapped this
+        # way; the older 10-count layout keeps the previous name-based grouping until a
+        # sample of it can confirm what its extra ranges hold.
+        names_in_order = [n for n, _ in bones]
+        layout = []                          # (kind, [names]) in storage order
+        if count_size == 7:
+            kinds = ('pos', 'scale', 'quat', 'rotx', 'roty', 'rotz')
+            for i, kind in enumerate(kinds):
+                lo, hi = counts[i], counts[i + 1]
+                if hi < lo or hi > len(names_in_order):
+                    raise ValueError("counts[] ranges don't fit the channel list")
+                layout.append((kind, names_in_order[lo:hi]))
+        else:
+            layout = [('pos', [n for n in names_in_order if n.endswith('.pos')]),
+                      ('scale', []),
+                      ('quat', [n for n in names_in_order if n.endswith('.quat')]),
+                      ('rotx', []), ('roty', []),
+                      ('rotz', [n for n in names_in_order if n.endswith('.rotz')])]
+        pos_bones = layout[0][1]
+        quat_bones = layout[2][1]
+        rotz_bones = layout[5][1]
 
         def read_pos():
             # IMPORTANT: at compression < 2 a position occupies 16 bytes, not 12 - it's
@@ -327,19 +352,30 @@ def _read_char_bones_samples(r):
                 return r.f32()
             return r.i16() * ROT_CHANNEL_SCALE
 
-        expected = (len(pos_bones) * type_size(0)
-                    + len(quat_bones) * type_size(2)
-                    + len(rotz_bones) * type_size(3))
+        expected = sum(len(names) * type_size(i) for i, (_k, names) in enumerate(layout))
 
         for _ in range(num_samples):
             start = r.p
             sample = {}
-            for name in pos_bones:
-                sample[name] = ('pos', read_pos())
-            for name in quat_bones:
-                sample[name] = ('quat', read_quat())
-            for name in rotz_bones:
-                sample[name] = ('rotz', read_rotz())
+            for kind, names in layout:
+                for name in names:
+                    if kind == 'pos':
+                        sample[name] = ('pos', read_pos())
+                    elif kind == 'scale':
+                        # Same storage as a position. Uncompressed in the only file seen
+                        # with scale channels (RB2's visemes); compressed scales would
+                        # follow the position encoding minus its 1300-unit range.
+                        if compression < 2:
+                            x, y, z = r.f32(), r.f32(), r.f32()
+                            r.p += 4
+                            sample[name] = ('scale', (x, y, z))
+                        else:
+                            sample[name] = ('scale', tuple(max(r.i16() / 32767.0, -1.0)
+                                                           for _ in range(3)))
+                    elif kind == 'quat':
+                        sample[name] = ('quat', read_quat())
+                    else:
+                        sample[name] = (kind, read_rotz())
             consumed = r.p - start
             # Hard check rather than a silent pad-skip: if the bytes actually read don't
             # match what the type-size table says this bone set should occupy, the reads
@@ -348,8 +384,8 @@ def _read_char_bones_samples(r):
             if consumed != expected:
                 raise ValueError(
                     f"sample stride mismatch: consumed {consumed} bytes but the type-size "
-                    f"table expects {expected} for {len(pos_bones)} pos / "
-                    f"{len(quat_bones)} quat / {len(rotz_bones)} rotz bones")
+                    f"table expects {expected} for "
+                    + ", ".join(f"{len(n)} {k}" for k, n in layout if n))
             pad = sample_size - consumed
             if pad > 0:
                 r.p += pad
@@ -431,9 +467,25 @@ def parse_viseme_clip(entry_bytes):
     - are the exception, and for those sample 0 is just the opening frame; importing
     them as real multi-frame Actions is a separate job (see module docstring gap #2).
 
+    Rock Band 2's clips (CharClipSamples version 14) store their source file's path in the
+    header's note field (E:\\prj\\band2\\art\\char\\...), which pushes the samples past
+    the usual search window; for those, the wider search the RB2 animation import uses finds
+    them (all 66 clips of male_viseme_head_1, each ending exactly at its last byte). RB2's
+    visemes are offsets from Base, like RB3's, and keep their poses in the 'one' block.
+
     Returns (pose_dict, full_data, one_data).
     """
-    off, full, one, _end = _locate_bone_samples(entry_bytes)
+    try:
+        off, full, one, _end = _locate_bone_samples(entry_bytes)
+    except VisemeImportError:
+        # Imported here: anim_importer imports from this module at load time.
+        from .anim_importer import _locate_bone_samples_wide
+        try:
+            off, full, one, _end = _locate_bone_samples_wide(entry_bytes)
+        except Exception:
+            raise VisemeImportError(
+                "couldn't locate a valid bone-samples block in this CharClip, with either "
+                "the standard or the wider search")
 
     pose = {}
     if full['samples']:
@@ -523,7 +575,11 @@ _MILO_VISEME_SET = "milo_viseme_set"      # source CharClipSet dir_name
 
 # The animated-component suffix used by CharBonesSamples channel names. These say WHICH
 # transform component the samples drive, and are not part of the bone's identity.
-_CHANNEL_SUFFIXES = ('.pos', '.quat', '.rotz')
+# Every channel type a sample block can hold (see _read_char_bones_samples). Scale channels
+# (RB2's lip corners) aren't keyed - every RB2 viseme's scale offset is zero - but their
+# suffix still has to come off so they resolve to their bone rather than reading as a
+# missing one.
+_CHANNEL_SUFFIXES = ('.pos', '.quat', '.rotz', '.scale', '.rotx', '.roty')
 
 # Milo's own bone-type extensions (see char_bone.bt: "Ext: .mesh, .trans"). These ARE
 # part of the bone's name as it appears in the skeleton milo - and therefore as the
@@ -1285,6 +1341,20 @@ class IMPORT_OT_gdrb_viseme_set(_IMPORT_OT_viseme_set_base):
     bl_idname = "import_scene.gdrb_viseme_set"
     bl_label = "Import GDRB Viseme Set"
     _game_label = "GDRB"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        return find_viseme_clips_rev25(filepath)
+
+
+class IMPORT_OT_rb2_viseme_set(_IMPORT_OT_viseme_set_base):
+    """Import a Rock Band 2 viseme milo as one Action per named viseme on the active
+    armature. RB2 uses Rock Band 3's viseme names (Eat_hi, Ox_lo, Brow_aggressive ...) in the
+    revision-25 format TBRB and GDRB share, with older clip headers (see parse_viseme_clip)"""
+    bl_idname = "import_scene.rb2_viseme_set"
+    bl_label = "Import RB2 Viseme Set"
+    _game_label = "RB2"
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
 
