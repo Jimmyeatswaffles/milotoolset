@@ -120,8 +120,9 @@ shown regardless of light.
 The outfit milo only holds the hair's textures. The clothing's (pant/shoe/torso_bud02) live
 in the outfit's shared milo, which the file names as '../../shared/outfit/
 budokan01_share.milo' - shared because every Beatle in that outfit uses them. The importer
-follows those references on disk (see find_shared_milo), or takes the path given in the
-import options.
+follows those references on disk automatically, using the game's folder layout (see
+find_shared_milo), and follows a shared milo's own references in turn. Textures it still
+can't find are listed in a warning; those slots are left empty.
 
 ===========================================================================================
 KNOWN GAPS
@@ -137,6 +138,7 @@ KNOWN GAPS
 4. kBlendMultiply/kBlendSubtract/kBlendDest materials are drawn opaque.
 """
 
+import hashlib
 import os
 import re
 import struct
@@ -415,29 +417,62 @@ def _platform_suffix(filepath):
     return ext if ext.startswith('.milo') else '.milo_xbox'
 
 
-def find_shared_milo(filepath, ref, max_dirs=4000):
-    """Locates a referenced milo on disk. Tries, in order: the reference resolved against
-    this file's folder (as the game's folder layout has it), the same file name next to
-    this one, then a bounded search of the folders up to three levels above. Returns the
-    path or None."""
-    here = os.path.dirname(os.path.abspath(filepath))
-    suffix = _platform_suffix(filepath)
-    stem = os.path.splitext(ref)[0]
-    name = os.path.basename(stem)
-    wanted = {name.lower() + suffix, name.lower() + '.milo'}
-    for cand in (os.path.normpath(os.path.join(here, stem + suffix)),
-                 os.path.normpath(os.path.join(here, ref)),
-                 os.path.join(here, name + suffix)):
-        if os.path.isfile(cand) and os.path.abspath(cand) != os.path.abspath(filepath):
-            return cand
-    root = here
-    for _ in range(3):
-        parent = os.path.dirname(root)
-        if parent == root:
+def _source_dir(milo_path):
+    """The folder a milo's references are relative to. Built files sit in a 'gen' folder
+    beside their source (char/john/outfit/gen/budokan01.milo_xbox), but the references were
+    written from the source folder (char/john/outfit), so 'gen' is stepped out of."""
+    here = os.path.dirname(os.path.abspath(milo_path))
+    return os.path.dirname(here) if os.path.basename(here).lower() == 'gen' else here
+
+
+def _char_root(milo_path):
+    """The nearest folder above a milo named 'char' (the game's character root), else the
+    folder three levels up. Used only for the fallback search."""
+    d = os.path.dirname(os.path.abspath(milo_path))
+    for _ in range(6):
+        if os.path.basename(d).lower() == 'char':
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
             break
-        root = parent
+        d = parent
+    d = os.path.dirname(os.path.abspath(milo_path))
+    for _ in range(3):
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    return d
+
+
+def find_shared_milo(filepath, ref, max_dirs=4000):
+    """Locates a referenced milo on disk, or None. The game's layout is tried first:
+
+        char/john/outfit/gen/budokan01.milo_xbox
+          refs '../../shared/outfit/budokan01_share.milo'   (from char/john/outfit)
+          ->    char/shared/outfit/gen/budokan01_share.milo_xbox
+
+    then the same without the 'gen' step (for flattened extractions), the file name next to
+    this one, and finally a bounded search under the char folder."""
+    suffix = _platform_suffix(filepath)
+    stem = os.path.splitext(ref.replace('\\', '/'))[0]
+    name = os.path.basename(stem)
+    self_path = os.path.normcase(os.path.abspath(filepath))
+    cands = []
+    for base in (_source_dir(filepath), os.path.dirname(os.path.abspath(filepath))):
+        target = os.path.normpath(os.path.join(base, stem))
+        tdir = os.path.dirname(target)
+        cands += [os.path.join(tdir, 'gen', name + suffix),
+                  os.path.join(tdir, name + suffix),
+                  os.path.join(tdir, 'gen', name + '.milo'),
+                  os.path.join(tdir, name + '.milo')]
+    cands.append(os.path.join(os.path.dirname(os.path.abspath(filepath)), name + suffix))
+    for cand in cands:
+        if os.path.isfile(cand) and os.path.normcase(os.path.abspath(cand)) != self_path:
+            return cand
+    wanted = {name.lower() + suffix, name.lower() + '.milo'}
     seen = 0
-    for dirpath, dirnames, filenames in os.walk(root):
+    for dirpath, dirnames, filenames in os.walk(_char_root(filepath)):
         seen += 1
         if seen > max_dirs:
             break
@@ -448,48 +483,62 @@ def find_shared_milo(filepath, ref, max_dirs=4000):
     return None
 
 
-def _shared_textures(filepath, missing, extra_paths, notes):
-    """Textures named by the materials but stored in another milo. TBRB outfits keep their
-    clothing textures in a shared outfit milo that every Beatle wearing the outfit points
-    at (budokan01 -> ../../shared/outfit/budokan01_share.milo); only the hair is local."""
+def _ref_priority(ref):
+    """Shared outfit milos first: they're where an outfit's textures live, while a head
+    milo reference ('../john_headhands_short.milo') rarely holds what's missing."""
+    r = ref.lower()
+    return (0 if ('shared' in r or '_share' in r) else 1)
+
+
+def _shared_textures(filepath, missing, notes, max_files=8, max_depth=2):
+    """Textures the materials name but this milo doesn't hold, gathered from the milos it
+    references. TBRB outfits keep their clothing textures in a shared outfit milo every
+    Beatle in that outfit points at (budokan01 -> ../../shared/outfit/budokan01_share.milo);
+    an outfit can name more than one, and a shared milo can point on to another, so
+    references are followed breadth-first (up to max_depth hops, max_files files) until
+    nothing is missing."""
     found = {}
-    paths = [p for p in extra_paths if p]
+    visited = {os.path.normcase(os.path.abspath(filepath))}
+    queue = [(filepath, 0)]
     unfound = []
-    for ref in referenced_milos(filepath):
-        p = find_shared_milo(filepath, ref)
-        if p is not None:
-            paths.append(p)
-        else:
-            unfound.append(ref)
-    seen = set()
-    for p in paths:
-        key = os.path.normcase(os.path.abspath(p))
-        if key in seen or key == os.path.normcase(os.path.abspath(filepath)):
+    loaded = 0
+    while queue and (missing - set(found)) and loaded < max_files:
+        src, depth = queue.pop(0)
+        if depth >= max_depth:
             continue
-        seen.add(key)
-        if not (missing - set(found)):
-            break
         try:
-            texs, _mats, _failed = read_milo_materials(p)
-        except Exception as e:
-            notes.append(f"couldn't read '{os.path.basename(p)}': {e}")
+            refs = sorted(referenced_milos(src), key=_ref_priority)
+        except Exception:
             continue
-        got = [n for n in missing if n in texs and n not in found]
-        for n in got:
-            found[n] = texs[n]
-        if got:
-            notes.append(f"{len(got)} texture(s) taken from '{os.path.basename(p)}'")
+        for ref in refs:
+            if not (missing - set(found)) or loaded >= max_files:
+                break
+            p = find_shared_milo(src, ref)
+            if p is None:
+                if ref not in unfound:
+                    unfound.append(ref)
+                continue
+            key = os.path.normcase(os.path.abspath(p))
+            if key in visited:
+                continue
+            visited.add(key)
+            loaded += 1
+            try:
+                texs, _mats, _failed = read_milo_materials(p)
+            except Exception as e:
+                notes.append(f"couldn't read '{os.path.basename(p)}': {e}")
+                continue
+            got = [n for n in missing if n in texs and n not in found]
+            for n in got:
+                found[n] = texs[n]
+            if got:
+                notes.append(f"{len(got)} texture(s) from '{os.path.relpath(p, _char_root(filepath))}'")
+            queue.append((p, depth + 1))
     if missing - set(found) and unfound:
-        notes.append("some textures live in another milo this one points at, not found "
-                     "near it: " + ", ".join(f"'{r}'" for r in unfound)
-                     + " - set 'Shared Texture Milo' in the import options to the outfit's "
-                       "_share milo")
+        notes.append("referenced milo(s) not found on disk: "
+                     + ", ".join(f"'{r}'" for r in unfound))
     return found
 
-
-# ---------------------------------------------------------------------------------------
-# Block decoding (numpy - Blender bundles it)
-# ---------------------------------------------------------------------------------------
 
 def _byteswap16(data):
     a = np.frombuffer(data, dtype=np.uint8)
@@ -596,12 +645,17 @@ def build_image(tex_name, tex, role, flip_green=True):
     """Creates or refreshes the Blender image for one texture. role: 'diffuse', 'normal'
     or 'specular'.
 
-    An existing image of the same name is overwritten in place rather than reused as-is,
-    so re-importing picks up changes (such as the normal-map green flip) while any node
-    already pointing at the image keeps working. One texture can also be needed in two
-    colour spaces - 21st_shoes.mat uses 'billiejoe shoes spec.tex' as both diffuse (sRGB)
-    and specular (Non-Color) - so a second role that disagrees on colour space gets its
-    own image rather than silently sharing the first."""
+    Images are matched by texture name AND pixel content, not by name alone. Texture names
+    repeat across milos with different pixels - every Beatle's head milo has its own
+    'hand_diffuse.tex' and 'hand_spec.tex' - and matching by name let the second import
+    overwrite the first character's images. Now an image is refreshed in place only when it
+    holds the same texture data (a re-import, where e.g. the normal-map green flip may have
+    changed), and identical textures (skin_detail_normals, eye_cubetex) are still shared;
+    different pixels get a new image, which Blender names 'hand_diffuse.001'.
+
+    One texture can also be needed in two colour spaces - 21st_shoes.mat uses
+    'billiejoe shoes spec.tex' as both diffuse (sRGB) and specular (Non-Color) - so each
+    colour space gets its own image."""
     colorspace = 'sRGB' if role == 'diffuse' else 'Non-Color'
     if role == 'normal' and tex['encoding'] == ENC_ATI2:
         rgba = decode_normal(tex, flip_green)
@@ -609,16 +663,24 @@ def build_image(tex_name, tex, role, flip_green=True):
         rgba = decode_rgba(tex)
     h, w = rgba.shape[:2]
 
-    base = _image_name(tex_name)
-    name = base
-    img = bpy.data.images.get(name)
-    if img is not None and img.get("milo_texture") == tex_name \
-            and img.get("milo_colorspace", colorspace) != colorspace:
-        name = f"{base}_{'color' if colorspace == 'sRGB' else 'data'}"
-        img = bpy.data.images.get(name)
-    if img is None or tuple(img.size) != (w, h):
-        if img is not None:
-            bpy.data.images.remove(img)
+    digest = hashlib.sha1(tex['data']).hexdigest()[:16]
+    img = None
+    for cand in bpy.data.images:
+        if (cand.get("milo_texture") == tex_name and cand.get("milo_hash") == digest
+                and cand.get("milo_colorspace") == colorspace):
+            img = cand
+            break
+    if img is not None and tuple(img.size) != (w, h):
+        bpy.data.images.remove(img)
+        img = None
+    if img is None:
+        base = _image_name(tex_name)
+        name = base
+        other = bpy.data.images.get(base)
+        if other is not None and other.get("milo_texture") == tex_name \
+                and other.get("milo_hash") == digest:
+            # same texture already here in the other colour space
+            name = f"{base}_{'color' if colorspace == 'sRGB' else 'data'}"
         img = bpy.data.images.new(name, width=w, height=h, alpha=True)
     img.colorspace_settings.name = colorspace
     # Blender stores pixels bottom row first; the decoded image is top row first. Flipping
@@ -632,6 +694,7 @@ def build_image(tex_name, tex, role, flip_green=True):
         pass
     img["milo_texture"] = tex_name
     img["milo_colorspace"] = colorspace
+    img["milo_hash"] = digest
     return img
 
 
@@ -1115,11 +1178,64 @@ def _viewport_color(mat, slots, diffuse_img):
         pass
 
 
-def apply_textures(filepath, material_names, flip_green=True, shared_paths=()):
+def _tex_identity(name, texs):
+    """What a texture slot really holds: a hash of its pixels, following a TexBlender's
+    render target to its base map, or the name when the texture isn't available."""
+    if not name:
+        return None
+    t = texs.get(name)
+    if t is not None and t.get('render_target') and t.get('blend_base') in texs:
+        name = t['blend_base']
+        t = texs[name]
+    if t is None or not t.get('data'):
+        return ('name', name)
+    return ('pixels', hashlib.sha1(t['data']).hexdigest())
+
+
+def _borrowed_specular(mat_name, slots, mats, texs):
+    """(material, texture) to lend a material that has no specular map, or None.
+
+    Some TBRB head milos leave the map off: Ringo's hands.mat has none while his nails.mat,
+    on the same hand textures, uses hand_spec.tex; John's SHORT-hands milo has none on
+    j_head/j_head01/j_hands, while his long-hands milo - identical textures - has
+    john_spec.tex on all three. With no map the material's specular colour (0.925 at power
+    5) covers the whole surface and, under Blender's environment lighting, turns it white.
+
+    So a material missing the map borrows one from a material in the same milo with the
+    same diffuse texture. "Same" means the same pixels, not the same name: John's milo
+    carries the face texture twice, as j_diffuse.tex (head) and john_diffuse.tex
+    (eyebrows), byte-for-byte identical, and only the eyebrow material keeps john_spec.tex.
+    A lender with the same normal map too is preferred. Materials that never use specular
+    (black specular colour) borrow nothing."""
+    if slots.get('specular') or not slots.get('diffuse'):
+        return None
+    if max(slots.get('specular_rgb') or (0.0,)) <= 0.0:
+        return None
+    my_diff = _tex_identity(slots['diffuse'], texs)
+    my_norm = _tex_identity(slots.get('normal'), texs)
+    best = None
+    for other, o in sorted(mats.items()):
+        if other == mat_name or not o.get('specular'):
+            continue
+        if _tex_identity(o.get('diffuse'), texs) != my_diff:
+            continue
+        rank = 0 if (my_norm is not None
+                     and _tex_identity(o.get('normal'), texs) == my_norm) else 1
+        if best is None or rank < best[0]:
+            best = (rank, other, o['specular'])
+    return (best[1], best[2]) if best else None
+
+
+def apply_textures(filepath, material_names, flip_green=True, source=None):
     """Builds the Milo Character Shader node tree for the named materials from a milo's own
     Tex and Mat entries, and fills each material's glTFMilo settings. Textures the materials
-    name but this milo doesn't hold are looked up in the milos it references (found next to
-    it on disk) and in shared_paths. Returns (textured count, image count, [notes])."""
+    name but this milo doesn't hold are looked up automatically in the milos it references
+    (see find_shared_milo). Returns (textured count, image count, [notes], [names of
+    textures that couldn't be found anywhere]). source: the milo's file name, scoping its
+    materials as mesh_importer.milo_material does (defaults to this file's name)."""
+    from .mesh_importer import milo_material
+    if source is None:
+        source = os.path.basename(filepath)
     texs, mats, failed = read_milo_materials(filepath)
     notes = [f"skipped {n}: {r}" for n, r in failed]
     images = {}
@@ -1130,16 +1246,22 @@ def apply_textures(filepath, material_names, flip_green=True, shared_paths=()):
         for key in ('diffuse', 'normal', 'specular', 'emissive', 'detail_normal'):
             if slots.get(key):
                 wanted.add(slots[key])
+    for mat_name in material_names:
+        slots = mats.get(mat_name)
+        if slots:
+            b = _borrowed_specular(mat_name, slots, mats, texs)
+            if b:
+                wanted.add(b[1])
     missing = {n for n in wanted if n not in texs}
     if missing:
-        texs.update(_shared_textures(filepath, missing, shared_paths, notes))
+        texs.update(_shared_textures(filepath, missing, notes))
+    not_found = sorted(n for n in missing if n not in texs)
 
     def image_for(tex_name, role):
         if not tex_name:
             return None
         if tex_name not in texs:
-            notes.append(f"texture '{tex_name}' isn't in this milo")
-            return None
+            return None             # reported once, in not_found
         if texs[tex_name].get('render_target'):
             base = texs[tex_name].get('blend_base')
             if base and base in texs and not texs[base].get('render_target'):
@@ -1163,11 +1285,10 @@ def apply_textures(filepath, material_names, flip_green=True, shared_paths=()):
     done = 0
     for mat_name in material_names:
         slots = mats.get(mat_name)
-        mat = bpy.data.materials.get(mat_name)
-        if slots is None or mat is None:
-            if slots is None:
-                notes.append(f"material '{mat_name}' isn't defined in this milo")
+        if slots is None:
+            notes.append(f"material '{mat_name}' isn't defined in this milo")
             continue
+        mat = milo_material(mat_name, source)
         if not slots.get('tail_ok'):
             notes.append(f"'{mat_name}': rim, detail-normal and hair settings couldn't be "
                          f"read; neutral values used")
@@ -1175,11 +1296,33 @@ def apply_textures(filepath, material_names, flip_green=True, shared_paths=()):
                 for role, key in (('diffuse', 'diffuse'), ('normal', 'normal'),
                                   ('specular', 'specular'), ('emissive', 'emissive'),
                                   ('detail', 'detail_normal'))}
+        own_imgs = dict(imgs)
+        borrowed = _borrowed_specular(mat_name, slots, mats, texs)
+        if imgs['specular'] is None and borrowed:
+            imgs['specular'] = image_for(borrowed[1], 'specular')
+            if imgs['specular'] is not None:
+                notes.append(f"'{mat_name}' has no specular map; using '{borrowed[1]}' from "
+                             f"'{borrowed[0]}', which shares its diffuse texture")
         build_material_tree(mat, slots, imgs)
-        fill_material_settings(mat, slots, imgs)
+        if imgs['specular'] is not None and own_imgs['specular'] is None:
+            # A borrowed map's alpha is tuned to the lender's specular power, not this
+            # material's, so only its colour (where the surface is shiny) is used.
+            grp = mat.node_tree.nodes.get(SHADER_NODE_NAME)
+            if grp is not None:
+                grp.inputs["Gloss Map Influence"].default_value = 0.0
+        # The panel keeps the material's own slots, so a re-export writes what the game
+        # file had rather than the borrowed preview map.
+        fill_material_settings(mat, slots, own_imgs)
+        mat["milo_borrowed_specular"] = borrowed[1] if (borrowed and imgs['specular']
+                                                        is not None
+                                                        and own_imgs['specular'] is None) \
+            else ""
         _viewport_color(mat, slots, imgs.get('diffuse'))
         if slots.get('blend') in (BLEND_SUBTRACT, BLEND_MULTIPLY, BLEND_DEST):
             notes.append(f"'{mat_name}': blend mode {slots['blend']} has no Blender "
                          f"equivalent here; drawn opaque")
         done += 1
-    return done, len([i for i in images.values() if i is not None]), notes
+    if not_found:
+        notes.append(f"{len(not_found)} texture(s) not found in this milo or any milo it "
+                     f"references: " + ", ".join(not_found))
+    return done, len([i for i in images.values() if i is not None]), notes, not_found

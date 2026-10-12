@@ -62,6 +62,7 @@ KNOWN GAPS
    also survives the misspelled 'billiejoel_tongueLOD02.mesh' present in the retail file.
 """
 
+import os
 import re
 import struct
 
@@ -1047,22 +1048,40 @@ def parse_gdrb_meshes(filepath):
 # Blender construction
 # ---------------------------------------------------------------------------------------
 
-def _placeholder_material(mat_name):
-    """A named stand-in so material slots and assignments survive import. Textures aren't
-    read (see gap #1), so this carries no maps - it exists to keep the mapping from mesh
-    to milo Mat visible and re-linkable later."""
+def milo_material(mat_name, source=""):
+    """The Blender material for one milo Mat, scoped to the milo it came from.
+
+    Material names repeat across milos - every Beatle's head milo has its own 'hands.mat'
+    and 'nails.mat', with different settings (Ringo's hands have no specular map, George's
+    do). Looked up by name alone, the second import would grab the first's material and
+    rebuild it, changing the already-imported character too. So a material is reused only
+    when it came from the same milo file (re-importing it refreshes it in place); otherwise
+    a new one is made, which Blender names 'hands.mat.001' and so on. The game name stays in
+    the 'milo_material' property, the source file in 'milo_source'."""
     if not mat_name:
         mat_name = "milo_unassigned"
-    mat = bpy.data.materials.get(mat_name)
-    if mat is None:
-        mat = bpy.data.materials.new(mat_name)
+    for mat in bpy.data.materials:
+        if mat.get("milo_material") == mat_name and mat.get("milo_source", "") == source:
+            return mat
+    mat = bpy.data.materials.new(mat_name)
+    try:
         mat.use_nodes = True
-        mat["milo_material"] = mat_name
+    except AttributeError:
+        pass
+    mat["milo_material"] = mat_name
+    mat["milo_source"] = source
     return mat
 
 
-def build_mesh_object(context, mesh_data, armature_obj=None):
-    """Creates one Blender object from a parsed mesh dict."""
+def _placeholder_material(mat_name, source=""):
+    """A named stand-in so material slots and assignments survive import; the texture
+    importer fills it in afterwards."""
+    return milo_material(mat_name, source)
+
+
+def build_mesh_object(context, mesh_data, armature_obj=None, source=""):
+    """Creates one Blender object from a parsed mesh dict. source: the milo's file name,
+    which scopes its materials (see milo_material)."""
     name = mesh_data['name']
     verts = mesh_data['verts']
     faces = mesh_data['faces']
@@ -1083,7 +1102,7 @@ def build_mesh_object(context, mesh_data, armature_obj=None):
         # still perfectly usable with computed normals, so this is a note, not a failure.
         _log(f"    '{name}': custom normals not applied ({e}); using computed normals")
 
-    me.materials.append(_placeholder_material(mesh_data['mat']))
+    me.materials.append(_placeholder_material(mesh_data['mat'], source))
 
     obj = bpy.data.objects.new(name, me)
     obj["milo_mesh_version"] = mesh_data['version']
@@ -1194,16 +1213,6 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
                      "through a shared Milo Character Shader node group. Also fills each "
                      "material's glTFMilo settings panel",
         default=True,
-    )
-
-    shared_texture_milo: StringProperty(
-        name="Shared Texture Milo",
-        description="A milo holding textures this one uses but doesn't contain - TBRB "
-                     "outfits keep their clothing textures in a shared outfit milo (e.g. "
-                     "shared/outfit/budokan01_share.milo_xbox). Optional: milos the file "
-                     "points at are also searched for automatically in the folders around it",
-        subtype='FILE_PATH',
-        default="",
     )
 
     flip_normal_green: BoolProperty(
@@ -1333,8 +1342,9 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
         unmatched_bones = set()
         arm_bones = set(armature_obj.data.bones.keys()) if armature_obj else set()
 
+        source = os.path.basename(self.filepath)
         for m in wanted:
-            build_mesh_object(context, m, armature_obj)
+            build_mesh_object(context, m, armature_obj, source)
             created += 1
             total_v += len(m['verts'])
             total_f += len(m['faces'])
@@ -1347,22 +1357,24 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
             _log(f"    SKIPPED {nm}: {reason}")
 
         tex_summary = ""
+        tex_warning = False
         if self.import_textures and self._textures_supported:
             # Imported here rather than at module level: texture_importer itself uses this
             # module's directory helpers.
             from .texture_importer import apply_textures
             wanted_mats = sorted({m['mat'] for m in wanted if m['mat']})
             try:
-                shared = bpy.path.abspath(self.shared_texture_milo) \
-                    if self.shared_texture_milo else ""
-                done, n_images, tex_notes = apply_textures(
-                    self.filepath, wanted_mats, self.flip_normal_green,
-                    shared_paths=(shared,) if shared else ())
+                done, n_images, tex_notes, tex_missing = apply_textures(
+                    self.filepath, wanted_mats, self.flip_normal_green, source=source)
                 _log(f"  textures: {done} of {len(wanted_mats)} material(s) textured, "
                      f"{n_images} image(s) decoded")
                 for n in tex_notes:
                     _log(f"    {n}")
                 tex_summary = f"; {done} material(s) textured"
+                if tex_missing:
+                    tex_warning = True
+                    tex_summary += (f"; {len(tex_missing)} texture(s) not imported - they "
+                                    f"live in a shared milo that wasn't found (see log)")
             except Exception as e:
                 _log(f"  textures: could not be imported ({e})")
                 tex_summary = "; textures failed (see log)"
@@ -1383,7 +1395,7 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
         if armature_obj is not None:
             summary += f"; parented to '{armature_obj.name}'"
         _log(f"===== {summary} =====")
-        self.report({'WARNING' if failed else 'INFO'}, summary)
+        self.report({'WARNING' if (failed or tex_warning) else 'INFO'}, summary)
         return {'FINISHED'}
 
 
@@ -1422,7 +1434,6 @@ class IMPORT_OT_rb2_meshes(_IMPORT_OT_milo_meshes_base):
     filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
     import_textures: BoolProperty(default=False, options={'HIDDEN'})
     flip_normal_green: BoolProperty(default=False, options={'HIDDEN'})
-    shared_texture_milo: StringProperty(default="", options={'HIDDEN'})
 
     def _parse_meshes(self, filepath):
         return parse_rb2_meshes(filepath)
