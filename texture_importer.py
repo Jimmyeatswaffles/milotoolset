@@ -82,9 +82,11 @@ rebuilds the game's terms from separate parts:
   * Diffuse: diffuse texture x material colour (x2 with intensify), through a Principled
     BSDF with its own specular switched off.
   * Specular: a Glossy BSDF ADDED on top, as the game adds it. Power n becomes roughness
-    (2/(n+2))^0.25 (the standard Blinn-Phong to GGX match), and its colour is
-    specularRGB x specular map x 8/(n+2), which gives the highlight the same peak
-    brightness as the game's un-normalised Blinn-Phong lobe.
+    (2/(n+2))^0.25 (the standard Blinn-Phong to Beckmann match), and its colour is
+    specularRGB x specular map x 8/(n+7): the total light the game's lobe,
+    spec x (N.H)^n x N.L, reflects over the hemisphere. For tight lobes that's also the
+    same peak brightness; for broad ones (skin, power ~5) it keeps the lobe from reading
+    as a pale layer under environment lighting, which the game's specular never gets.
   * Gloss: the specular map's ALPHA scales the power, as the material editor describes
     the map ("specular colour and power"). The pants' cloth is ~0.9, the vest's leather
     is lower, giving it a broader sheen. Turned off for hair (see below).
@@ -716,7 +718,7 @@ def _lin3(rgb):
 
 
 SHADER_GROUP_NAME = "Milo Character Shader"
-SHADER_GROUP_VERSION = 3
+SHADER_GROUP_VERSION = 4
 SHADER_NODE_NAME = "MiloCharShader"
 
 # (name, socket type, default, min, max). Colours are linear (Blender's working space);
@@ -911,7 +913,14 @@ def ensure_shader_group():
         n = math('MAXIMUM', n, 1.0, x=-900, y=y)
         n2 = math('ADD', n, 2.0, x=-700, y=y)
         rough = math('POWER', math('DIVIDE', 2.0, n2, x=-500, y=y), 0.25, x=-330, y=y)
-        energy = math('MINIMUM', math('DIVIDE', 8.0, n2, x=-500, y=y - 140), 1.0,
+        # Reflected energy matched to the game's lobe, spec x (N.H)^n x N.L, over the
+        # hemisphere: 8/(n+7) (fit within 10% from n=1 to 200). The earlier 8/(n+2)
+        # matched only the peak and ignored N.L, overstating broad lobes ~1.5x - and a
+        # broad lobe under Blender's environment light reads as a pale layer over the
+        # whole surface (George's "make-up"), since the game's ambient never reaches its
+        # specular. Tight lobes are unchanged: n=50 -> 0.14 either way.
+        n7 = math('ADD', n, 7.0, x=-700, y=y - 140)
+        energy = math('MINIMUM', math('DIVIDE', 8.0, n7, x=-500, y=y - 140), 1.0,
                       x=-330, y=y - 140)
         col = mul_rgb(color_in, spec_map.outputs['Color'], -500, y - 300)
         col_v = vmath('SCALE', col, x=-160, y=y - 200)

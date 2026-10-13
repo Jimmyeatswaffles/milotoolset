@@ -324,6 +324,8 @@ def setup_fur_material(mat, fur, shells):
         nodes.remove(n)                  # the plain alpha-blend multiply this replaced
     _set_render_method(mat, shells)
     mat["rb2_fur_params"] = repr(fur)
+    from .rb2_creator_textures import sync_milo_shader
+    sync_milo_shader(mat)
     return True
 
 

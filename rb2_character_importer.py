@@ -33,10 +33,43 @@ instruments.
 
 Selectable characters are the ones with (selectable TRUE); their display names come from
 the locale file's (prefab_<name> "Display Name") entries.
+
+Saves work too - Xbox 360 (a CON package such as 'band', or its extracted save.dat) and
+PS3 (RB2.SAV as RPCS3 keeps it, which has no console encryption): the characters players
+made are read from it and picked by the names they were given. Both platforms store the
+same thing - the same Rand2 encryption, little-endian on PS3 as well, the same character
+records - so one reader serves both; only the PS3 header after the seed differs, which
+doesn't matter as records are found by their structure. RB2.SAV is a fixed 6 MB of which
+~200 KB is data, so the zero padding is trimmed before decrypting.
+
+    CON (STFS)   save.dat is one file of the package; its blocks are found through the
+                 package's hash tables (two alternating copies - both are tried).
+    save.dat     u32 version (14 outside, 15 inside), then a random 32-bit seed and the rest
+                 XORed with the low byte of the engine's Rand2 generator (Park-Miller) from
+                 that seed: BinStream's own encryption (RB3 decomp: utl/BinStream.cpp,
+                 math/Rand2.cpp), little-endian.
+    characters   after a u32 count, each record: u32 0x24, the name (u32 length + text), u32
+                 1, a 16-byte id, a byte, then the character as a binary DataArray - u16
+                 count, 4 bytes, then nodes (u32 type: 0 int, 1 float, 5 symbol, 0x12
+                 string, 0x10 array) - exactly a prefab entry with the creator preset it
+                 started from in place of a prefab name:
+                     (contestant_number_one (gender female) (skin_color_index 0) ...
+                      (outfit (hair ladylayered_resource (colors 1 0)) ...))
+                 Each character's progress follows its record, so records are found by
+                 their structure rather than at fixed offsets.
+    colours      The (colors a b) in that array are NOT the ones in use: they are the
+                 starting preset's, left as they were when items were swapped (Sylvain,
+                 from contestant_number_one, keeps (4 4) and (26 11) from its bleached tee
+                 and work pants). After the array each character has a closet: per item
+                 used, its slot, its name, u32 2, two u32 palette indices and u32 -1 -
+                 loosedapperjacket_vintage 26 0 = the slate jacket and black tie Sylvain
+                 wears, bootcutpants_distressedjeans 18 0 = red-orange denim[18] and a black
+                 belt. Those win; the array's numbers are only a fallback.
 """
 
 import os
 import re
+import struct
 import time
 
 import bpy
@@ -175,6 +208,338 @@ def parse_locale_prefab_names(path):
     return names
 
 
+# ---------------------------------------------------------------------------------------
+# Xbox 360 saves
+# ---------------------------------------------------------------------------------------
+
+class SaveError(Exception):
+    pass
+
+
+def _stfs_files(data):
+    """{name: [bytes, ...]} for the files of an STFS package (CON / LIVE / PIRS) - one
+    candidate per hash-table copy whose block chain is complete."""
+    if data[:4] not in (b'CON ', b'LIVE', b'PIRS'):
+        raise SaveError("not an Xbox 360 package")
+    header_size = struct.unpack_from('>I', data, 0x340)[0]
+    first = (header_size + 0xFFF) & 0xFFFFF000
+    sep = data[0x37B]
+    sex = 0 if sep & 1 else 1                  # two copies of each hash table unless set
+    ft_blocks = struct.unpack_from('<H', data, 0x37C)[0]
+    ft_start = int.from_bytes(data[0x37E:0x381], 'little')
+
+    def backing(b):
+        n = (((b + 0xAA) // 0xAA) << sex) + b
+        if b < 0xAA:
+            return n
+        if b < 0x70E4:
+            return n + (((b + 0x70E4) // 0x70E4) << sex)
+        return (1 << sex) + n + (((b + 0x70E4) // 0x70E4) << sex)
+
+    def off(b):
+        return first + (backing(b) << 12)
+
+    step0 = 0xAC if sex else 0xAB
+
+    def hash_entry(b, copy):
+        if b < 0xAA:
+            hb = 0
+        else:
+            hb = (b // 0xAA) * step0
+            hb += ((b // 0x70E4) + 1) << sex
+            if b // 0x70E4:
+                hb += 1 << sex
+        o = first + ((hb + copy) << 12) + (b % 0xAA) * 0x18
+        return data[o:o + 0x18]
+
+    def chain(start, count, copy, consecutive):
+        out, b = [], start
+        for _ in range(count):
+            if b >= 0xFFFFFF or off(b) + 0x1000 > len(data):
+                return None
+            out.append(b)
+            b = b + 1 if consecutive else int.from_bytes(hash_entry(b, copy)[0x15:0x18], 'big')
+        return out
+
+    tables = []
+    for copy in range(1 << sex):
+        blocks = chain(ft_start, max(ft_blocks, 1), copy, False)
+        if blocks:
+            tables.append(blocks)
+    files = {}
+    seen = set()
+    for blocks in tables:
+        for b in blocks:
+            o = off(b)
+            for k in range(0x40):
+                e = data[o + k * 0x40:o + k * 0x40 + 0x40]
+                if not e[0]:
+                    continue
+                ln = e[0x28] & 0x3F
+                if e[0x28] & 0x80 or not 0 < ln <= 0x28:
+                    continue
+                name = e[:ln].decode('latin-1', 'replace')
+                nblocks = int.from_bytes(e[0x29:0x2C], 'little')
+                start = int.from_bytes(e[0x2F:0x32], 'little')
+                size = struct.unpack_from('>I', e, 0x34)[0]
+                for copy in range(1 << sex):
+                    key = (name, start, size, copy)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    bl = chain(start, nblocks, copy, bool(e[0x28] & 0x40))
+                    if bl:
+                        body = b''.join(data[off(x):off(x) + 0x1000] for x in bl)[:size]
+                        files.setdefault(name, []).append(body)
+    return files
+
+
+def _rand2_xor(body, seed):
+    s = 1 if seed == 0 else abs(seed)
+    out = bytearray(body)
+    for i in range(len(out)):
+        t = (s % 127773) * 0x41A7 - (s // 127773) * 0xB14
+        s = t if t > 0 else t + 0x7FFFFFFF
+        out[i] ^= s & 0xFF
+    return bytes(out)
+
+
+def _decrypt_save(raw):
+    if len(raw) < 16:
+        raise SaveError("save too small")
+    seed = struct.unpack_from('<i', raw, 4)[0]
+    return _rand2_xor(raw[8:], seed)
+
+
+_DTB_TEXT = {2, 3, 4, 5, 7, 0x12, 0x20, 0x21, 0x22, 0x23, 0x25}
+_DTB_TREE = {0x10, 0x11, 0x13}
+
+
+def _dtb_node(b, o, depth=0):
+    if depth > 64:
+        raise SaveError("data nested too deep")
+    t = struct.unpack_from('<I', b, o)[0]; o += 4
+    if t == 0:
+        return struct.unpack_from('<i', b, o)[0], o + 4
+    if t == 1:
+        return struct.unpack_from('<f', b, o)[0], o + 4
+    if t in _DTB_TEXT:
+        n = struct.unpack_from('<I', b, o)[0]
+        if n > 4096 or o + 4 + n > len(b):
+            raise SaveError("bad text length")
+        text = b[o + 4:o + 4 + n].decode('utf-8', 'replace')
+        return (DtaString(text) if t == 0x12 else text), o + 4 + n
+    if t in _DTB_TREE:
+        return _dtb_array(b, o, depth + 1)
+    if t in (6, 8, 9, 0x24):
+        return None, o + 4
+    raise SaveError(f"unknown data type {t:#x}")
+
+
+def _dtb_array(b, o, depth=0):
+    n = struct.unpack_from('<H', b, o)[0]
+    if n > 4096:
+        raise SaveError("bad array count")
+    o += 6
+    out = []
+    for _ in range(n):
+        v, o = _dtb_node(b, o, depth)
+        out.append(v)
+    return out, o
+
+
+def _closet_colours(region, items):
+    """{item: [colour, colour]} from a character's closet: the item's name (u32 length +
+    text), then u32 2, the colours, and u32 -1. The last entry for an item wins."""
+    out = {}
+    for item in items:
+        raw = item.encode('latin-1', 'replace')
+        tag = struct.pack('<I', len(raw)) + raw
+        o = 0
+        while True:
+            o = region.find(tag, o)
+            if o < 0:
+                break
+            q = o + len(tag)
+            try:
+                n = struct.unpack_from('<I', region, q)[0]
+                if 1 <= n <= 3:
+                    cols = list(struct.unpack_from(f'<{n}I', region, q + 4))
+                    tail = struct.unpack_from('<i', region, q + 4 + 4 * n)[0]
+                    if all(c < 256 for c in cols) and tail == -1:
+                        out[item] = cols
+            except struct.error:
+                pass
+            o += 1
+    return out
+
+
+def _save_characters(plain):
+    """[(name, entry list, {item: closet colours})] from a decrypted save: records of u32
+    0x24, the name, u32 1, a 16-byte id, a byte, then the character's DataArray (preset,
+    (gender ...), ...), followed by that character's progress and closet."""
+    found, o = [], 0
+    marker = struct.pack('<I', 0x24)
+    while True:
+        o = plain.find(marker, o)
+        if o < 0 or o + 8 > len(plain):
+            break
+        try:
+            ln = struct.unpack_from('<I', plain, o + 4)[0]
+            if not 1 <= ln <= 64:
+                raise SaveError("name")
+            raw_name = plain[o + 8:o + 8 + ln]
+            q = o + 8 + ln
+            if struct.unpack_from('<I', plain, q)[0] != 1:
+                raise SaveError("record")
+            arr, end = _dtb_array(plain, q + 4 + 16 + 1)
+            if len(arr) < 3 or not isinstance(arr[0], str) \
+                    or not (isinstance(arr[1], list) and arr[1][:1] == ['gender']):
+                raise SaveError("not a character")
+            found.append([raw_name.decode('utf-8', 'replace').strip(), arr, o, end])
+            o = end
+            continue
+        except (SaveError, struct.error, UnicodeDecodeError, IndexError):
+            pass
+        o += 1
+    out = []
+    for i, (name, arr, _start, end) in enumerate(found):
+        nxt = found[i + 1][2] if i + 1 < len(found) else len(plain)
+        items = []
+        for field in arr[1:]:
+            if isinstance(field, list) and field[:1] == ['outfit']:
+                items = [p[1] for p in field[1:] if isinstance(p, list) and len(p) > 1
+                         and isinstance(p[1], str) and p[1] != 'none']
+        out.append((name, arr, _closet_colours(plain[end:nxt], items)))
+    return out
+
+
+_SAVE_EXTS = ('.dat', '.sav')
+SAVE_VERSIONS = range(1, 64)          # the plain u32 version before the seed (14 seen)
+
+
+def _trim(data):
+    """Without the trailing zero padding (RB2.SAV is a fixed 6 MB, ~200 KB of data)."""
+    end = len(data.rstrip(b'\x00'))
+    return data[:min(len(data), end + 16)]
+
+
+def _looks_like_save(data):
+    """A plain save: a small version number, a seed, then data that decrypts into at least
+    one character record within its first 64 KB."""
+    if len(data) < 64 or struct.unpack_from('<I', data, 0)[0] not in SAVE_VERSIONS:
+        return False
+    try:
+        return bool(_save_characters(_decrypt_save(_trim(data[:65536]))))
+    except (SaveError, struct.error):
+        return False
+
+
+def _encrypted_hint(data):
+    """Why a save that isn't a CON gave nothing: most likely a PS3 save still under the
+    console's encryption (its own start isn't the game's version number)."""
+    if struct.unpack_from('<I', data, 0)[0] not in SAVE_VERSIONS:
+        return ("this looks like a PS3 save still under the console's encryption - decrypt "
+                "it first with a PS3 save tool, or use the copy RPCS3 keeps (its RB2.SAV is "
+                "not encrypted)")
+    return "no characters found - is this a Rock Band 2 save?"
+
+
+def parse_save(path):
+    """{character name: character dict} from an RB2 save: an Xbox 360 CON package, its
+    extracted save.dat, or a PS3 RB2.SAV (RPCS3)."""
+    with open(path, 'rb') as f:
+        data = f.read()
+    candidates = []
+    if data[:4] in (b'CON ', b'LIVE', b'PIRS'):
+        files = _stfs_files(data)
+        candidates = files.get('save.dat', [])
+        if not candidates:
+            raise SaveError("no save.dat in this package")
+    else:
+        if len(data) < 64:
+            raise SaveError("file too small to be a save")
+        candidates = [_trim(data)]
+    best = []
+    for raw in candidates:
+        try:
+            chars = _save_characters(_decrypt_save(raw))
+        except (SaveError, struct.error):
+            continue
+        if len(chars) > len(best):
+            best = chars
+    if not best:
+        if data[:4] in (b'CON ', b'LIVE', b'PIRS'):
+            raise SaveError("no characters found in this package's save.dat")
+        raise SaveError(_encrypted_hint(data))
+    out = {}
+    for name, arr, closet in best:
+        key = name or f"character_{len(out) + 1}"
+        while key in out:
+            key += "_"
+        ch = _character_from_entry([key] + arr[1:], key, default_selectable=True)
+        ch['preset'] = arr[0]
+        ch['from_save'] = True
+        fixed = []
+        for category, item, colors in ch['outfit']:
+            if item in closet:
+                colors = list(closet[item])
+            fixed.append((category, item, colors))
+        ch['outfit'] = fixed
+        ch['closet_items'] = sorted(closet)
+        out[key] = ch
+    return out
+
+
+def load_characters(path):
+    """Characters from prefabs.dta / characters.dta, or from a save."""
+    if is_save_file(path):
+        return parse_save(path)
+    return parse_prefabs(path)
+
+
+_SAVE_KIND_CACHE = {}
+
+
+def _wrap(text, width):
+    words, lines, cur = text.split(), [], ""
+    for w in words:
+        if len(cur) + len(w) + 1 > width and cur:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = f"{cur} {w}".strip()
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def is_save_file(path):
+    """A save rather than a DTA: a CON package, a .dat / .sav file (save.dat, RB2.SAV), or
+    any other file whose contents decrypt into a character record. Text DTA files never
+    qualify."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return False
+    key = (path, st.st_mtime, st.st_size)
+    if key in _SAVE_KIND_CACHE:
+        return _SAVE_KIND_CACHE[key]
+    try:
+        with open(path, 'rb') as f:
+            head = f.read(65536)
+    except OSError:
+        return False
+    if head[:4] in (b'CON ', b'LIVE', b'PIRS') or path.lower().endswith(_SAVE_EXTS):
+        result = True
+    elif path.lower().endswith('.dta') or head.lstrip()[:1] in (b'(', b';', b'#'):
+        result = False
+    else:
+        result = _looks_like_save(head)
+    _SAVE_KIND_CACHE[key] = result
+    return result
+
+
 _PREFAB_CACHE = {}
 _LOCALE_CACHE = {}
 
@@ -291,19 +656,130 @@ def find_milo(root, name, category=None, gender=None):
     return max(paths, key=score)
 
 
+_REF_RE = re.compile(rb'([A-Za-z0-9_\-./]+?)\.milo')
+
+
 def milo_summary(path):
-    """(has top-level meshes, [resource milo basenames the directory references])."""
+    """(has top-level meshes, [resource milo basenames the directory references]).
+
+    Kept for callers that only want the *_resource references; milo_refs gives them all."""
+    has_mesh, refs = milo_refs(path)
+    return has_mesh, [os.path.basename(r).lower() for r in refs
+                      if r.lower().endswith('_resource')]
+
+
+_SOURCE_PATH_RE = re.compile(r'(^|/)(band|prj|run|char)/', re.IGNORECASE)
+
+
+def milo_refs(path):
+    """(has top-level meshes, [every milo the directory references, as written - e.g.
+    'puffyskirt/puffyskirt_barelegs' - except the shared colour palettes and the milo's own
+    source path]).
+
+    Self-contained milos name themselves by their source path - naked (hands) ->
+    'band/run/char/female/outfits/hands/naked', head_2_chops -> '.../facehair/head_2_chops',
+    strapjacket_pleather -> 'prj/band/run/char/male/outfits/torso/strapjacket_pleather'.
+    That's metadata, not a link: followed, it led away from the milo to another file of the
+    same name (the torso's naked instead of the hands, the male head_1 for a female)."""
     with open(path, 'rb') as f:
         body = read_milo_container_body(f.read())
     objs, metas = cc.walk_milo(body)
     top = metas[0][0]
     has_mesh = any(t == 'Mesh' and d == top for d, t, _n, _a, _z in objs)
-    resources = []
-    for m in _RESOURCE_RE.finditer(metas[0][1]):
-        base = os.path.basename(m.group(1).decode('latin-1')).lower()
-        if base not in resources:
-            resources.append(base)
-    return has_mesh, resources
+    refs = []
+    for m in _REF_RE.finditer(metas[0][1]):
+        ref = m.group(1).decode('latin-1').lstrip('./')
+        # the symbol's length byte can sit in front of it; keep the path from its first
+        # letter or slash on
+        ref = re.sub(r'^[^A-Za-z0-9_/]+', '', ref)
+        if 'colorpalettes' in ref.lower() or not ref or ref in refs:
+            continue
+        own = os.path.splitext(os.path.basename(path))[0].lower()
+        if os.path.basename(ref).lower() == own and _SOURCE_PATH_RE.search(ref):
+            continue                                  # its own source path
+        refs.append(ref)
+    return has_mesh, refs
+
+
+def find_milo_ref(root, ref, category, gender, exclude=None):
+    """The file a directory reference names. 'puffyskirt/puffyskirt_barelegs' shares its
+    name with the variant making the reference, so the copy inside a 'puffyskirt' folder is
+    preferred, and the referencing file itself never counts."""
+    base = os.path.basename(ref).lower()
+    paths = [p for p in milo_index(root).get(base, ())
+             if not exclude or os.path.normcase(os.path.abspath(p))
+             != os.path.normcase(os.path.abspath(exclude))]
+    if not paths:
+        return None
+    folders = [x.lower() for x in re.split(r'[\\/]', ref)[:-1] if x and x != '..']
+
+    def score(p):
+        parts = [x.lower() for x in os.path.normpath(p).split(os.sep)]
+        s = 16 * sum(1 for f in folders if f in parts)
+        if gender and gender.lower() in parts:
+            s += 8
+        if category and category.lower() in parts:
+            s += 4
+        if 'gen' in parts:
+            s += 1
+        return s
+    return max(paths, key=score)
+
+
+def resolve_part_milos(root, milo, category, gender, item, depth=3):
+    """(milo holding the meshes or None, [every milo met on the way, outermost first]).
+
+    Usually a texture variant names its *_resource milo. Some go through another milo -
+    puffyskirt_barelegs names 'puffyskirt/puffyskirt_barelegs', a second milo of the same
+    name in a puffyskirt folder - so references are followed (up to `depth` steps) until a
+    milo with meshes turns up. As a last resort the naming convention is tried:
+    puffyskirt_barelegs -> puffyskirt_resource."""
+    chain, todo, seen = [], [(milo, 0)], set()
+    mesh_src = None
+    while todo:
+        path, d = todo.pop(0)
+        key = os.path.normcase(os.path.abspath(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        chain.append(path)
+        try:
+            has_mesh, refs = milo_refs(path)
+        except Exception:
+            continue
+        # A resource reference beats the milo's own meshes (a variant's own meshes are
+        # patches, fur and the like, handled separately).
+        res = [r for r in refs if r.lower().endswith('_resource')]
+        other = [r for r in refs if r not in res]
+        for r in res:
+            p = find_milo_ref(root, r, category, gender, exclude=path)
+            if p:
+                if mesh_src is None:
+                    mesh_src = p
+                if os.path.normcase(os.path.abspath(p)) not in seen:
+                    chain.append(p)
+                    seen.add(os.path.normcase(os.path.abspath(p)))
+        if mesh_src is None and has_mesh:
+            mesh_src = path                       # a milo's own meshes beat other refs
+        if mesh_src is None and d < depth:
+            for r in other:
+                p = find_milo_ref(root, r, category, gender, exclude=path)
+                if p:
+                    todo.append((p, d + 1))
+    if mesh_src is None:
+        try:
+            has_mesh, _r = milo_refs(milo)
+        except Exception:
+            has_mesh = False
+        if has_mesh:
+            mesh_src = milo
+    if mesh_src is None and '_' in item:
+        guess = find_milo(root, item.split('_')[0] + '_resource', category, gender)
+        if guess:
+            mesh_src = guess
+            if guess not in chain:
+                chain.append(guess)
+    return mesh_src, chain
 
 
 def find_deform(root, gender, instrument):
@@ -318,6 +794,304 @@ def find_deform(root, gender, instrument):
     picks = sorted(k for k in index if k.startswith(gender.lower() + '_')
                    and k.endswith('_deform'))
     return find_milo(root, picks[0], None, gender) if picks else None
+
+
+# ---------------------------------------------------------------------------------------
+# Master armatures and retargeting
+# ---------------------------------------------------------------------------------------
+#
+# char/<gender>/gen holds the game's complete character rigs - <gender>_vocal (and the
+# guitar / drum versions): ~200 bones with face bones. Their body bones are exactly where
+# the outfits are bound (strapjacket_resource 0.000 from male_vocal; the female hands and
+# lolitatop at most 0.005 from female_vocal), so no outfit mesh needs fitting and seams
+# like the female wrists stay closed. Their 34 face bones are ONE generic face, though:
+# each head binds its own layout (head_2 a median 0.35 off, up to 0.70 at the lips; head_7
+# 0.58) - importing a head onto the master as it is reshapes the face. So before each
+# part's meshes come in, the bones they bind that aren't body bones (face, hair) are moved
+# to where that part binds them, and bones they need that the rig lacks (bone_neckTwist,
+# used by the outfits' skin pieces, is in neither master) are added there.
+
+MASTER_TYPES = {
+    'GUITAR': ('guitar',),
+    'VOCALS': ('vocal', 'vocals'),
+    'DRUMS': ('drum', 'drums', 'drummer'),
+}
+_FACE_KEYS = ('brow', 'lid', 'lip', 'jaw', 'cheek', 'nose', 'crease', 'eye', 'tongue',
+              'teeth', 'hair', 'mouth')
+
+
+def master_type_for(instrument):
+    inst = (instrument or '').lower()
+    if inst.startswith('drum'):
+        return 'DRUMS'
+    if inst in ('guitar', 'bass') or inst.startswith('guitar'):
+        return 'GUITAR'
+    return 'VOCALS'
+
+
+def find_master(root, gender, kind):
+    """<gender>_<type> in char/<gender>/gen - the game's full rig for that instrument."""
+    index = milo_index(root)
+    for variant in MASTER_TYPES[kind]:
+        name = f"{gender}_{variant}".lower()
+        if name in index:
+            return find_milo(root, name, None, gender)
+    return None
+
+
+def _stem(name):
+    for ext in ('.mesh', '.trans'):
+        if name.endswith(ext):
+            return name[:-len(ext)]
+    return name
+
+
+def build_master_armature(context, path, name):
+    """An armature from a master rig's own bones (its Trans hierarchy) - the same reading
+    that lines up exactly with the outfits' bind poses."""
+    from .mesh_importer import read_file_bones, add_file_bones
+    fb = read_file_bones(path)
+    if not fb:
+        raise RuntimeError(f"no bones read from {os.path.basename(path)}")
+    data = bpy.data.armatures.new(name)
+    obj = bpy.data.objects.new(name, data)
+    context.collection.objects.link(obj)
+    _activate(context, obj)
+    add_file_bones(context, obj, fb)
+    obj["rb2_master"] = os.path.basename(path)
+    return obj
+
+
+def _rig_worlds(path):
+    """{bone name: Blender world matrix} for a rig milo, chained through its own parents
+    exactly as add_file_bones places them."""
+    from .mesh_importer import read_file_bones
+    from .io import _milo_to_blender_matrix
+    fb = read_file_bones(path)
+    world = {}
+
+    def w(name, stack=()):
+        if name in world:
+            return world[name]
+        local12, parent = fb[name]
+        m = _milo_to_blender_matrix(local12)
+        if parent and parent in fb and parent not in stack:
+            m = w(parent, stack + (name,)) @ m
+        world[name] = m
+        return m
+    for n in fb:
+        w(n)
+    return world
+
+
+def conform_to_rig(context, armature, ref_path):
+    """Puts every bone the armature shares with a reference rig where that rig has it, and
+    carries every other bone along with its parent (its offset kept).
+
+    The drum rigs store their body in a different pose from the standing bind every outfit
+    is skinned to - male_drum's bone_spine1 is 9.41 units off, female_drum's breasts 5.55 -
+    while the vocal rigs match those binds exactly. Conforming the drum rig to the vocal rig
+    gives it the standing rest pose; the drum-only bones keep their place relative to their
+    parents (the sticks stay in the hands) and the kit, which hangs from the rig's root, stays
+    where it is. Drumming animation then poses the body. Returns the number of bones moved."""
+    ref = {_stem(n): m for n, m in _rig_worlds(ref_path).items()}
+    prev_active = context.view_layer.objects.active
+    context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    moved = 0
+    try:
+        ebs = armature.data.edit_bones
+        old = {eb.name: eb.matrix.copy() for eb in ebs}
+        new = {}
+
+        def visit(eb):
+            nonlocal moved
+            target = ref.get(_stem(eb.name))
+            if target is not None:
+                nm = target.normalized()
+                if (nm.to_translation() - old[eb.name].to_translation()).length > 1e-4:
+                    moved += 1
+            elif eb.parent is not None:
+                nm = new[eb.parent.name] @ (old[eb.parent.name].inverted() @ old[eb.name])
+            else:
+                nm = old[eb.name]
+            new[eb.name] = nm
+            for c in eb.children:
+                visit(c)
+        for eb in [e for e in ebs if e.parent is None]:
+            visit(eb)
+        for eb in ebs:
+            length = eb.length
+            eb.matrix = new[eb.name]
+            eb.length = length
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.objects.active = prev_active
+    return moved
+
+
+def retarget_to_part(context, armature, mesh_path, body_stems, hierarchy=None):
+    """Before a part's meshes are imported: moves the armature's non-body bones (face) to
+    where this part's meshes are bound, and adds bones the meshes need that the armature
+    lacks and the part doesn't define itself. Meshes bound in a frame of their own (head_7's
+    eyebrows: bone_head 86 units off, height on Y) are ignored - only meshes whose body
+    bones agree with the armature count.
+
+    Mount bones are the exception: a bone the part's file hangs from its own root (hair's
+    bone_hair) is where the game ATTACHES the part, resolved by name in the character's rig.
+    The rig keeps it at the head (61.31 for the female); hippybangs_maohat is bound to it
+    0.78 lower (60.53) and libertyspikes to it turned 180 degrees, and the game draws both
+    through the rig's bone - lifting the hat onto the head, turning the spikes off the face.
+    Those bones aren't moved; instead their offset (rig rest x bind inverse) is returned for
+    the part's meshes. Returns (moved, added, {mount bone name: offset matrix})."""
+    from .mesh_importer import parse_rb2_meshes, read_file_bones
+    from .io import _milo_to_blender_matrix
+    try:
+        _dn, meshes, _fb = parse_rb2_meshes(mesh_path)
+    except Exception:
+        return [], [], {}
+    try:
+        fb = read_file_bones(mesh_path)
+    except Exception:
+        fb = {}
+    file_defined = {_stem(n) for n in fb}
+    bones = armature.data.bones
+    by_stem = {_stem(b.name): b.name for b in bones}
+
+    def is_body(stem):
+        if body_stems:
+            return stem in body_stems
+        return not any(k in stem.lower() for k in _FACE_KEYS)
+
+    mount_stems = {_stem(n) for n, (_l, parent) in fb.items()
+                   if parent not in fb and _stem(n) in by_stem and not is_body(_stem(n))}
+    mounts = {}
+    for m in meshes:
+        if m.get('is_lod') or m.get('is_shadow') or m.get('is_helper'):
+            continue
+        for bn, bm in zip(m.get('bone_names') or (), m.get('bone_mats') or ()):
+            st = _stem(bn)
+            if st in mount_stems and by_stem[st] not in mounts:
+                try:
+                    bind_m = _milo_to_blender_matrix(bm).inverted()
+                    mounts[by_stem[st]] = bones[by_stem[st]].matrix_local @ bind_m.inverted()
+                except Exception:
+                    pass
+
+    bind = {}                                  # stem -> (bone name as the mesh has it, M)
+    for m in meshes:
+        if m.get('is_lod') or m.get('is_shadow') or m.get('is_helper'):
+            continue
+        mats = {}
+        for bn, bm in zip(m.get('bone_names') or (), m.get('bone_mats') or ()):
+            try:
+                mats[bn] = _milo_to_blender_matrix(bm).inverted()
+            except Exception:
+                continue
+        consistent = True
+        for bn, M in mats.items():
+            st = _stem(bn)
+            an = by_stem.get(st)
+            if an and is_body(st) and \
+                    (M.to_translation() - bones[an].matrix_local.to_translation()).length > 0.5:
+                consistent = False
+                break
+        if not consistent:
+            _log(f"    retarget: '{m['name']}' is bound in a frame of its own - not used")
+            continue
+        for bn, M in mats.items():
+            bind.setdefault(_stem(bn), (bn, M))
+
+    move, add = {}, {}
+    for st, (bn, M) in bind.items():
+        an = by_stem.get(st)
+        if an is None:
+            if st not in file_defined:
+                add[st] = (bn, M)
+        elif not is_body(st) and st not in mount_stems:
+            rest = bones[an].matrix_local
+            if (M.to_translation() - rest.to_translation()).length > 1e-3 or \
+                    max(abs(a - b) for ra, rb in zip(M.to_3x3(), rest.to_3x3())
+                        for a, b in zip(ra, rb)) > 1e-3:
+                move[an] = M
+    if not move and not add:
+        return [], [], mounts
+
+    prev_active = context.view_layer.objects.active
+    context.view_layer.objects.active = armature
+    bpy.ops.object.mode_set(mode='EDIT')
+    added = []
+    try:
+        ebs = armature.data.edit_bones
+        for an, M in move.items():
+            eb = ebs.get(an)
+            if eb is None:
+                continue
+            length = eb.length
+            eb.matrix = M.normalized()
+            eb.length = length
+        for st, (bn, M) in add.items():
+            eb = ebs.new(bn)
+            eb.head = (0.0, 0.0, 0.0)
+            eb.tail = (0.0, 0.5, 0.0)
+            eb.matrix = M.normalized()
+            parent = None
+            if hierarchy and st in hierarchy:
+                gp = hierarchy[st][0]
+                parent = ebs.get(by_stem.get(gp, '')) if gp else None
+            if parent is not None:
+                eb.parent = parent
+            added.append(bn)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.objects.active = prev_active
+    return sorted(move), added, mounts
+
+
+def mount_meshes(armature, objects, mounts, mesh_path):
+    """Moves a part's meshes by their mount bone's offset (see retarget_to_part) - only meshes
+    still where the file stores them, so one the mesh importer already fitted isn't moved
+    twice. Returns the names moved."""
+    import numpy as np
+    from .mesh_importer import parse_rb2_meshes
+    if not mounts:
+        return []
+    try:
+        _dn, raw, _fb = parse_rb2_meshes(mesh_path)
+    except Exception:
+        return []
+    raw_by_name = {m['name']: m for m in raw}
+    done = []
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        groups = {vg.name for vg in obj.vertex_groups}
+        hits = [b for b in mounts if b in groups]
+        if not hits:
+            continue
+        src = raw_by_name.get(re.sub(r'\.\d{3}$', '', obj.name)) or raw_by_name.get(obj.data.name)
+        me = obj.data
+        if src is None or len(src['verts']) != len(me.vertices):
+            continue
+        n = min(16, len(me.vertices))
+        co = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get('co', co)
+        co = co.reshape(-1, 3)[:n]
+        stored = np.array([v['co'] for v in src['verts'][:n]])
+        if np.abs(co - stored).max() > 1e-3:
+            continue                          # already fitted by the mesh importer
+        weight = {b: 0.0 for b in hits}
+        idx = {obj.vertex_groups[b].index: b for b in hits}
+        for v in me.vertices:
+            for g in v.groups:
+                if g.group in idx:
+                    weight[idx[g.group]] += g.weight
+        bone = max(weight, key=weight.get)
+        to_obj = obj.matrix_world.inverted() @ armature.matrix_world
+        me.transform(to_obj @ mounts[bone] @ to_obj.inverted())
+        me.update()
+        done.append(obj.name)
+    return done
 
 
 def find_skeleton(root, gender):
@@ -390,25 +1164,38 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
     bl_label = "Import RB2 Character (Experimental)"
     bl_options = {'REGISTER', 'UNDO'}
 
-    filename_ext = ".dta"
-    filter_glob: StringProperty(default="*.dta", options={'HIDDEN'})
+    filename_ext = ""
+    filter_glob: StringProperty(default="*", options={'HIDDEN'})
 
     character: StringProperty(
         name="Character",
-        description="The character's checksum name from prefabs.dta (e.g. guitar32). Its "
-                    "display name (The Duke of Gravity) or prefab_guitar32 work too")
+        description="prefabs.dta: the checksum name (guitar32), its display name (The Duke of "
+                    "Gravity) or prefab_guitar32. A save - Xbox 360 CON file such as 'band', "
+                    "its save.dat, or a PS3 RB2.SAV: the name the character was given in "
+                    "the game (Heather)")
     allow_unselectable: BoolProperty(
         name="Allow Non-Selectable",
         description="Also import characters the game doesn't offer in its menus "
                     "(selectable is not TRUE). These are less tested",
         default=False)
     skeleton: EnumProperty(
-        name="Skeleton",
-        items=(('AUTO', "Selected or Auto", "Use the selected armature; if none is "
-                "selected, look for the gender's skeleton milo in the extracted files"),
+        name="Armature",
+        items=(('AUTO', "Selected or by Instrument", "Use the selected armature; if none is "
+                "selected, the game's full rig for the character's instrument "
+                "(char/<gender>/gen/<gender>_guitar / _vocal / _drum)"),
+               ('GUITAR', "Guitar Rig", "The game's guitar rig, <gender>_guitar"),
+               ('VOCALS', "Vocals Rig", "The game's vocals rig, <gender>_vocal"),
+               ('DRUMS', "Drums Rig", "The game's drums rig, <gender>_drum"),
                ('ACTIVE', "Selected Armature", "Use the selected armature only"),
                ('NONE', "None", "Import the meshes without an armature")),
         default='AUTO')
+    retarget: BoolProperty(
+        name="Match Face & Hair Bones",
+        description="Before each part comes in, move the armature's face and hair bones to "
+                    "where that part's meshes are bound (each head has its own face "
+                    "layout), and add bones the meshes need that the rig lacks - so no mesh "
+                    "is reshaped to fit the rig",
+        default=True)
     import_file_bones: BoolProperty(
         name="Add Bones From Each Part",
         description="Add bones a part defines itself (the head's face rig, hair physics "
@@ -443,6 +1230,14 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
         description="Dress every part with its textures, its (colors a b) and the "
                     "character's skin tone and eye colour",
         default=True)
+    use_milo_shader: BoolProperty(
+        name="Use Milo Shader",
+        description="Shade the character with the game-style Milo Character Shader "
+                    "(Blinn-Phong specular with the specular map's gloss, as the GDRB/TBRB "
+                    "importers do) instead of a plain Principled BSDF. Experimental for "
+                    "Rock Band 2; each material can be switched back in the Rock Band 2 "
+                    "Character Creator Texture panel",
+        default=False)
     eyebrow_override: BoolProperty(
         name="Use eyebrow_color_index",
         description="Colour the eyebrows from the character's eyebrow_color_index instead "
@@ -469,6 +1264,7 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
         layout.prop(self, "character")
         layout.prop(self, "allow_unselectable")
         layout.prop(self, "skeleton")
+        layout.prop(self, "retarget")
         layout.prop(self, "import_file_bones")
         layout.prop(self, "apply_proportions")
         sub = layout.column()
@@ -479,22 +1275,40 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
         layout.prop(self, "load_textures")
         sub = layout.column()
         sub.enabled = self.load_textures
+        sub.prop(self, "use_milo_shader")
         sub.prop(self, "eyebrow_override")
         layout.prop(self, "locale_file")
 
         path = self.filepath
-        if path and path.lower().endswith('.dta') and os.path.isfile(path):
-            prefabs = _cached(_PREFAB_CACHE, path, parse_prefabs)
+        if path and os.path.isfile(path) and (path.lower().endswith('.dta')
+                                              or is_save_file(path)):
+            prefabs = _cached(_PREFAB_CACHE, path, load_characters)
+            if not prefabs and is_save_file(path):
+                try:
+                    parse_save(path)
+                except Exception as e:
+                    box = layout.box()
+                    box.label(text="No characters read:", icon='ERROR')
+                    for line in _wrap(str(e), 44):
+                        box.label(text=line)
+                    return
             if prefabs:
-                names = display_names(path, root, bpy.path.abspath(self.locale_file)
-                                      if self.locale_file else "")
+                save = is_save_file(path)
+                names = {} if save else display_names(
+                    path, root, bpy.path.abspath(self.locale_file) if self.locale_file else "")
                 box = layout.box()
-                box.label(text="Selectable characters:")
+                box.label(text="Characters in this save:" if save else "Selectable characters:")
                 col = box.column(align=True)
                 for key, pf in prefabs.items():
-                    if pf['selectable']:
+                    if not pf['selectable']:
+                        continue
+                    if save:
+                        col.label(text=f"{key}  -  {pf['gender']}, from {pf.get('preset', '?')}")
+                    else:
                         disp = names.get(key) or ("creator preset" if '/' in key else "?")
                         col.label(text=f"{key}  -  {disp}")
+            elif is_save_file(path):
+                layout.label(text="No characters read from this file", icon='ERROR')
 
     # -- import --------------------------------------------------------------------------
 
@@ -557,17 +1371,27 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
             self.report({'ERROR'}, "Set 'Rock Band 2 Extracted Files' in the Milo Toolset "
                                    "add-on preferences first")
             return {'CANCELLED'}
-        prefabs = _cached(_PREFAB_CACHE, self.filepath, parse_prefabs)
+        save = is_save_file(self.filepath)
+        if save:
+            try:
+                prefabs = parse_save(self.filepath)
+            except Exception as e:
+                self.report({'ERROR'}, f"Couldn't read the save: {e}")
+                return {'CANCELLED'}
+            _log(f"RB2 save: {len(prefabs)} character(s): {', '.join(prefabs)}")
+        else:
+            prefabs = _cached(_PREFAB_CACHE, self.filepath, parse_prefabs)
         if not prefabs:
             self.report({'ERROR'}, "No (prefab ...) characters found in this file - is it "
                                    "the decrypted prefabs.dta?")
             return {'CANCELLED'}
-        names = display_names(self.filepath, root, bpy.path.abspath(self.locale_file)
-                              if self.locale_file else "")
+        names = {} if save else display_names(
+            self.filepath, root, bpy.path.abspath(self.locale_file) if self.locale_file else "")
         key = self._resolve_character(prefabs, names)
         if key is None:
-            self.report({'ERROR'}, f"No character '{self.character}' in this file (use its "
-                                   f"checksum name, e.g. guitar32)")
+            hint = (f"characters in this save: {', '.join(prefabs)}" if save
+                    else "use its checksum name, e.g. guitar32")
+            self.report({'ERROR'}, f"No character '{self.character}' in this file ({hint})")
             return {'CANCELLED'}
         pf = prefabs[key]
         if not pf['selectable'] and not self.allow_unselectable:
@@ -588,11 +1412,47 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
 
         # Armature
         armature = None
+        is_master = False
         if self.skeleton in ('AUTO', 'ACTIVE') and prev_active is not None \
                 and prev_active.type == 'ARMATURE':
             armature = prev_active
             _log(f"  armature: using selected '{armature.name}'")
-        elif self.skeleton == 'AUTO':
+        master_kind = self.skeleton if self.skeleton in MASTER_TYPES else (
+            master_type_for(pf['instrument']) if self.skeleton == 'AUTO' and armature is None
+            else None)
+        if master_kind:
+            master = find_master(root, gender, master_kind)
+            if master is None:
+                _log(f"  armature: no {gender} {master_kind.lower()} rig found in "
+                     f"char/{gender}/gen" + (" - falling back to a skeleton search"
+                                             if self.skeleton == 'AUTO' else ""))
+                if self.skeleton != 'AUTO':
+                    warnings.append(f"no {gender} {master_kind.lower()} rig found")
+            else:
+                try:
+                    armature = build_master_armature(
+                        context, master, f"{gender}_{master_kind.lower()}")
+                    is_master = True
+                    _log(f"  armature: the game's {master_kind.lower()} rig "
+                         f"{os.path.basename(master)} ({len(armature.data.bones)} bones)")
+                except Exception as e:
+                    warnings.append(f"couldn't build the {master_kind.lower()} rig: {e}")
+                if armature is not None and master_kind == 'DRUMS':
+                    vocal = find_master(root, gender, 'VOCALS')
+                    if vocal is None:
+                        warnings.append("drum rig left in its stored (drumming) pose - the "
+                                        f"{gender} vocal rig, which gives the standing pose "
+                                        "the outfits are bound in, wasn't found")
+                    else:
+                        try:
+                            n_moved = conform_to_rig(context, armature, vocal)
+                            _log(f"  armature: drum rig put in the standing bind pose from "
+                                 f"{os.path.basename(vocal)} ({n_moved} bone(s) moved; "
+                                 f"sticks and kit kept with their parents)")
+                        except Exception as e:
+                            warnings.append(f"couldn't put the drum rig in the standing "
+                                            f"pose: {e}")
+        if armature is None and self.skeleton == 'AUTO':
             skel = find_skeleton(root, gender)
             if skel:
                 _activate(context, None)
@@ -607,7 +1467,7 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                 # Put the new skeleton's rest pose on the neutral body every outfit milo is
                 # bound at, before any part adds its own bones (hair physics bones are
                 # placed relative to the armature's rest - off the head otherwise).
-                if armature is not None:
+                if armature is not None and not is_master:
                     deform = find_deform(root, gender, pf['instrument'])
                     if deform is None:
                         _log("  armature: no deform milo to conform the skeleton to the "
@@ -640,6 +1500,16 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                     except Exception as e:
                         _log(f"  palettes: couldn't read {pal}: {e}")
 
+        body_stems, hierarchy = None, None
+        if armature is not None and self.retarget:
+            dpath = find_deform(root, gender, pf['instrument'])
+            if dpath:
+                try:
+                    hierarchy = rb2_proportions.read_deform_milo(dpath)['hierarchy']
+                    body_stems = set(hierarchy)
+                except Exception as e:
+                    _log(f"  retarget: body bones from name only ({e})")
+
         imported_parts = 0
         fit_parts = []
         makeup = []
@@ -662,25 +1532,32 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                 _log(f"  {category}: '{item}' NOT FOUND")
                 continue
             try:
-                has_mesh, resources = milo_summary(milo)
+                mesh_src, chain = resolve_part_milos(root, milo, category, gender, item)
             except Exception as e:
                 warnings.append(f"{category}: couldn't read '{item}' ({e})")
                 continue
-
-            mesh_src = None
-            for res in resources:
-                mesh_src = find_milo(root, res, category, gender)
-                if mesh_src:
-                    break
-            if mesh_src is None and has_mesh:
-                mesh_src = milo
             if mesh_src is None:
-                warnings.append(f"{category}: no meshes for '{item}'"
-                                + (f" (resource {resources[0]} not found)" if resources
-                                   else ""))
+                warnings.append(f"{category}: no meshes for '{item}' (looked through "
+                                f"{', '.join(os.path.basename(c) for c in chain)})")
                 continue
             _log(f"  {category}: {item} -> meshes from {os.path.basename(mesh_src)}"
-                 + (f", textures from {os.path.basename(milo)}" if mesh_src != milo else ""))
+                 + (f", textures from {os.path.basename(milo)}" if mesh_src != milo else "")
+                 + (f" (via {' -> '.join(os.path.relpath(c, root) for c in chain[1:-1])})"
+                    if len(chain) > 2 else ""))
+
+            mounts = {}
+            if armature is not None and self.retarget:
+                try:
+                    moved, added, mounts = retarget_to_part(context, armature, mesh_src,
+                                                            body_stems, hierarchy)
+                    if moved or added:
+                        _log(f"    retarget: {len(moved)} bone(s) matched to "
+                             f"{os.path.basename(mesh_src)}"
+                             + (f" ({', '.join(_stem(n) for n in moved[:6])}"
+                                f"{' ...' if len(moved) > 6 else ''})" if moved else "")
+                             + (f"; added {', '.join(added)}" if added else ""))
+                except Exception as e:
+                    _log(f"    retarget failed: {e}")
 
             before = set(bpy.data.objects)
             _activate(context, armature)
@@ -698,6 +1575,14 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                                 f"didn't import")
                 continue
             imported_parts += 1
+            if armature is not None and self.retarget and mounts:
+                try:
+                    mounted = mount_meshes(armature, new_objs, mounts, mesh_src)
+                    if mounted:
+                        _log(f"    attached to the rig's {', '.join(_stem(b) for b in mounts)}: "
+                             f"{', '.join(mounted)}")
+                except Exception as e:
+                    _log(f"    attaching to the rig failed: {e}")
             if mesh_src != milo:
                 new_objs += self._variant_fur_meshes(context, milo, armature)
             for o in new_objs:
@@ -737,20 +1622,25 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                 warnings.append(f"{category}: textures unreadable ({e})")
                 continue
             res_slots = {}
-            if mesh_src != milo:
-                # A variant can name textures that only its resource milo stores
-                # (hotpants_camo -> hotpants_camo_legs_diff.tex in hotpants_resource).
+            # A variant can name textures - and leave materials - to the milos behind it:
+            # its resource milo (hotpants_camo -> hotpants_camo_legs_diff.tex in
+            # hotpants_resource) or an intermediate one (puffyskirt_barelegs ->
+            # puffyskirt/puffyskirt_barelegs). Nearer milos win.
+            for src in [c for c in chain if c != milo] + ([mesh_src] if mesh_src not in chain
+                                                           else []):
+                if src == milo:
+                    continue
                 try:
-                    res_info = cc.read_texture_milo(mesh_src)
-                    res_slots = {sl['target']: sl for sl in res_info.slots
-                                 if any(sl.get(k) for k in cc._TEX_KEYS)}
-                    res_texs = res_info.texs
-                    added = [n for n, t in res_texs.items() if cc._has_pixels(t)
-                             and not cc._has_pixels(info.texs.get(n))]
-                    for n in added:
-                        info.texs[n] = res_texs[n]
+                    res_info = cc.read_texture_milo(src)
                 except Exception as e:
-                    _log(f"    resource textures unreadable: {e}")
+                    _log(f"    textures in {os.path.basename(src)} unreadable: {e}")
+                    continue
+                for sl in res_info.slots:
+                    if any(sl.get(k) for k in cc._TEX_KEYS):
+                        res_slots.setdefault(sl['target'], sl)
+                for n, t in res_info.texs.items():
+                    if cc._has_pixels(t) and not cc._has_pixels(info.texs.get(n)):
+                        info.texs[n] = t
             by_target = {sl['target']: sl for sl in info.slots}
             jobs = []
             for m in mats:
@@ -779,7 +1669,8 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
             if not jobs:
                 continue
             done, warn = cc.dress_jobs(context, info, jobs, milo, choice_indices=colors,
-                                       fur_shells=self.import_fur)
+                                       fur_shells=self.import_fur,
+                                       milo_shader=self.use_milo_shader)
             warnings.extend(f"{category}: {w}" for w in warn)
             head_skin.extend(m for m, _sl in jobs if m.get("rb2_makeup_rects"))
 
@@ -789,7 +1680,6 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                     pg = m.rb2cc
                     if pg.kind == 'ITEM' and pg.uses1 and pg.sel_palette1 == 'hair.pal':
                         pg["sel_index1"] = int(pf['eyebrow_color_index'])
-                        pg["cfg_index1"] = int(pf['eyebrow_color_index'])
                         cc.apply_material_colors(m, context)
                         _log(f"    '{m.name}': eyebrows -> hair.pal"
                              f"[{pf['eyebrow_color_index']}] (eyebrow_color_index)")

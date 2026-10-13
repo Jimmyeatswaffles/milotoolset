@@ -65,6 +65,20 @@ Palettes stored inside an item's own milo (rings_chief.pal, facehair_color.pal) 
 referenced by its cfg and rings_chief holds debug colours, so the global palettes milo is
 what's used.
 
+Milo shader (optional, "Use Milo Shader" on import): the same game-style shading the GDRB
+and TBRB importers use (texture_importer's "Milo Character Shader" group - Blinn-Phong
+specular added on top, the specular map's alpha as gloss, alpha/additive blending). RB2's
+material revision 47 has no rim light, second highlight or shader variation, so only the
+diffuse, normal and specular parts apply. RB2 specular maps follow the same pattern as the
+later games': a greyscale RGB mask with gloss in the alpha (basictightpants_jeans_spec:
+denim ~0.37, rivets and zip ~0.75+).
+
+Everything the creator system does - two-colour tinting, makeup, fur, baking - still runs
+through the Principled BSDF's Base Color and Alpha inputs, so that node stays as the colour
+hub; with the Milo shader on it's simply no longer connected to the output. Instead
+sync_milo_shader() feeds whatever reaches the Principled BSDF into the Milo group, and is
+called again whenever those links change (makeup, fur, bake, restore).
+
 ColorPalette revision 1: the same 17-byte header, a u32 count, then count x 4 floats. Only
 RGB is meaningful (the fourth float is uninitialised junk). The values are exact 8-bit
 sRGB (0.549 = 140/255), so they're converted to linear before going into a node.
@@ -960,7 +974,7 @@ def wire_diffuse_alpha(mat, keep):
         nt.links.new(diff.outputs['Alpha'], grp.inputs["Diffuse Alpha"])
 
 
-def build_creator_material(mat, slot, images, keep_alpha=False):
+def build_creator_material(mat, slot, images, keep_alpha=False, milo_shader=False):
     """Replaces the material's nodes. images: {'diffuse', 'mask', 'normal', 'specular'}.
 
     Base colour always goes through the two-colour group so one path covers every item:
@@ -1081,6 +1095,139 @@ def build_creator_material(mat, slot, images, keep_alpha=False):
             except (AttributeError, TypeError):
                 continue
     mat["milo_textured"] = True
+
+    # What the Milo shader needs that the Principled tree doesn't keep.
+    spec_rgb = slot.get('specular_rgb')
+    if isinstance(spec_rgb, int):
+        spec_rgb = [((spec_rgb >> sh) & 0xFF) / 255.0 for sh in (16, 8, 0)]
+    mat[MILO_SPEC_KEY] = [float(c) for c in (spec_rgb or (0.0, 0.0, 0.0))[:3]]
+    mat[MILO_POWER_KEY] = float(slot.get('specular_power') or 10.0)
+    mat[MILO_BLEND_KEY] = int(blend) if blend is not None else 1
+    set_milo_shader(mat, milo_shader)
+
+
+MILO_SHADER_KEY = "rb2_milo_shader"
+MILO_SPEC_KEY = "rb2_milo_specular_rgb"
+MILO_POWER_KEY = "rb2_milo_specular_power"
+MILO_BLEND_KEY = "rb2_milo_blend"
+
+
+def _principled(nt):
+    return next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+
+
+def _material_output(nt):
+    outs = [n for n in nt.nodes if n.type == 'OUTPUT_MATERIAL']
+    return next((n for n in outs if getattr(n, 'is_active_output', False)), None) \
+        or (outs[0] if outs else None)
+
+
+def set_milo_shader(mat, enabled):
+    """Switches a dressed material between the plain Principled BSDF and the Milo
+    Character Shader. Either way the creator nodes are untouched; only what reaches the
+    Material Output changes."""
+    nt = mat.node_tree
+    if nt is None:
+        return
+    from .texture_importer import SHADER_NODE_NAME
+    mat[MILO_SHADER_KEY] = bool(enabled)
+    if enabled:
+        sync_milo_shader(mat)
+        return
+    grp = nt.nodes.get(SHADER_NODE_NAME)
+    if grp is not None:
+        nt.nodes.remove(grp)
+    out, bsdf = _material_output(nt), _principled(nt)
+    if out is None or bsdf is None:
+        return
+    add = next((n for n in nt.nodes if n.type == 'ADD_SHADER'), None)
+    if mat.get(MILO_BLEND_KEY) == BLEND_ADD and add is not None:
+        nt.links.new(add.outputs[0], out.inputs['Surface'])
+    else:
+        nt.links.new(bsdf.outputs['BSDF'], out.inputs['Surface'])
+    bsdf.label = ""
+
+
+def sync_milo_shader(mat):
+    """Feeds the Milo Character Shader from whatever reaches the Principled BSDF - the
+    two-colour result (with makeup / fur tint / a baked image), its alpha, the normal map
+    and the specular map - and connects it to the Material Output. No-op unless the
+    material uses the Milo shader."""
+    if not mat.get(MILO_SHADER_KEY) or mat.node_tree is None:
+        return
+    from .texture_importer import (ensure_shader_group, SHADER_NODE_NAME, SHADER_GROUP_NAME,
+                                   _lin3)
+    nt = mat.node_tree
+    nodes, links = nt.nodes, nt.links
+    bsdf, out = _principled(nt), _material_output(nt)
+    if bsdf is None or out is None:
+        return
+    grp = nodes.get(SHADER_NODE_NAME)
+    if grp is None or grp.node_tree is None:
+        if grp is not None:
+            nodes.remove(grp)
+        grp = nodes.new('ShaderNodeGroup')
+        grp.name = SHADER_NODE_NAME
+    grp.node_tree = ensure_shader_group()
+    grp.label = SHADER_GROUP_NAME
+    grp.width = 260
+    grp.location = (bsdf.location.x, bsdf.location.y - 750)
+    gi = grp.inputs
+    for sock in gi:
+        for l in list(sock.links):
+            links.remove(l)
+
+    def feed(src_sock, dst):
+        node, outp = _source(src_sock)
+        if node is not None:
+            links.new(outp, dst)
+            return True
+        return False
+
+    # colour
+    base = bsdf.inputs.get('Base Color')
+    if not feed(base, gi["Diffuse"]) and base is not None:
+        gi["Diffuse"].default_value = tuple(base.default_value)
+    gi["Material Color"].default_value = (1.0, 1.0, 1.0, 1.0)  # already in the colour
+
+    # alpha: only where the Principled tree uses it as coverage (blended items, fur)
+    alpha = bsdf.inputs.get('Alpha')
+    blend = mat.get(MILO_BLEND_KEY, 1)
+    if alpha is not None and feed(alpha, gi["Diffuse Alpha"]):
+        gi["Use Alpha"].default_value = 1.0
+        gi["Material Alpha"].default_value = 1.0
+    elif alpha is not None and alpha.default_value < 1.0:
+        gi["Use Alpha"].default_value = 1.0
+        gi["Material Alpha"].default_value = float(alpha.default_value)
+    else:
+        gi["Use Alpha"].default_value = 0.0
+    gi["Additive"].default_value = 1.0 if blend == BLEND_ADD else 0.0
+
+    # normal map: the colour going into the Principled's Normal Map node
+    nnode, _o = _source(bsdf.inputs.get('Normal'))
+    if nnode is not None and nnode.type == 'NORMAL_MAP':
+        feed(nnode.inputs.get('Color'), gi["Normal Map"])
+    gi["Detail Strength"].default_value = 0.0
+
+    # specular: the map's colour as the mask, its alpha as gloss
+    snode, _o = _source(bsdf.inputs.get('Specular Tint'))
+    if snode is not None and getattr(snode, 'image', None) is not None:
+        links.new(snode.outputs['Color'], gi["Specular Map"])
+        links.new(snode.outputs['Alpha'], gi["Gloss Map"])
+        gi["Gloss Map Influence"].default_value = 1.0
+    else:
+        gi["Specular Map"].default_value = (1.0, 1.0, 1.0, 1.0)
+        gi["Gloss Map Influence"].default_value = 0.0
+    spec = mat.get(MILO_SPEC_KEY) or [0.0, 0.0, 0.0]
+    gi["Specular Color"].default_value = (*_lin3(list(spec)), 1.0)
+    gi["Specular Power"].default_value = float(mat.get(MILO_POWER_KEY, 10.0))
+    gi["Specular 2 Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+    gi["Hair Anisotropy"].default_value = 0.0
+    gi["Rim Color"].default_value = (0.0, 0.0, 0.0, 1.0)   # RB2 materials have no rim
+    gi["Emissive"].default_value = (0.0, 0.0, 0.0, 1.0)
+
+    links.new(grp.outputs["Shader"], out.inputs['Surface'])
+    bsdf.label = "RB2 colour hub (feeds the Milo shader)"
 
 
 def apply_material_colors(mat, context=None):
@@ -1233,6 +1380,207 @@ def rebuild_makeup(mat, context=None):
     if base is not None:
         links.new(prev, base)
     apply_material_colors(mat, context)
+    sync_milo_shader(mat)
+
+
+# ---------------------------------------------------------------------------------------
+# Baking the character's diffuse textures
+# ---------------------------------------------------------------------------------------
+#
+# For exporting, each dressed material's live colouring is written into one plain texture.
+# Blender's own bake only runs in Cycles and renders through the mesh's UVs (selection,
+# margins, resampling); everything these materials do happens in the texture's own pixel
+# space, so the result is computed straight from the source pixels instead - exact, at the
+# game texture's resolution, with no render engine involved. It follows the node group:
+#
+#     out = mix(diffuse x mix(colour1, colour2, alpha x use2), diffuse, keep)    (linear)
+#
+# then the makeup layers in their rectangles (heads), then the flat fur tint (fur). The
+# baked image keeps the diffuse alpha only where the material uses alpha as transparency
+# (fur, alpha-cut cards); elsewhere the alpha is the keep / colour-2 mask, baked in already.
+
+BAKED_NODE = "RB2CC_Baked"
+
+
+def _pixels(img):
+    """(H, W, 4) float array, rows bottom-up as Blender stores them."""
+    import numpy as np
+    w, h = img.size
+    buf = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(buf)
+    return buf.reshape(h, w, 4)
+
+
+def _to_linear(x):
+    import numpy as np
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def _to_srgb(x):
+    import numpy as np
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
+
+
+def _resample(arr, h, w):
+    """Nearest-neighbour resize of an (H, W, C) array to (h, w, C)."""
+    import numpy as np
+    ys = (np.arange(h) * arr.shape[0] // h)
+    xs = (np.arange(w) * arr.shape[1] // w)
+    return arr[ys][:, xs]
+
+
+def _source(sock):
+    """(node, output socket) linked into an input, or (None, None)."""
+    if sock is None or not sock.is_linked:
+        return None, None
+    link = sock.links[0]
+    return link.from_node, link.from_socket
+
+
+def bake_material(mat):
+    """Computes the material's baked diffuse. Returns the image, or None with a reason."""
+    import numpy as np
+    nt = mat.node_tree
+    if nt is None:
+        return None, "no nodes"
+    grp = nt.nodes.get(GROUP_NODE_NAME)
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if grp is None or bsdf is None:
+        return None, "not a Rock Band 2 creator material"
+    dnode, _ds = _source(grp.inputs["Diffuse"])
+    if dnode is None or getattr(dnode, 'image', None) is None:
+        return None, "no diffuse texture (its colour is a plain value - nothing to bake)"
+    dimg = dnode.image
+    px = _pixels(dimg)
+    h, w = px.shape[:2]
+    d = _to_linear(px[..., :3].astype(np.float64))
+    a_tex = px[..., 3].astype(np.float64)
+
+    def value_or_linked(sock):
+        """(H, W) array for a float input: the texture feeding it or its value."""
+        node, out = _source(sock)
+        if node is None:
+            return np.full((h, w), float(sock.default_value))
+        if node is dnode and out.name == 'Alpha':
+            return a_tex
+        if getattr(node, 'image', None) is not None:
+            arr = _pixels(node.image)
+            if arr.shape[:2] != (h, w):
+                arr = _resample(arr, h, w)
+            return arr[..., 0].astype(np.float64) if out.name == 'Color' \
+                else arr[..., 3].astype(np.float64)
+        return np.zeros((h, w))
+
+    c1 = np.array(grp.inputs["Color 1"].default_value[:3])
+    c2 = np.array(grp.inputs["Color 2"].default_value[:3])
+    use2 = float(grp.inputs["Use Color 2"].default_value)
+    sel = np.clip(value_or_linked(grp.inputs["Diffuse Alpha"]) * use2, 0.0, 1.0)[..., None]
+    keep = np.clip(value_or_linked(grp.inputs["Keep Mask"]), 0.0, 1.0)[..., None]
+    out = d * (c1 * (1 - sel) + c2 * sel)
+    out = out * (1 - keep) + d * keep
+
+    # makeup, in each layer's rectangle of the texture
+    rects = json.loads(mat.get("rb2_makeup_rects", "{}"))
+    state = json.loads(mat.get("rb2_makeup", "{}"))
+    tint_node = nt.nodes.get("RB2CC_MakeupTint")
+    tint = np.array(tint_node.outputs[0].default_value[:3]) if tint_node else np.ones(3)
+    for kind in MAKEUP_KINDS:
+        st, rect = state.get(kind), rects.get(kind)
+        mimg = bpy.data.images.get(st['image']) if st else None
+        if mimg is None or not rect:
+            continue
+        x, y, rw, rh = rect
+        yb = 1.0 - y - rh
+        mk = _pixels(mimg)
+        mh, mw = mk.shape[:2]
+        vs = (np.arange(h) + 0.5) / h
+        us = (np.arange(w) + 0.5) / w
+        mu = (us - x) / rw
+        mv = (vs - yb) / rh
+        cols = np.clip((mu * mw).astype(int), 0, mw - 1)
+        rows = np.clip((mv * mh).astype(int), 0, mh - 1)
+        inside = ((mv >= 0) & (mv < 1))[:, None] & ((mu >= 0) & (mu < 1))[None, :]
+        sample = mk[rows][:, cols]
+        m_rgb = _to_linear(sample[..., :3].astype(np.float64))
+        m_a = np.where(inside, sample[..., 3], 0.0)[..., None]
+        out = out * (1 - m_a * MAKEUP_ALPHA) + m_rgb * (m_a * MAKEUP_ALPHA)
+        out = out * (1 - m_a * MAKEUP_OVERLAY_ALPHA) + (m_rgb * tint) * (m_a * MAKEUP_OVERLAY_ALPHA)
+
+    # fur: the flat (half-way) tint - shells can't be baked into one texture
+    if mat.get("rb2_fur"):
+        import ast
+        try:
+            fur = ast.literal_eval(mat.get("rb2_fur_params", "{}"))
+            mid = [(_srgb_to_linear(b) + _srgb_to_linear(e)) / 2
+                   for b, e in zip(fur['base_tint'][:3], fur['end_tint'][:3])]
+            out = out * np.array(mid)
+        except (ValueError, SyntaxError, KeyError):
+            pass
+
+    alpha_in = bsdf.inputs.get('Alpha')
+    alpha = a_tex if (alpha_in is not None and alpha_in.is_linked) else np.ones((h, w))
+    rgba = np.concatenate([_to_srgb(out), alpha[..., None]], axis=2).astype(np.float32)
+
+    name = f"{mat.name}_baked"
+    old = bpy.data.images.get(name)
+    if old is not None:
+        bpy.data.images.remove(old)          # a fresh, unpacked image saves cleanly
+    img = bpy.data.images.new(name, width=w, height=h, alpha=True)
+    img.colorspace_settings.name = 'sRGB'
+    img.pixels.foreach_set(rgba.ravel())
+    img.update()
+    img["rb2_baked_from"] = mat.name
+    return img, ""
+
+
+def use_baked(mat, img):
+    """Points the material's base colour (and alpha, when it's used) at the baked image,
+    remembering what fed them so the live colours can be restored."""
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    base = bsdf.inputs.get('Base Color')
+    alpha = bsdf.inputs.get('Alpha')
+    if not mat.get("rb2_live_sources"):
+        saved = {}
+        for key, sock in (('base', base), ('alpha', alpha)):
+            node, out = _source(sock)
+            if node is not None:
+                saved[key] = [node.name, out.identifier]
+        mat["rb2_live_sources"] = json.dumps(saved)
+    node = nt.nodes.get(BAKED_NODE) or nt.nodes.new('ShaderNodeTexImage')
+    node.name = BAKED_NODE
+    node.label = "Baked Diffuse"
+    node.image = img
+    node.location = (bsdf.location.x - 350, bsdf.location.y + 350)
+    nt.links.new(node.outputs['Color'], base)
+    if alpha is not None and alpha.is_linked:
+        nt.links.new(node.outputs['Alpha'], alpha)
+    nt.nodes.active = node                       # also what most exporters look for
+    mat["rb2_baked"] = True
+    sync_milo_shader(mat)
+
+
+def restore_live(mat):
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    saved = json.loads(mat.get("rb2_live_sources", "{}"))
+    for key, sock_name in (('base', 'Base Color'), ('alpha', 'Alpha')):
+        sock = bsdf.inputs.get(sock_name) if bsdf else None
+        src = saved.get(key)
+        if sock is None or not src:
+            continue
+        node = nt.nodes.get(src[0])
+        out = next((o for o in node.outputs if o.identifier == src[1]), None) if node else None
+        if out is not None:
+            nt.links.new(out, sock)
+    baked = nt.nodes.get(BAKED_NODE)
+    if baked is not None:
+        nt.nodes.remove(baked)
+    for k in ("rb2_baked", "rb2_live_sources"):
+        if k in mat:
+            del mat[k]
+    sync_milo_shader(mat)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1455,7 +1803,7 @@ def channels_for(target, choices):
 
 
 def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=None,
-               skin_dir=None, fur_shells=True):
+               skin_dir=None, fur_shells=True, milo_shader=False):
     """Builds and colours the materials in `jobs` [(material, slot)] from one milo's
     MiloTextures. `choice_indices` (a character's '(colors a b)') overrides the cfg
     defaults, one index per cfg colour choice in cfg order. Returns (dressed material
@@ -1536,7 +1884,7 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
             if sl.get('two_color_mask') else None,
             normal=image(sl, 'normal_map', 'normal'),
             specular=image(sl, 'specular_map', 'specular')),
-            keep_alpha=kind in CHARACTER_PALETTES)
+            keep_alpha=kind in CHARACTER_PALETTES, milo_shader=milo_shader)
 
         chans = channels_for(sl['target'], choices)
         pg = m.rb2cc
@@ -1549,11 +1897,12 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
         pg.uses2 = 2 in chans
         pg.link2 = 1 in chans and 2 in chans and chans[1][2] == chans[2][2]
         for ch in (1, 2):
-            pal, idx, k = chans.get(ch, ("", 0, -1))
+            pal, default, k = chans.get(ch, ("", 0, -1))
+            idx = default
             if pal and choice_indices is not None and 0 <= k < len(choice_indices):
                 idx = int(choice_indices[k])
             pg[f"cfg_palette{ch}"] = pal
-            pg[f"cfg_index{ch}"] = idx
+            pg[f"cfg_index{ch}"] = default        # the item's own .cfg default, always
             pg[f"sel_palette{ch}"] = pal
             pg[f"sel_index{ch}"] = idx
             if pal and pal_ok and pal not in _palettes(context):
@@ -1573,6 +1922,7 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
                 _log(f"  '{m.name}': fur ({f['name']}) - "
                      + (f"{f['passes']} shells, thickness {f['thickness']:g}, gravity "
                         f"{f['gravity']:g}" if fur_shells else "flat (2D)"))
+        sync_milo_shader(m)
         done.append(m.name)
 
         if kind != 'ITEM':
@@ -1617,6 +1967,13 @@ class MATERIAL_OT_rb2cc_load_textures(bpy.types.Operator, ImportHelper):
         name="Flip Normal Map Green",
         description="Convert the normal maps' Y from DirectX (down) to Blender's OpenGL (up)",
         default=True)
+    use_milo_shader: BoolProperty(
+        name="Use Milo Shader",
+        description="Shade with the game-style Milo Character Shader (Blinn-Phong specular "
+                    "with the specular map's gloss, as the GDRB/TBRB importers do) instead of "
+                    "a plain Principled BSDF. Experimental for Rock Band 2; it can be "
+                    "switched per material afterwards in this panel",
+        default=False)
 
     def execute(self, context):
         mat = bpy.data.materials.get(self.material_name) or context.material
@@ -1670,10 +2027,39 @@ class MATERIAL_OT_rb2cc_load_textures(bpy.types.Operator, ImportHelper):
                         jobs.append((m, sl))
 
         done, warn = dress_jobs(context, info, jobs, self.filepath,
-                                flip_green=self.flip_normal_green)
+                                flip_green=self.flip_normal_green,
+                                milo_shader=self.use_milo_shader)
         msg = f"Loaded '{info.dir_name}' into {len(done)} material(s): {', '.join(done)}"
         self.report({'WARNING'} if warn else {'INFO'}, ". ".join([msg] + warn))
         _log(f"===== {msg} =====")
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_rb2cc_milo_shader(bpy.types.Operator):
+    """Switch this dressed material between the Milo Character Shader (game-style
+    specular) and a plain Principled BSDF"""
+    bl_idname = "material.rb2cc_milo_shader"
+    bl_label = "Milo Shader"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    material_name: StringProperty(options={'HIDDEN'})
+    enable: BoolProperty(options={'HIDDEN'})
+    all_materials: BoolProperty(
+        name="All Dressed Materials",
+        description="Apply to every Rock Band 2 dressed material in the file",
+        default=False)
+
+    def execute(self, context):
+        mats = [m for m in bpy.data.materials if m.rb2cc.loaded] if self.all_materials \
+            else [bpy.data.materials.get(self.material_name) or context.material]
+        n = 0
+        for m in mats:
+            if m is None or m.node_tree is None or _principled(m.node_tree) is None:
+                continue
+            set_milo_shader(m, self.enable)
+            n += 1
+        self.report({'INFO'}, f"{'Milo shader' if self.enable else 'Principled BSDF'} on "
+                              f"{n} material(s)")
         return {'FINISHED'}
 
 
@@ -1729,6 +2115,86 @@ class MATERIAL_OT_rb2cc_fur_mode(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class MATERIAL_OT_rb2cc_bake_all(bpy.types.Operator):
+    """Write each Rock Band 2 material's live colours - palette tint, keep masks, makeup,
+    flat fur tint - into one plain diffuse texture and use it, for exporting. Computed from
+    the texture pixels directly (no Cycles bake, no UV margins), at the game texture's size"""
+    bl_idname = "material.rb2cc_bake_all"
+    bl_label = "Bake All Character Diffuse Textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    save_dir: StringProperty(
+        name="Also Save PNGs To", subtype='DIR_PATH',
+        description="Optional folder to save the baked textures to as PNG files (for "
+                    "exporters that don't embed images). Leave empty to only pack them "
+                    "into the .blend")
+    use_in_materials: BoolProperty(
+        name="Use Baked Textures in Materials", default=True,
+        description="Connect each material's base colour to its baked texture, so "
+                    "exporters see a plain textured material ('Restore Live Colours' "
+                    "undoes it)")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        import os
+        mats = [m for m in bpy.data.materials
+                if getattr(m, 'rb2cc', None) is not None and m.rb2cc.loaded]
+        if not mats:
+            self.report({'WARNING'}, "No Rock Band 2 creator materials loaded")
+            return {'CANCELLED'}
+        out_dir = bpy.path.abspath(self.save_dir) if self.save_dir else ""
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        baked, skipped = [], []
+        for m in mats:
+            if m.get("rb2_baked"):
+                restore_live(m)              # bake from the live colours, not the old bake
+            try:
+                img, why = bake_material(m)
+            except Exception as e:
+                img, why = None, str(e)
+            if img is None:
+                skipped.append(f"{m.name}: {why}")
+                continue
+            if out_dir:
+                path = os.path.join(out_dir, bpy.path.clean_name(img.name) + ".png")
+                img.filepath_raw = path
+                img.file_format = 'PNG'
+                try:
+                    img.save()
+                except RuntimeError as e:
+                    skipped.append(f"{m.name}: baked, but saving {path} failed ({e})")
+            img.pack()
+            if self.use_in_materials:
+                use_baked(m, img)
+            baked.append(m.name)
+        _log(f"RB2 bake: {len(baked)} material(s) baked"
+             + (f" and saved to {out_dir}" if out_dir else "") + ": " + ", ".join(baked))
+        for sk in skipped:
+            _log(f"RB2 bake: skipped {sk}")
+        self.report({'INFO'}, f"Baked {len(baked)} diffuse texture(s)"
+                    + (f"; {len(skipped)} skipped (see the log)" if skipped else ""))
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_rb2cc_restore_live(bpy.types.Operator):
+    """Reconnect the live palette colours on every baked Rock Band 2 material"""
+    bl_idname = "material.rb2cc_restore_live"
+    bl_label = "Restore Live Colours"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = 0
+        for m in bpy.data.materials:
+            if m.get("rb2_baked"):
+                restore_live(m)
+                n += 1
+        self.report({'INFO'}, f"Live colours restored on {n} material(s)")
+        return {'FINISHED'}
+
+
 class MATERIAL_OT_rb2cc_clear_makeup(bpy.types.Operator):
     """Remove this head's eye or lip makeup"""
     bl_idname = "material.rb2cc_clear_makeup"
@@ -1769,6 +2235,26 @@ class MATERIAL_PT_rb2cc(bpy.types.Panel):
         op = layout.operator(MATERIAL_OT_rb2cc_load_textures.bl_idname,
                              text="Load Customizable Textures", icon='TEXTURE')
         op.material_name = mat.name
+        row = layout.row(align=True)
+        row.operator(MATERIAL_OT_rb2cc_bake_all.bl_idname, icon='RENDER_STILL')
+        if any(m.get("rb2_baked") for m in bpy.data.materials):
+            row.operator(MATERIAL_OT_rb2cc_restore_live.bl_idname, text="", icon='LOOP_BACK')
+        if mat.get("rb2_baked"):
+            layout.label(text="Using its baked texture - colour changes won't show until "
+                              "you restore live colours or bake again", icon='INFO')
+        if pg.loaded:
+            on = bool(mat.get(MILO_SHADER_KEY))
+            row = layout.row(align=True)
+            row.label(text="Shading:", icon='SHADING_RENDERED')
+            op = row.operator(MATERIAL_OT_rb2cc_milo_shader.bl_idname, text="Milo Shader",
+                              depress=on)
+            op.material_name, op.enable, op.all_materials = mat.name, True, False
+            op = row.operator(MATERIAL_OT_rb2cc_milo_shader.bl_idname, text="Principled",
+                              depress=not on)
+            op.material_name, op.enable, op.all_materials = mat.name, False, False
+            op = row.operator(MATERIAL_OT_rb2cc_milo_shader.bl_idname, text="",
+                              icon='WORLD')
+            op.material_name, op.enable, op.all_materials = mat.name, not on, True
         layout.prop(scn.rb2cc, "palette_milo")
 
         info = layout.column(align=True)
@@ -1899,9 +2385,12 @@ _classes = (
     RB2CCMaterialSettings,
     RB2CCSceneSettings,
     MATERIAL_OT_rb2cc_load_textures,
+    MATERIAL_OT_rb2cc_milo_shader,
     MATERIAL_OT_rb2cc_load_makeup,
     MATERIAL_OT_rb2cc_clear_makeup,
     MATERIAL_OT_rb2cc_fur_mode,
+    MATERIAL_OT_rb2cc_bake_all,
+    MATERIAL_OT_rb2cc_restore_live,
     MATERIAL_PT_rb2cc,
     MATERIAL_PT_rb2cc_character,
 )
