@@ -193,7 +193,16 @@ def parse_dir_texture_slots(meta):
 
 
 def parse_outfit_config(data):
-    """OutfitConfig revision 3 -> [{'index', 'mats', 'palette1', 'palette2'}]."""
+    """OutfitConfig revision 3 -> [{'index', 'mats', 'entries', 'palette1', 'palette2'}].
+
+    Each colour choice is u32 default index, u32 n, then n entries of (symbol material,
+    symbol palette-for-colour-1, symbol palette-for-colour-2, u32) - every material with its
+    own palettes. thermalundertee_moped's torso.cfg is (28, [tee: cloth_dulled]) and (12,
+    [arms: cloth_dulled, patch: cloth_dulled]): the sleeves and the moped logo share the
+    detail colour. Every cfg seen before listed one material per choice, where this reads
+    byte for byte the same as one material list followed by one palette pair - the reading
+    this replaces. 'entries' maps each material to its (palette 1, palette 2); 'mats',
+    'palette1' and 'palette2' (the first entry's) are kept for everything else."""
     try:
         p = OBJECT_HEADER_END
         count = _u32(data, p); p += 4
@@ -205,14 +214,17 @@ def parse_outfit_config(data):
             n = _u32(data, p); p += 4
             if n > 64:
                 raise CreatorTextureError(f"implausible material count {n}")
-            mats = []
+            mats, entries = [], {}
             for _ in range(n):
-                s, p = _sym_at(data, p)
-                mats.append(s)
-            pal_a, p = _sym_at(data, p)
-            pal_b, p = _sym_at(data, p)
-            p += 4
-            out.append(dict(index=idx, mats=mats, palette1=pal_a, palette2=pal_b))
+                mat, p = _sym_at(data, p)
+                pal_a, p = _sym_at(data, p)
+                pal_b, p = _sym_at(data, p)
+                p += 4
+                mats.append(mat)
+                entries.setdefault(mat, (pal_a, pal_b))
+            first = entries[mats[0]] if mats else ('', '')
+            out.append(dict(index=idx, mats=mats, entries=entries,
+                            palette1=first[0], palette2=first[1]))
         if p != len(data):
             raise CreatorTextureError(f"parsed {p} of {len(data)} bytes")
         return out, None
@@ -295,6 +307,15 @@ def parse_rb2_mat(data, name):
     p = _object_header_end(data)
     blend = struct.unpack_from('>i', data, p)[0]
     color = struct.unpack_from('>4f', data, p + 4)
+    # after the colour: prelit, use-environment (u8 each), z-mode (i32), alpha-cut (u8),
+    # alpha threshold (i32), alpha-write (u8), tex-gen (i32), tex-wrap (i32) - the order
+    # rb2_exporter.write_rb2_rnd_mat writes. thermalundertee's moped patch: z-mode 2
+    # (transparent), wrap 2 (black border); its necklace: alpha-cut on.
+    q = p + 20
+    z_mode = struct.unpack_from('>i', data, q + 2)[0]
+    alpha_cut = bool(data[q + 6])
+    alpha_threshold = struct.unpack_from('>i', data, q + 7)[0]
+    tex_wrap = struct.unpack_from('>i', data, q + 16)[0]
     p += 4 + 16 + 1 + 1 + 4 + 1 + 4 + 1 + 4 + 4 + 48     # blend .. texture transform
     diffuse, p = _sym_at(data, p)
     _next_pass, p = _sym_at(data, p)
@@ -306,7 +327,8 @@ def parse_rb2_mat(data, name):
     specular, p = _sym_at(data, p)
     return dict(target=name, diffuse_tex=diffuse, normal_map=normal, specular_map=specular,
                 specular_rgb=tuple(spec_rgb), specular_power=spec_power,
-                mat_color=tuple(color), blend=blend, from_mat=True)
+                mat_color=tuple(color), blend=blend, from_mat=True, z_mode=z_mode,
+                alpha_cut=alpha_cut, alpha_threshold=alpha_threshold, tex_wrap=tex_wrap)
 
 
 def parse_palette(data, name):
@@ -947,11 +969,40 @@ def _input(node, *names):
     return None
 
 
+TEX_WRAP_EXTENSION = {0: 'EXTEND', 1: 'REPEAT', 2: 'CLIP', 3: 'CLIP', 4: 'MIRROR'}
+ZMODE_TRANSPARENT = 2
+
+
+def _set_render_method(mat, alpha_cut):
+    """Alpha-cut materials (a necklace's chain and lock, tighterpants' hoops) are solid
+    cut-outs drawn with depth - Blender's dithered mode; blended ones (glass, decals) stay
+    blended, with transparency overlap off so an object's own faces sort front to back
+    instead of showing their insides."""
+    tries = ((('surface_render_method', 'DITHERED'), ('blend_method', 'HASHED')) if alpha_cut
+             else (('surface_render_method', 'BLENDED'), ('blend_method', 'BLEND')))
+    for attr, value in tries:
+        try:
+            setattr(mat, attr, value)
+            break
+        except (AttributeError, TypeError):
+            continue
+    if not alpha_cut:
+        for attr in ('use_transparency_overlap', 'show_transparent_back'):
+            if hasattr(mat, attr):
+                try:
+                    setattr(mat, attr, False)
+                except (AttributeError, TypeError):
+                    pass
+                break
+
+
 def alpha_keeps(pg):
     """Whether the diffuse alpha is the keep mask (skin, eyes, one-colour items) rather
     than the colour-2 selector (two-colour items)."""
     if pg.id_data.get("rb2_fur"):
         return False             # fur: the diffuse alpha is the strand mask (coverage)
+    if pg.id_data.get("rb2_alpha_coverage"):
+        return False             # alpha-blended (a decal's artwork shape): coverage too
     return pg.kind in CHARACTER_PALETTES or not pg.uses2
 
 
@@ -1000,11 +1051,14 @@ def build_creator_material(mat, slot, images, keep_alpha=False, milo_shader=Fals
         if s is not None:
             s.default_value = value
 
+    extension = TEX_WRAP_EXTENSION.get(slot.get('tex_wrap', 1), 'REPEAT')
+
     def tex_node(img, y, label):
         n = nodes.new('ShaderNodeTexImage')
         n.image = img
         n.label = label
         n.location = (-650, y)
+        n.extension = extension            # the material's tex-wrap (decals: black border)
         return n
 
     grp = nodes.new('ShaderNodeGroup')
@@ -1039,6 +1093,9 @@ def build_creator_material(mat, slot, images, keep_alpha=False, milo_shader=Fals
     # the material colour's, times the diffuse alpha when there's a diffuse and it isn't
     # already serving as the colour-2 mask.
     blend = slot.get('blend')
+    # An alpha-blended material's diffuse alpha is its shape (thermalundertee's moped logo),
+    # never a keep mask - recorded so alpha_keeps leaves it alone.
+    mat["rb2_alpha_coverage"] = blend in (BLEND_SRC_ALPHA, BLEND_PREMULT)
     alpha_sock = _input(bsdf, 'Alpha')
     if blend in (BLEND_SRC_ALPHA, BLEND_PREMULT) and alpha_sock is not None:
         alpha = float(mat_color[3]) if mat_color else 1.0
@@ -1051,12 +1108,7 @@ def build_creator_material(mat, slot, images, keep_alpha=False, milo_shader=Fals
             mat["rb2cc_alpha_from_diffuse"] = True
         else:
             alpha_sock.default_value = alpha
-        for attr, value in (('surface_render_method', 'BLENDED'), ('blend_method', 'BLEND')):
-            try:
-                setattr(mat, attr, value)
-                break
-            except (AttributeError, TypeError):
-                continue
+        _set_render_method(mat, bool(slot.get('alpha_cut')))
 
     if images.get('normal') is not None:
         nm = tex_node(images['normal'], -50, "Normal")
@@ -1795,8 +1847,9 @@ def channels_for(target, choices):
     for k, c in enumerate(choices):
         if target not in c['mats']:
             continue
+        pals = c.get('entries', {}).get(target, (c.get('palette1'), c.get('palette2')))
         for ch in (1, 2):
-            pal = c.get(f"palette{ch}")
+            pal = pals[ch - 1]
             if pal and ch not in out:
                 out[ch] = (pal, c['index'], k)
     return out

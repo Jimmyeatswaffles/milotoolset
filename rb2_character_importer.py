@@ -73,7 +73,7 @@ import struct
 import time
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 from .io import read_milo_container_body
@@ -811,6 +811,8 @@ def find_deform(root, gender, instrument):
 # to where that part binds them, and bones they need that the rig lacks (bone_neckTwist,
 # used by the outfits' skin pieces, is in neither master) are added there.
 
+DECAL_LIFT = 0.1
+
 MASTER_TYPES = {
     'GUITAR': ('guitar',),
     'VOCALS': ('vocal', 'vocals'),
@@ -1219,6 +1221,13 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                     "exports or renderers that can't use the shells. Switchable later in the "
                     "material panel",
         default=True)
+    decal_lift: FloatProperty(
+        name="Decal Lift",
+        description="How far decals that lie on clothing (a shirt's printed logo) are lifted "
+                    "off it so the viewport draws them on top. The game keeps them ~0.005 "
+                    "units off, too close for Blender's depth precision at a normal viewing "
+                    "distance. Raise it if a logo still disappears into the clothing",
+        default=DECAL_LIFT, min=0.0, max=2.0, step=1, precision=3)
     fit_outfit: BoolProperty(
         name="Fit Outfit Parts",
         description="Apply the parts' CharMeshHide (hide pieces another part covers) and "
@@ -1272,6 +1281,7 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
         sub.prop(self, "snap_proportions")
         layout.prop(self, "import_fur")
         layout.prop(self, "fit_outfit")
+        layout.prop(self, "decal_lift")
         layout.prop(self, "load_textures")
         sub = layout.column()
         sub.enabled = self.load_textures
@@ -1327,14 +1337,22 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
         return None
 
     def _variant_fur_meshes(self, context, milo, armature):
-        """A texture variant can bring its own fur layer (furbikini_cheetah ->
-        furbikini_fur.mesh); the resource milo doesn't have it. Imports the variant's
-        meshes and keeps the ones drawn with a fur material - not patches and the like."""
+        """A texture variant can bring meshes of its own that the resource milo doesn't
+        have: a fur layer (furbikini_cheetah -> furbikini_fur.mesh) or a decal
+        (thermalundertee_moped -> thermalundertee_patch.1.mesh, the moped logo on the chest,
+        alpha-blended, its artwork in thermalundertee_moped_patch.tex). Imports the variant's
+        meshes and keeps the ones whose material is fur or has a real texture in the
+        variant - not patches whose texture the game paints at runtime
+        (strapjacket_patch_diffuse.tex is an empty render target)."""
         try:
             probe = cc.read_texture_milo(milo)
         except Exception:
             return []
         fur_mats = {sl['target'] for sl in probe.slots if sl.get('fur')}
+        fur_mats |= {sl['target'] for sl in probe.slots
+                     if sl.get('from_mat') and isinstance(sl.get('diffuse_tex'), str)
+                     and cc._has_pixels(probe.texs.get(sl['diffuse_tex']))
+                     and sl['diffuse_tex'] not in probe.rendered}
         if not fur_mats:
             return []
         before = set(bpy.data.objects)
@@ -1355,8 +1373,28 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                 keep.append(o)
             else:
                 bpy.data.objects.remove(o, do_unlink=True)
+        # A decal sits a hair off the clothing it lies on (the moped patch 0.005 units in
+        # front of the tee) - the game draws it after, with a depth test; Blender's viewport
+        # can't resolve that gap at a normal distance and buries it in the shirt (with the
+        # default clip start of 0.01, surfaces ~100 units away need ~0.06 between them).
+        # Lift transparent-z-mode decals (not cut-outs, not fur) along their normals by the
+        # importer's Decal Lift - 0.1 by default, about 2-3 mm at real scale.
+        slot_of = {sl['target']: sl for sl in probe.slots}
+        for o in keep:
+            mats = [cc._base_name(sl.material.name) for sl in o.material_slots
+                    if sl.material is not None]
+            sl = next((slot_of[m] for m in mats if m in slot_of), None)
+            if sl and not sl.get('fur') and sl.get('z_mode') == cc.ZMODE_TRANSPARENT \
+                    and not sl.get('alpha_cut'):
+                me = o.data
+                lift = float(getattr(self, 'decal_lift', DECAL_LIFT))
+                for v in me.vertices:
+                    v.co = v.co + v.normal * lift
+                me.update()
+                o["rb2_decal_lift"] = lift
+                _log(f"    '{o.name}': decal lifted {lift:g} off the surface below")
         if keep:
-            _log(f"    fur layer from {os.path.basename(milo)}: "
+            _log(f"    the variant's own meshes from {os.path.basename(milo)}: "
                  + ", ".join(o.name for o in keep))
             if self.apply_proportions:
                 try:

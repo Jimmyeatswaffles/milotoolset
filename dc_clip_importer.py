@@ -236,7 +236,9 @@ def _scan_samples(chunk, start):
 
 
 # CharClip versions read with the DC3-style header walk and structural sample scan.
-_HEADER_TREE_VERSIONS = {'DC2': (20,), 'DC3': (22,)}
+# Rock Band 3 shares DC1's CharClip version (19) but carries a data tree in its clip headers
+# (viseme_group / exp_rocker_smile_mellow ...), so it takes this path, not DC1's.
+_HEADER_TREE_VERSIONS = {'DC2': (20,), 'DC3': (22,), 'RB3': (19,)}
 
 
 # ---------------------------------------------------------------------------------------
@@ -328,7 +330,8 @@ def read_rb2_clips(filepath):
 
 def read_dc_clips(filepath, game='DC1'):
     """Returns (dir_name, [clip dicts], {clip: [groups]}, [(name, reason)] failures).
-    `game` is 'DC1' (version-19 clips), 'DC2' (version 20) or 'DC3' (version 22)."""
+    `game` is 'DC1' (version-19 clips), 'DC2' (version 20), 'DC3' (version 22), 'RB3'
+    (version 19 with a header data tree and frame tables) or 'RB2'."""
     if game == 'RB2':
         return read_rb2_clips(filepath)
     dir_name, raw = find_viseme_clips(filepath)
@@ -349,6 +352,15 @@ def read_dc_clips(filepath, game='DC1'):
         n = max(full['num_samples'], 1 if one['samples'] else 0)
         if n == 0:
             failed.append((name, "no samples"))
+            continue
+        if game == 'RB3' and full['frame_times']:
+            # RB3 clips thin their samples and carry a frame table: one entry per 1/30 s of
+            # clip time, each a (fractional) sample index, rising from 0 to the last sample -
+            # GDRB's and RB2's semantics. 87 of medium_rocker's 96 clips have one; the rest
+            # (idles) play one sample per frame.
+            table = list(full['frame_times'])
+            clips.append(dict(name=name, fps=TABLE_RATE, full=full, one=one, num_samples=n,
+                              seconds=(len(table) - 1) / TABLE_RATE, table=table))
             continue
         clips.append(dict(name=name, fps=fps, full=full, one=one, num_samples=n,
                           seconds=(n - 1) / fps))
@@ -644,9 +656,9 @@ class _IMPORT_OT_dc_clip_base(bpy.types.Operator, ImportHelper):
                     _log(f"  blend bones: could not read the character milo ({e})")
                     blend = None
             else:
-                _log("  blend bones: no character milo set, so the shoulder, thigh and spine "
-                     "twist bones aren't solved - use Object > Rock Band Animation > Set "
-                     "Character Milo with the dancer's character milo (e.g. main.milo_xbox)")
+                _log("  blend bones: no character milo set, so any CharBlendBone twist bones "
+                     "(Dance Central's shoulders, thighs and spine) aren't solved - use Object > "
+                     "Rock Band Animation > Set Character Milo with the character's own milo")
 
         scene = context.scene
         fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
@@ -762,3 +774,12 @@ class IMPORT_OT_rb2_clip_set(_IMPORT_OT_dc_clip_base):
                      "default for Rock Band 2: its settings haven't been verified",
         default=False,
     )
+
+
+class IMPORT_OT_rb3_clip_set(_IMPORT_OT_dc_clip_base):
+    """Import every animation clip in a Rock Band 3 clip milo (a musician's idles, moves and
+    camera moments) as its own Action on the active armature, keyed in real time at the
+    clip's own speed, with the twist bones solved and the musician's movement applied"""
+    bl_idname = "import_scene.rb3_clip_set"
+    bl_label = "Import RB3 CharClip Milo"
+    _game = "RB3"

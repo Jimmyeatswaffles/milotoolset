@@ -4225,6 +4225,9 @@ class TOPBAR_MT_milo_charclip_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_clip_set.bl_idname,
                         text="Green Day: Rock Band Clip Set (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        layout.operator(IMPORT_OT_rb3_clip_set.bl_idname,
+                        text="Rock Band 3 (.milo_xbox)",
+                        icon_value=_milo_icon_id('RB3'))
         layout.operator(IMPORT_OT_rb2_clip_set.bl_idname,
                         text="Rock Band 2 (.milo_xbox/.milo_ps3)",
                         icon_value=_milo_icon_id('RB2'))
@@ -4570,6 +4573,7 @@ classes = (
     IMPORT_OT_dc1_clip_set,
     IMPORT_OT_dc2_clip_set,
     IMPORT_OT_dc3_clip_set,
+    IMPORT_OT_rb3_clip_set,
     IMPORT_OT_rb2_clip_set,
     IMPORT_OT_dc_routine,
     IMPORT_OT_dc_lipsync,
