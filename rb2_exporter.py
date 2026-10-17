@@ -44,7 +44,7 @@ from .utilities import (
 from .model_exporter import write_tbrb_rnd_mesh
 from .texture_exporter import (
     write_tbrb_rnd_tex, MAT_BLEND_VALUES, MAT_ZMODE_VALUES, MAT_STENCIL_IGNORE,
-    MAT_TEXGEN_NONE, MAT_TEXWRAP_REPEAT,
+    MAT_TEXGEN_NONE, MAT_TEXWRAP_REPEAT, mat_tex_wrap,
 )
 
 
@@ -160,7 +160,7 @@ def write_rb2_rnd_mat(w: MiloWriter, settings, force_rb2_defaults=True):
     # PATCH - a decal sampled once inside its own UV island, where clamping to a black
     # border is exactly right. A normal character texture wants repeat, which is what both
     # other game paths in this plugin write.
-    w.i32(MAT_TEXWRAP_REPEAT)
+    w.i32(mat_tex_wrap(s))
     write_matrix(w, IDENTITY_MATRIX)            # texXfm
     w.symbol(s.get('diffuse_tex_name', ""))
     w.symbol("")                                # nextPass

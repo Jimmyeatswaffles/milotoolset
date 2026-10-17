@@ -1543,7 +1543,7 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
                       blend=1, z_mode=1, cull=True, pre_lit=True,
                       use_environment=True, emissive_multiplier=1.0,
                       specular_rgb=(0.0, 0.0, 0.0), specular_power=40.0,
-                      standalone=True):
+                      standalone=True, tex_wrap='kTexWrapRepeat'):
     """RndMat.Write at revision 28 (Guitar Hero 2).
 
     Defaults reproduce a retail OPAQUE character body material.
@@ -1559,7 +1559,7 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
     tint texture there on "skin" materials and leaves it empty elsewhere.
     """
     from .texture_exporter import (
-        MAT_STENCIL_IGNORE, MAT_TEXGEN_NONE, MAT_TEXWRAP_REPEAT,
+        MAT_STENCIL_IGNORE, MAT_TEXGEN_NONE, MAT_TEXWRAP_REPEAT, MAT_TEXWRAP_VALUES,
     )
     from .utilities import IDENTITY_MATRIX
 
@@ -1576,7 +1576,7 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
     # revision 28 is NOT > 37 -> no alphaThreshold field
     w.boolean(False)                     # alphaWrite
     w.i32(MAT_TEXGEN_NONE)
-    w.i32(MAT_TEXWRAP_REPEAT)
+    w.i32(MAT_TEXWRAP_VALUES.get(tex_wrap, MAT_TEXWRAP_REPEAT))
     write_matrix(w, IDENTITY_MATRIX)     # texXfm
     w.symbol(diffuse_tex)
     w.symbol("")                         # nextPass

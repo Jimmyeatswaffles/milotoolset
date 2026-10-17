@@ -115,7 +115,7 @@ def write_tbrb_rnd_mat(w: MiloWriter, settings, standalone=True, force_tbrb_defa
     w.i32(s['alpha_threshold'])                 # rev > 37
     w.boolean(s['blend'] == 'kBlendSrcAlpha')   # alphaWrite - mirrors the RB3 path
     w.i32(MAT_TEXGEN_NONE)
-    w.i32(MAT_TEXWRAP_REPEAT)
+    w.i32(mat_tex_wrap(settings))
     write_matrix(w, IDENTITY_MATRIX)            # texXfm
     w.symbol(s.get('diffuse_tex_name', ""))
     w.symbol("")                                # nextPass
@@ -249,7 +249,7 @@ def write_tbrb_custom_song_rnd_mat(w: MiloWriter, settings, standalone=True):
     # reference file.
     w.boolean(settings['blend'] == 'kBlendSrcAlpha')   # alphaWrite
     w.i32(MAT_TEXGEN_NONE)
-    w.i32(MAT_TEXWRAP_REPEAT)
+    w.i32(mat_tex_wrap(settings))
     write_matrix(w, IDENTITY_MATRIX)                   # texXfm
     w.symbol(settings.get('diffuse_tex_name', ""))
     w.symbol("")                                       # nextPass
@@ -789,6 +789,16 @@ MAT_TEXGEN_NONE = 0
 
 
 MAT_TEXWRAP_REPEAT = 1
+MAT_TEXWRAP_VALUES = {
+    'kTexWrapClamp': 0, 'kTexWrapRepeat': 1, 'kTexBorderBlack': 2, 'kTexBorderWhite': 3,
+    'kTexWrapMirror': 4,
+}
+
+
+def mat_tex_wrap(settings):
+    """The material's texWrap value (RndMat's TexWrap enum); repeat when unset."""
+    return MAT_TEXWRAP_VALUES.get(settings.get('tex_wrap', 'kTexWrapRepeat'),
+                                  MAT_TEXWRAP_REPEAT)
 
 
 MAT_SHADER_VARIATION_NONE = 0
@@ -830,7 +840,7 @@ def write_rnd_mat(w: MiloWriter, settings, standalone=True):
                                                         # sets this true in its "BLEND" alpha-mode
                                                         # branch, which corresponds to this blend mode
     w.i32(MAT_TEXGEN_NONE)             # texGen (not exposed yet)
-    w.i32(MAT_TEXWRAP_REPEAT)          # texWrap (not exposed yet - CLI's own fallback default)
+    w.i32(mat_tex_wrap(settings))      # texWrap
     write_matrix(w, IDENTITY_MATRIX)   # texXfm (not exposed yet)
     w.symbol(settings.get('diffuse_tex_name', ''))
     w.symbol("")                       # nextPass
@@ -1034,7 +1044,7 @@ def write_dc3_rnd_mat(w: MiloWriter, settings, standalone=True, force_dc3_defaul
 
     # bs << mTexGen << mTexWrap << mTexXfm << mDiffuseTex << mNextPass;
     w.i32(MAT_TEXGEN_NONE)
-    w.i32(MAT_TEXWRAP_REPEAT)
+    w.i32(mat_tex_wrap(settings))
     write_matrix(w, DC3_TEXXFM_IDENTITY)   # -0.0 off-diagonals match retail's Transform::Reset()
     w.symbol(settings.get('diffuse_tex_name', ''))
     w.symbol("")                     # nextPass (in-milo next-pass material chain; unused here)
@@ -1435,6 +1445,8 @@ def gather_materials_and_textures(materials_by_name, max_tex_size=512, ignore_te
             'emissive_multiplier': s.emissive_multiplier,
             'environment_map': s.environment_map,
             'cull': s.cull,
+            'tex_wrap': s.tex_wrap,
+            'material_version': s.material_version,
             'de_normal': s.de_normal,
             'anisotropy': s.anisotropy,
             'normal_detail_strength': s.normal_detail_strength,

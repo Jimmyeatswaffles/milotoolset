@@ -383,6 +383,133 @@ def build_clip_bytes(arm_obj, action, scene_fps, clip_type, preset, bpm, include
                                                  full=len(full_k), one=len(one_k))
 
 
+# ---------------------------------------------------------------------------------------
+# Template mode: match the clip being replaced
+# ---------------------------------------------------------------------------------------
+#
+# A character doesn't take its animation channels from each clip. When a clip type is set
+# (guitar_body_right ...), CharServoBone::SetClipType calls CharBoneDir::StuffBones, which
+# fills the character's channel list from that clip type's CharBoneDir resource - so every
+# clip of the type is expected to fit one fixed layout of channel names AND types (RB3
+# decompilation, system/char). Retail clips are exported against it. The default export
+# above isn't: it writes every rotation as a quaternion, so a hinge the layout declares as
+# rotz (knees, a forearm, every finger joint) arrives as .quat, and it carries only the bones
+# the Action animates.
+#
+# That was the difference between Good Riddance's own performance and an exported
+# replacement that crashed the game the moment it began to play: the original fits the
+# layout exactly (12 pos, 36 quat, 25 rotz channels); the export had 26 of its 54 shared bones
+# in a different channel type and lacked the guitar, mic, mic-stand, hand-target and facing
+# bones. The routine that copies a clip's channels into the layout isn't decompiled, so the
+# exact failing line can't be shown, but a clip that doesn't fit the layout is the strongest
+# explanation for a crash on the first frame of playback.
+#
+# So with a template - the original clip being replaced - the export writes exactly the
+# template's channels (names, types, order, weights), its header settings (clip type, flags,
+# play flags, tempo, compression) and, optionally, its length. Hinge channels are converted
+# from the Action's rotation; bones the Action doesn't animate hold the template's own first
+# pose. The end marker follows the template file, so the output matches whatever extraction
+# tool produced it.
+
+HINGE_OFF_AXIS_WARN = 0.05      # x/y quaternion magnitude (about 5.7 degrees) worth reporting
+
+
+def read_template_clip(path):
+    """The pieces of an existing GDRB clip a template export copies."""
+    from .viseme_importer import _Reader, _read_char_bones_samples
+    with open(path, 'rb') as f:
+        raw = f.read()
+    has_marker = raw.endswith(END_MARKER)
+    c = raw[:-4] if has_marker else raw
+    header, off = parse_clip_header(c)
+    r = _Reader(c, off)
+    full = _read_char_bones_samples(r)
+    one = _read_char_bones_samples(r)
+    pose = {}
+    for blk in (one, full):
+        if blk['samples']:
+            pose.update({k: v for k, (_kind, v) in blk['samples'][0].items()})
+    channels = [(n, w) for n, w in full['bones'] + one['bones']]
+    return dict(header=header, channels=channels, pose=pose, compression=full['compression'],
+                has_marker=has_marker, seconds=(header['end_beat'] - header['start_beat'])
+                / max(header['beats_per_sec'], 1e-6))
+
+
+def _hinge_angle(q_xyzw):
+    """The hinge angle whose pure Z rotation is closest to a local rotation - the exact
+    inverse of how the importer builds a hinge (Quaternion(cos a/2, 0, 0, sin a/2)) - and
+    how far the rotation strays off the Z axis."""
+    x, y, z, w = q_xyzw
+    if w < 0.0:
+        x, y, z, w = -x, -y, -z, -w
+    return 2.0 * math.atan2(z, w), math.sqrt(x * x + y * y)
+
+
+def build_clip_from_template(arm_obj, action, scene_fps, template, include_twist=False,
+                             pad=True):
+    names, frames, seconds = sample_action(arm_obj, action, scene_fps, include_twist)
+    if pad:
+        want = int(round(template['seconds'] * CLIP_FPS)) + 1
+        while frames and len(frames) < want:
+            frames.append(dict(frames[-1]))
+    channels = template['channels']
+    off_axis = {}
+    samples = []
+    prev_q = {}
+    for f in frames:
+        s = {}
+        for ch, _w in channels:
+            stem, kind = ch.rsplit('.', 1)
+            if kind == 'pos':
+                s[ch] = f.get(ch, template['pose'][ch])
+            elif kind == 'quat':
+                q = f.get(ch)
+                if q is None:
+                    q = template['pose'][ch]
+                last = prev_q.get(ch)
+                if last is not None and sum(a * b for a, b in zip(q, last)) < 0.0:
+                    q = tuple(-c for c in q)
+                prev_q[ch] = q
+                s[ch] = q
+            else:                                   # rotz (rotx/roty would go the same way)
+                q = f.get(stem + '.quat')
+                if q is None:
+                    s[ch] = template['pose'][ch]
+                else:
+                    ang, stray = _hinge_angle(q)
+                    off_axis[stem] = max(off_axis.get(stem, 0.0), stray)
+                    s[ch] = ang
+        samples.append(s)
+
+    def constant(ch):
+        v0 = samples[0][ch]
+        if isinstance(v0, float):
+            return all(abs(x[ch] - v0) <= 1e-5 for x in samples)
+        return all(max(abs(a - b) for a, b in zip(x[ch], v0)) <= 1e-5 for x in samples)
+
+    order = {'pos': 0, 'quat': 1, 'rotz': 2}
+    full_ch = sorted([c for c in channels if not constant(c[0])],
+                     key=lambda c: (order.get(c[0].rsplit('.', 1)[1], 3), c[0]))
+    one_ch = sorted([c for c in channels if constant(c[0])],
+                    key=lambda c: (order.get(c[0].rsplit('.', 1)[1], 3), c[0]))
+    n = len(samples)
+    comp = template['compression']
+    full = (full_ch, [{c: x[c] for c, _ in full_ch} for x in samples],
+            [float(i) for i in range(n)], comp)
+    one = (one_ch, [{c: samples[0][c] for c, _ in one_ch}] if one_ch else [], [], comp)
+    th = template['header']
+    clip_seconds = (n - 1) / CLIP_FPS
+    header = dict(th, start_beat=0.0, end_beat=clip_seconds * th['beats_per_sec'])
+    data = encode_clip(header, full, one)
+    used = {c.rsplit('.', 1)[0] for c, _ in channels}
+    animated = {b.rsplit('.', 1)[0] if b.endswith(('.mesh', '.trans')) else b for b in names}
+    return data, dict(samples=n, seconds=clip_seconds, full=len(full_ch), one=len(one_ch),
+                      held=sorted(used - animated),
+                      off_axis={k: v for k, v in off_axis.items() if v > HINGE_OFF_AXIS_WARN},
+                      dropped=sorted(animated - used),
+                      marker=template['has_marker'])
+
+
 def _safe_filename(name):
     """A clip name made safe as a file name on every platform. The object's real name is
     kept in names.txt beside the files."""
@@ -426,6 +553,23 @@ class EXPORT_OT_gdrb_raw_charclips(bpy.types.Operator, ExportHelper):
                      "clip's length at this tempo",
         default=120.0, min=1.0, max=400.0,
     )
+    # Plain text on purpose: a file-path field's folder button can't open a second file
+    # browser from inside this export dialog. Paste the path.
+    template_path: StringProperty(
+        name="Template Clip",
+        description="Optional: the original clip you're replacing (a raw CharClipSamples "
+                     "file, e.g. a song's main_anim as your tool extracts it). The export then "
+                     "copies its channel layout (names, types, order), header settings and "
+                     "length, so the clip fits what the game expects for its clip type. "
+                     "Overrides Clip Kind, Clip Type and Tempo",
+        default="",
+    )
+    pad_to_template: BoolProperty(
+        name="Pad To Template Length",
+        description="With a template: hold the last pose until the template's length, so a "
+                     "song performance covers the whole song",
+        default=True,
+    )
     include_twist: BoolProperty(
         name="Include Twist Bones",
         description="Also write twist bones. Off by default: GDRB's own solvers drive them",
@@ -450,21 +594,51 @@ class EXPORT_OT_gdrb_raw_charclips(bpy.types.Operator, ExportHelper):
         os.makedirs(out_dir, exist_ok=True)
         scene = context.scene
         fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
+        template = None
+        if self.template_path:
+            try:
+                template = read_template_clip(bpy.path.abspath(self.template_path))
+            except Exception as e:
+                self.report({'ERROR'}, f"Couldn't read the template clip: {e}")
+                return {'CANCELLED'}
         _log(f"===== Exporting {len(actions)} GDRB raw CharClip(s) to {out_dir} =====")
+        if template is not None:
+            th = template['header']
+            _log(f"  template: {len(template['channels'])} channels, clip type "
+                 f"'{th['clip_type']}', flags {th['flags']:#x}/{th['play_flags']:#x}, "
+                 f"{th['beats_per_sec'] * 60:g} BPM, compression {template['compression']}, "
+                 f"{template['seconds']:.1f}s, end marker "
+                 f"{'yes' if template['has_marker'] else 'no'}")
         written = 0
         manifest = []
         for act in actions:
             name = act.get("milo_clip_name") or (act.name[5:] if act.name.startswith("CLIP_")
                                                  else act.name)
             try:
-                data, info = build_clip_bytes(arm, act, fps, self.clip_type, self.preset,
-                                              self.bpm, self.include_twist)
+                if template is not None:
+                    data, info = build_clip_from_template(arm, act, fps, template,
+                                                          self.include_twist,
+                                                          self.pad_to_template)
+                else:
+                    data, info = build_clip_bytes(arm, act, fps, self.clip_type, self.preset,
+                                                  self.bpm, self.include_twist)
             except Exception as e:
                 _log(f"  SKIPPED {act.name}: {e}")
                 continue
             fname = _safe_filename(name)
             with open(os.path.join(out_dir, fname), 'wb') as f:
-                f.write(data + END_MARKER)
+                f.write(data + (END_MARKER if info.get('marker', True) else b''))
+            if template is not None:
+                if info['held']:
+                    _log(f"    held at the template's first pose (not in the Action): "
+                         f"{', '.join(info['held'])}")
+                if info['dropped']:
+                    _log(f"    animated but not part of the template's layout, so left out: "
+                         f"{', '.join(info['dropped'][:12])}")
+                for bone, stray in sorted(info['off_axis'].items()):
+                    _log(f"    WARNING: {bone} is a hinge (rotz) in the template but bends up to "
+                         f"{math.degrees(2 * math.asin(min(1.0, stray))):.1f} deg off its axis "
+                         f"in the Action - that part can't be stored")
             manifest.append((fname, name))
             if fname != name:
                 _log(f"  '{name}' written as '{fname}' (characters Windows forbids replaced)")

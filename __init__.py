@@ -148,7 +148,103 @@ MAT_SHADER_VARIATION_ITEMS = (
 )
 
 
+MAT_VERSION_ITEMS = (
+    ('AUTO', "Auto (match the export's game)",
+     "Written at the revision of whatever game the export targets"),
+    ('REV_68', "Rev 68 (Rock Band 3, Dance Central 1)",
+     "RndMat revision 68 - the flat material Rock Band 3 and Dance Central 1 load"),
+    ('REV_70', "Rev 70 (Dance Central 3)",
+     "RndMat revision 70 with Dance Central 3's MetaMaterial (.mmat) template"),
+    ('REV_55', "Rev 55 (The Beatles: Rock Band)",
+     "RndMat revision 55 - The Beatles: Rock Band milos (and its loose song assets)"),
+    ('REV_47', "Rev 47 (Rock Band 2)",
+     "RndMat revision 47 - Rock Band 2. No rim lighting, shader variation, refraction or "
+     "environment map at this revision"),
+    ('REV_28_TBRB', "Rev 28 (TBRB custom song assets)",
+     "RndMat revision 28 as used for The Beatles: Rock Band custom song loose assets - a "
+     "reduced field set"),
+    ('REV_28_GH2', "Rev 28 (Guitar Hero II)",
+     "RndMat revision 28 as Guitar Hero II writes it - only the textures and texture "
+     "mapping are taken from these settings"),
+)
+
+# Which settings each revision actually writes (see the matching writer in
+# texture_exporter / rb2_exporter / gh2_exporter). 'AUTO' shows everything.
+_MAT_ALL_FIELDS = ('blend', 'base_color', 'pre_lit', 'intensify', 'use_environment',
+                   'z_mode', 'alpha_cut', 'alpha_threshold', 'textures', 'tex_wrap',
+                   'specular_rgb', 'specular_power', 'emissive_multiplier',
+                   'environment_map', 'cull', 'de_normal', 'anisotropy',
+                   'normal_detail_strength', 'rim_rgb', 'rim_power', 'shader_variation',
+                   'meta_material', 'refract')
+MAT_VERSION_FIELDS = {
+    'AUTO': set(_MAT_ALL_FIELDS),
+    'REV_68': set(_MAT_ALL_FIELDS) - {'meta_material'},
+    'REV_70': set(_MAT_ALL_FIELDS),
+    'REV_55': set(_MAT_ALL_FIELDS) - {'environment_map', 'refract', 'meta_material'},
+    'REV_47': set(_MAT_ALL_FIELDS) - {'environment_map', 'refract', 'meta_material',
+                                      'rim_rgb', 'rim_power', 'shader_variation'},
+    'REV_28_TBRB': {'blend', 'base_color', 'pre_lit', 'intensify', 'use_environment',
+                    'z_mode', 'alpha_cut', 'textures', 'tex_wrap', 'specular_rgb',
+                    'specular_power', 'emissive_multiplier', 'cull'},
+    'REV_28_GH2': {'textures', 'tex_wrap'},
+}
+
+MAT_TEXWRAP_ITEMS = (
+    ('kTexWrapClamp', "kTexWrapClamp", "Clamp UVs to the texture's edge pixels"),
+    ('kTexWrapRepeat', "kTexWrapRepeat", "Tile the texture (default)"),
+    ('kTexBorderBlack', "kTexBorderBlack", "Outside 0-1 UV reads black"),
+    ('kTexBorderWhite', "kTexBorderWhite", "Outside 0-1 UV reads white"),
+    ('kTexWrapMirror', "kTexWrapMirror",
+     "Tile the texture, mirroring every other repeat. Present in Rock Band 3's enum; "
+     "whether older games' shaders honour it hasn't been verified"),
+)
+
+
+def material_version_problems(materials, accepted):
+    """[(material name, chosen label)] for materials whose Material Version is set to a
+    revision the export can't write (anything other than Auto or one of `accepted`)."""
+    labels = {k: n for k, n, _d in MAT_VERSION_ITEMS}
+    out = []
+    for m in materials:
+        st = getattr(m, 'gltfmilo_settings', None)
+        v = getattr(st, 'material_version', 'AUTO') if st is not None else 'AUTO'
+        if v != 'AUTO' and v not in accepted:
+            out.append((m.name, labels.get(v, v)))
+    return out
+
+
+def report_material_version_problems(op, materials, accepted, game_label):
+    """Logs and reports a material/game revision mismatch. True when the export must stop."""
+    bad = material_version_problems(materials, accepted)
+    if not bad:
+        return False
+    for name, label in bad:
+        _log(f"  ERROR: material '{name}' is set to {label}, which {game_label} doesn't "
+             f"load")
+    names = ", ".join(f"'{n}'" for n, _l in bad[:5]) + (" ..." if len(bad) > 5 else "")
+    op.report({'ERROR'}, f"{len(bad)} material(s) are set to a Material Version {game_label} "
+                         f"can't use: {names}. Set them to Auto or to {game_label}'s "
+                         f"revision (Material Properties > Rock Band Material Export "
+                         f"Settings)")
+    return True
+
+
 class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
+    material_version: EnumProperty(
+        name="Material Version",
+        description="Which RndMat revision this material is exported at. Material "
+                     "revisions are not interchangeable between games; the export stops "
+                     "with an error if a material is set to one the target game can't "
+                     "load. Auto writes the export game's own revision",
+        items=MAT_VERSION_ITEMS,
+        default='AUTO',
+    )
+    tex_wrap: EnumProperty(
+        name="Texture Mapping Mode",
+        description="RndMat.texWrap - how UVs outside 0-1 sample the textures",
+        items=MAT_TEXWRAP_ITEMS,
+        default='kTexWrapRepeat',
+    )
     blend: EnumProperty(
         name="Blend Mode",
         description="RndMat.blend - how to blend this material's poly into the screen",
@@ -248,8 +344,9 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
     cull: BoolProperty(
         name="Cull (Backface)",
         description="RndMat.cull - cull backfaces of this material's polygons "
-                     "(equivalent to the CLI tool's !DoubleSided)",
-        default=False,
+                     "(equivalent to the CLI tool's !DoubleSided). On by default, as on "
+                     "retail character materials; turn off for double-sided surfaces",
+        default=True,
     )
     de_normal: EnumProperty(
         name="De-Normal",
@@ -437,7 +534,7 @@ class MATERIAL_OT_gltfmilo_autodetect_textures(bpy.types.Operator):
 
 
 class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
-    bl_label = "glTFMilo Material Settings"
+    bl_label = "Rock Band Material Export Settings"
     bl_idname = "MATERIAL_PT_gltfmilo_settings"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
@@ -453,47 +550,53 @@ class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
         layout.use_property_decorate = False
 
         settings = context.material.gltfmilo_settings
+        fields = MAT_VERSION_FIELDS.get(settings.material_version, MAT_VERSION_FIELDS['AUTO'])
 
-        layout.prop(settings, "blend")
-        layout.prop(settings, "base_color")
-        layout.prop(settings, "pre_lit")
-        layout.prop(settings, "intensify")
-        layout.prop(settings, "use_environment")
-        layout.prop(settings, "z_mode")
-        layout.prop(settings, "alpha_cut")
-        layout.prop(settings, "alpha_threshold")
+        layout.prop(settings, "material_version")
+        if settings.material_version == 'REV_28_GH2':
+            layout.label(text="Guitar Hero II materials take only the textures and "
+                              "texture mapping from here", icon='INFO')
 
-        box = layout.box()
-        box.label(text="Textures", icon='TEXTURE')
-        row = box.row(align=True)
-        row.label(text="Diffuse")
-        row.template_ID(settings, "diffuse_tex", open="image.open")
-        row = box.row(align=True)
-        row.label(text="Normal Map")
-        row.template_ID(settings, "normal_tex", open="image.open")
-        row = box.row(align=True)
-        row.label(text="Specular")
-        row.template_ID(settings, "specular_tex", open="image.open")
-        row = box.row(align=True)
-        row.label(text="Emissive")
-        row.template_ID(settings, "emissive_tex", open="image.open")
-        box.operator("material.gltfmilo_autodetect_textures", icon='VIEWZOOM')
+        def prop(target, name):
+            if name in fields:
+                target.prop(settings, name)
 
-        layout.prop(settings, "specular_rgb")
-        layout.prop(settings, "specular_power")
-        layout.prop(settings, "emissive_multiplier")
-        layout.prop(settings, "environment_map")
+        for name in ("blend", "base_color", "pre_lit", "intensify", "use_environment",
+                     "z_mode", "alpha_cut", "alpha_threshold"):
+            prop(layout, name)
 
-        box = layout.box()
-        box.label(text="Advanced", icon='MODIFIER')
-        box.prop(settings, "cull")
-        box.prop(settings, "de_normal")
-        box.prop(settings, "anisotropy")
-        box.prop(settings, "normal_detail_strength")
-        box.prop(settings, "rim_rgb")
-        box.prop(settings, "rim_power")
-        box.prop(settings, "shader_variation")
-        box.prop(settings, "meta_material")
+        if 'textures' in fields:
+            box = layout.box()
+            box.label(text="Textures", icon='TEXTURE')
+            row = box.row(align=True)
+            row.label(text="Diffuse")
+            row.template_ID(settings, "diffuse_tex", open="image.open")
+            row = box.row(align=True)
+            row.label(text="Normal Map")
+            row.template_ID(settings, "normal_tex", open="image.open")
+            row = box.row(align=True)
+            row.label(text="Specular")
+            row.template_ID(settings, "specular_tex", open="image.open")
+            row = box.row(align=True)
+            row.label(text="Emissive")
+            row.template_ID(settings, "emissive_tex", open="image.open")
+            box.operator("material.gltfmilo_autodetect_textures", icon='VIEWZOOM')
+            sub = box.column()
+            sub.use_property_split = True
+            prop(sub, "tex_wrap")
+
+        for name in ("specular_rgb", "specular_power", "emissive_multiplier",
+                     "environment_map"):
+            prop(layout, name)
+
+        advanced = [n for n in ("cull", "de_normal", "anisotropy", "normal_detail_strength",
+                                "rim_rgb", "rim_power", "shader_variation", "meta_material")
+                    if n in fields]
+        if advanced:
+            box = layout.box()
+            box.label(text="Advanced", icon='MODIFIER')
+            for name in advanced:
+                box.prop(settings, name)
 
 
 class MATERIAL_PT_gltfmilo_refract(bpy.types.Panel):
@@ -510,7 +613,11 @@ class MATERIAL_PT_gltfmilo_refract(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.material is not None
+        mat = context.material
+        if mat is None:
+            return False
+        v = mat.gltfmilo_settings.material_version
+        return 'refract' in MAT_VERSION_FIELDS.get(v, MAT_VERSION_FIELDS['AUTO'])
 
     def draw(self, context):
         layout = self.layout
@@ -1658,6 +1765,11 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         material_entries = []
         mat_name_by_material = {}
         if self.gh2_donor_mode == 'reverse':
+            gh2_mats = {s.material for o in mesh_objs for s in o.material_slots
+                        if s.material is not None}
+            if report_material_version_problems(self, gh2_mats, {'REV_28_GH2'},
+                                                "Guitar Hero II"):
+                return {'CANCELLED'}
             try:
                 material_entries, mat_name_by_material = _collect_gh2_materials(
                     mesh_objs, max_tex_size=512,
@@ -1995,6 +2107,9 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         # every retail texture ships a full chain, and a mip-less compressed surface is
         # a known cause of black/garbage rendering on these older Harmonix shader paths.
         _log("--- Materials & Textures ---")
+        if report_material_version_problems(self, materials_by_name.values(), {'REV_47'},
+                                            "Rock Band 2"):
+            return {'CANCELLED'}
         materials, textures, _texture_images = gather_materials_and_textures(
             materials_by_name, max_tex_size=512,
             ignore_tex_size_limits=self.ignore_tex_size_limits,
@@ -2127,6 +2242,9 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         _log("--- Materials & Textures ---")
         # mip_floor=16: every retail TBRB texture bottoms out at a 16px smaller dimension,
         # never 4. generate_mips is forced on - retail ships full chains for every texture.
+        if report_material_version_problems(self, materials_by_name.values(), {'REV_55'},
+                                            "The Beatles: Rock Band"):
+            return {'CANCELLED'}
         materials, textures, _texture_images = gather_materials_and_textures(
             materials_by_name, max_tex_size=512,
             ignore_tex_size_limits=self.ignore_tex_size_limits,
@@ -2221,6 +2339,10 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
             _log("  WARNING: tangents are DISABLED - normal maps will render FLAT.")
 
         _log("--- Materials & Textures ---")
+        if report_material_version_problems(self, materials_by_name.values(),
+                                            {'REV_55', 'REV_28_TBRB'},
+                                            "a TBRB custom song asset"):
+            return {'CANCELLED'}
         materials, textures, texture_images = gather_materials_and_textures(
             materials_by_name, max_tex_size=512,
             ignore_tex_size_limits=self.ignore_tex_size_limits,
@@ -2271,9 +2393,13 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                 _log(f"  Tex  '{tname}': {tw}x{th} bpp={bpp} enc={enc} mipMaps={nmips} "
                      f"-> {len(w.buf)} bytes")
 
-        use_rev28_mat = (self.custom_song_mat_revision == 'rev28')
+        default_rev28 = (self.custom_song_mat_revision == 'rev28')
         for (mat_entry_name, settings) in materials:
             w = MiloWriter(big_endian=True)
+            # A material's own Material Version wins over the export option.
+            version = settings.get('material_version', 'AUTO')
+            use_rev28_mat = (version == 'REV_28_TBRB' or
+                             (version == 'AUTO' and default_rev28))
             if use_rev28_mat:
                 write_tbrb_custom_song_rnd_mat(w, settings, standalone=True)
             else:
@@ -2855,6 +2981,12 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         # which is a real, confirmed mismatch - left unfixed pending the same byte-level
         # check for DC3, whose real mip depth hasn't been independently verified yet.
         game_mip_floor = DC1_TEX_MIP_FLOOR if self.game == 'dc1' else 4
+        if report_material_version_problems(
+                self, materials_by_name.values(),
+                {'REV_70'} if self.game == 'dc3' else {'REV_68'},
+                {'rb3': "Rock Band 3", 'dc1': "Dance Central 1",
+                 'dc3': "Dance Central 3"}[self.game]):
+            return {'CANCELLED'}
         materials, textures, _texture_images = gather_materials_and_textures(
             materials_by_name, max_tex_size=512, ignore_tex_size_limits=self.ignore_tex_size_limits,
             platform=self.platform,
@@ -4187,6 +4319,11 @@ class TOPBAR_MT_milo_mesh_import(bpy.types.Menu):
 
     def draw(self, context):
         layout = self.layout
+        # RndMesh 38, compressed or uncompressed vertices. Placeholder materials only -
+        # RB3's textures come from its character customisation system.
+        layout.operator(IMPORT_OT_rb3_meshes.bl_idname,
+                        text="Rock Band 3 (.milo_xbox)",
+                        icon_value=_milo_icon_id('RB3'))
         layout.operator(IMPORT_OT_tbrb_meshes.bl_idname,
                         text="The Beatles: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('TBRB'))
@@ -4402,17 +4539,19 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
                      f"'{mat_name}': {e} - that slot is left empty.")
 
         if s is None:
-            _log(f"  WARNING: material '{mat_name}' has no glTFMilo settings block - "
+            _log(f"  WARNING: material '{mat_name}' has no material export settings - "
                  f"exported with no textures.")
         elif not (diffuse or normal or specular):
             _log(f"  NOTE: material '{mat_name}' has no texture slots filled in "
-                 f"(Material Properties > glTFMilo Material Settings > Textures) - "
+                 f"(Material Properties > Rock Band Material Export Settings > Textures) - "
                  f"exported untextured.")
 
         entry_name = f"{sanitize_milo_name(mat_name)}.mat"
         w = MiloWriter(big_endian=False)
         write_gh2_rnd_mat(w, diffuse_tex=diffuse, normal_tex=normal,
-                          specular_tex=specular)
+                          specular_tex=specular,
+                          tex_wrap=getattr(s, 'tex_wrap', 'kTexWrapRepeat')
+                          if s is not None else 'kTexWrapRepeat')
         extra_entries.append(('Mat', entry_name, bytes(w.buf)))
         mat_name_by_material[mat_name] = entry_name
         _log(f"  material '{mat_name}' -> '{entry_name}' "
@@ -4566,6 +4705,7 @@ classes = (
     IMPORT_OT_tbrb_skeleton,
     IMPORT_OT_gdrb_skeleton,
     IMPORT_OT_gdrb_meshes,
+    IMPORT_OT_rb3_meshes,
     IMPORT_OT_rb2_meshes,
     IMPORT_OT_tbrb_meshes,
     IMPORT_OT_gdrb_animation,

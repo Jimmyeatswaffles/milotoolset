@@ -288,20 +288,80 @@ def _find_trans(chunk, limit):
     return None
 
 
+# Rock Band 3 (and Dance Central) meshes: RndMesh version 38. They come in two vertex
+# layouts, mixed within one file: the 36-byte compressed one TBRB and GDRB use (read below
+# unchanged), and an 88-byte uncompressed one (see _find_rb3_raw_vertex_block). In the
+# retail-format head.milo_xbox the head is uncompressed and its eyes, teeth and tongue are
+# compressed.
+RB3_MESH_VERSION = 38
+RB3_RAW_VERTEX_SIZE = 88
+
+
+def _rb3_raw_vertex_ok(chunk, o):
+    try:
+        nx, ny, nz = struct.unpack_from('>3f', chunk, o + 12)
+        wts = struct.unpack_from('>4f', chunk, o + 48)
+        x, y, z = struct.unpack_from('>3f', chunk, o)
+    except struct.error:
+        return False
+    if not all(abs(c) < 1e5 for c in (x, y, z)):
+        return False
+    if abs(nx * nx + ny * ny + nz * nz - 1.0) > 0.02:
+        return False
+    return all(-1e-4 <= w <= 1.0001 for w in wts) and (abs(sum(wts) - 1.0) < 0.01
+                                                        or sum(wts) < 1e-6)
+
+
+def _find_rb3_raw_vertex_block(chunk):
+    """The uncompressed RB3 vertex block: a vertex count, an isNextGen byte of 0, then
+    88-byte vertices - position (3 floats), normal (3), colour (4), UV (2), four weights,
+    four 16-bit bone indices, tangent (4) - followed by a face list that indexes them.
+    Located by that structure. Returns (vert_count, payload_offset)."""
+    for p in range(16, min(len(chunk) - 8, 1024)):
+        n = _u32(chunk, p)
+        if not 1 <= n <= 1_000_000 or chunk[p + 4] != 0:
+            continue
+        vstart = p + 5
+        fo = vstart + n * RB3_RAW_VERTEX_SIZE
+        if fo + 4 > len(chunk):
+            continue
+        if not all(_rb3_raw_vertex_ok(chunk, vstart + k * RB3_RAW_VERTEX_SIZE)
+                   for k in (0, n // 2, n - 1)):
+            continue
+        fcount = _u32(chunk, fo)
+        if not 0 < fcount < 1_000_000 or fo + 4 + fcount * 6 > len(chunk):
+            continue
+        if any(max(struct.unpack_from('>3H', chunk, fo + 4 + i * 6)) >= n
+               for i in range(fcount)):
+            continue
+        return n, vstart
+    raise MeshImportError("no vertex block found, compressed or uncompressed")
+
+
 def parse_mesh_entry(chunk, name):
     """Decodes one Mesh entry into a dict, or raises MeshImportError."""
     version = _u32(chunk, 0)
-    if version not in (GDRB_MESH_VERSION, TBRB_MESH_VERSION):
+    if version not in (GDRB_MESH_VERSION, TBRB_MESH_VERSION, RB3_MESH_VERSION):
         raise MeshImportError(
-            f"RndMesh version {version} (expected {TBRB_MESH_VERSION} for TBRB or "
-            f"{GDRB_MESH_VERSION} for GDRB)")
+            f"RndMesh version {version} (expected {TBRB_MESH_VERSION} for TBRB, "
+            f"{GDRB_MESH_VERSION} for GDRB or {RB3_MESH_VERSION} for RB3)")
 
-    vcount, vstart = _find_vertex_block(chunk)
+    raw_layout = False
+    try:
+        vcount, vstart = _find_vertex_block(chunk)
+    except MeshImportError:
+        if version != RB3_MESH_VERSION:
+            raise
+        vcount, vstart = _find_rb3_raw_vertex_block(chunk)
+        raw_layout = True
+    stride = RB3_RAW_VERTEX_SIZE if raw_layout else NG_VERTEX_SIZE
 
     # mat and geomOwner sit immediately before mutable/volume/bsp, which in turn sit
     # 9 bytes before the vertex count. Resolve them by finding the pair of strings that
     # lands exactly on that boundary.
-    boundary = vstart - 9 - 4 - 9
+    # (Uncompressed: the count is followed only by the isNextGen byte, not the 8-byte
+    # vertex-size/compression header, so the vertices start 5 bytes after the count.)
+    boundary = (vstart - 5 - 9) if raw_layout else (vstart - 9 - 4 - 9)
     mat_name = geom_owner = ""
     for s in range(8, max(9, boundary)):
         m, o1 = _numstring(chunk, s)
@@ -315,7 +375,23 @@ def parse_mesh_entry(chunk, name):
             break
 
     verts = []
-    for i in range(vcount):
+    for i in range(vcount if raw_layout else 0):
+        o = vstart + i * RB3_RAW_VERTEX_SIZE
+        x, y, z = struct.unpack_from('>3f', chunk, o)
+        nx, ny, nz = struct.unpack_from('>3f', chunk, o + 12)
+        cr, cg, cb, ca = struct.unpack_from('>4f', chunk, o + 24)
+        u, v = struct.unpack_from('>2f', chunk, o + 40)
+        wts = struct.unpack_from('>4f', chunk, o + 48)
+        idx = struct.unpack_from('>4H', chunk, o + 64)
+        # Plain parallel arrays: weight i pairs with bone i (see the module notes on RB3).
+        colour = ((int(max(0.0, min(1.0, cr)) * 255) << 24)
+                  | (int(max(0.0, min(1.0, cg)) * 255) << 16)
+                  | (int(max(0.0, min(1.0, cb)) * 255) << 8)
+                  | int(max(0.0, min(1.0, ca)) * 255))
+        verts.append(dict(co=(x, y, z), normal=(nx, ny, nz),
+                          uv=(u, 1.0 - v), colour=colour,
+                          weights=tuple(wts), bones=tuple(idx)))
+    for i in range(0 if raw_layout else vcount):
         o = vstart + i * NG_VERTEX_SIZE
         x, y, z = struct.unpack_from('>fff', chunk, o)
         colour = _u32(chunk, o + 12)
@@ -345,7 +421,7 @@ def parse_mesh_entry(chunk, name):
                           uv=(u, 1.0 - v), colour=colour,
                           weights=(wx, wy, wz, ww), bones=bones))
 
-    fo = vstart + vcount * NG_VERTEX_SIZE
+    fo = vstart + vcount * stride
     fcount = _u32(chunk, fo)
     fo += 4
     faces = [struct.unpack_from('>3H', chunk, fo + i * 6) for i in range(fcount)]
@@ -1181,6 +1257,10 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
     bl_options = {'REGISTER', 'UNDO'}
     _game_label = "Milo"
     _textures_supported = True
+    # Whether the selected armature may be used as the reference for placing meshes through
+    # their skinning matrices (apply_bind_corrections). See IMPORT_OT_rb3_meshes for why
+    # RB3 turns it off.
+    _skeleton_corrections = True
 
     def _parse_meshes(self, filepath):
         return parse_gdrb_meshes(filepath)
@@ -1299,7 +1379,7 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
         for name, note in place_rigid_meshes(meshes):
             _log(f"  '{name}': {note}")
         for name, note in apply_bind_corrections(
-                meshes, armature_obj, extra_rest={n: t[0] for n, t in trans_bones.items()}):
+                meshes, armature_obj if self._skeleton_corrections else None, extra_rest={n: t[0] for n, t in trans_bones.items()}):
             _log(f"  '{name}': {note}")
         for name, note in remap_unknown_bones(meshes, trans_bones, armature_obj):
             _log(f"  '{name}': {note}")
@@ -1437,3 +1517,25 @@ class IMPORT_OT_rb2_meshes(_IMPORT_OT_milo_meshes_base):
 
     def _parse_meshes(self, filepath):
         return parse_rb2_meshes(filepath)
+
+
+class IMPORT_OT_rb3_meshes(_IMPORT_OT_milo_meshes_base):
+    """Import the meshes from a Rock Band 3 character milo, with UVs, per-bone vertex groups
+    and placeholder materials. RB3's textures come from its character customisation system,
+    so they aren't imported"""
+    bl_idname = "import_scene.rb3_meshes"
+    bl_label = "Import RB3 Meshes"
+    _game_label = "RB3"
+    _textures_supported = False
+    # RB3 heads are skinned to their OWN face: in head.milo_xbox the eye, lid and tongue
+    # bones sit about 0.5 units from where the master skeleton (skeleton.milo_xbox) puts
+    # them, with no rotation, while every other bone matches it exactly - character
+    # customisation (the master character carries eyesdeform_male/female animations that
+    # move the eye bones). Correcting against the master armature would drag the eyes,
+    # lids and tongue toward its default face, out of this head's sockets, so RB3 meshes
+    # keep their stored placement. Each file is consistent with itself.
+    _skeleton_corrections = False
+
+    filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+    import_textures: BoolProperty(default=False, options={'HIDDEN'})
+    flip_normal_green: BoolProperty(default=False, options={'HIDDEN'})
