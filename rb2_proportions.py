@@ -393,7 +393,7 @@ def apply_proportions(arm_obj, report=False):
     their Blender parents. Returns (bones placed, [deform bones the armature lacks])."""
     from mathutils import Matrix
     deform = _deform_of(arm_obj)
-    if deform is None or arm_obj.type != 'ARMATURE':
+    if deform is None or arm_obj.type != 'ARMATURE' or arm_obj.get(BAKED_KEY):
         return 0, []
     pg = arm_obj.rb2_proportions
     h, w = pg.height, pg.weight
@@ -799,6 +799,190 @@ def apply_girth(arm_obj, deform, world, neutral, pose_m, enabled=True):
 
 
 # ---------------------------------------------------------------------------------------
+# Baking: proportions into the rest pose and the meshes, for export
+# ---------------------------------------------------------------------------------------
+#
+# A proportioned character is four live layers on the imported model: the bones posed by
+# the sliders, the 'RB2 Proportions' (girth) and 'RB2 Cuff' shape keys, and the Armature
+# modifier putting them together. Exporters understand none of it, so the bake makes the
+# current look the plain rest state:
+#
+#   1. each mesh deformed by the armature is evaluated - pose, shape keys, Armature
+#      modifier; anything after the Armature modifier (shell fur) switched off for it - and
+#      that shape, with its normals, becomes the mesh's base geometry; the RB2 shape keys go
+#      (any others are carried over by their offsets);
+#   2. the pose becomes the armature's rest pose ("Apply Pose as Rest Pose"); bone scale
+#      (girth helpers, the head scale) ends up in positions and lengths, which matches the
+#      captured meshes;
+#   3. objects hanging from bones keep their place;
+#   4. the armature is marked baked, so the sliders can't stack proportions on top.
+#
+# Vertex groups and the Armature modifier stay, so the character still poses and animates
+# from its new rest - with one caveat: RB2 animations that set bone POSITIONS are authored
+# for the neutral body and pull those bones back toward it.
+
+BAKED_KEY = "rb2_proportions_baked"
+RB2_SHAPE_KEYS = (SHAPE_KEY, "RB2 Cuff")
+
+
+def _armature_meshes(arm_obj):
+    return [o for o in bpy.data.objects if o.type == 'MESH' and any(
+        m.type == 'ARMATURE' and m.object is arm_obj for m in o.modifiers)]
+
+
+def _duplicate_character(context, arm_obj, meshes, name):
+    """A hidden, unbaked copy of the armature and its meshes, in its own collection."""
+    coll = bpy.data.collections.new(name)
+    context.scene.collection.children.link(coll)
+    arm2 = arm_obj.copy()
+    arm2.data = arm_obj.data.copy()
+    coll.objects.link(arm2)
+    copies = {arm_obj: arm2}
+    for o in meshes + [c for c in arm_obj.children if c not in meshes]:
+        o2 = o.copy()
+        if o.data is not None:
+            o2.data = o.data.copy()
+        for m in o2.modifiers:
+            if m.type == 'ARMATURE' and m.object is arm_obj:
+                m.object = arm2
+        coll.objects.link(o2)
+        copies[o] = o2
+    for o, o2 in copies.items():
+        if o.parent in copies:
+            o2.parent = copies[o.parent]
+    layer = context.view_layer.layer_collection.children.get(coll.name)
+    if layer is not None:
+        layer.exclude = True                   # out of the way, and out of exports
+    return coll
+
+
+def _capture_mesh(context, obj):
+    """Writes the object's evaluated (posed, shape-keyed, armature-deformed) shape and
+    normals into its base mesh and drops the RB2 shape keys. Returns True if captured."""
+    import numpy as np
+    me = obj.data
+    arm_index = max((i for i, m in enumerate(obj.modifiers) if m.type == 'ARMATURE'),
+                    default=-1)
+    toggled = []
+    for i, m in enumerate(obj.modifiers):
+        if i > arm_index and m.show_viewport:
+            m.show_viewport = False            # e.g. shell fur: not part of the body
+            toggled.append(m)
+    # Hidden pieces (the outfit hide flags) aren't evaluated while hidden.
+    was_hidden, was_vp_hidden = obj.hide_get(), obj.hide_viewport
+    obj.hide_viewport = False
+    try:
+        obj.hide_set(False)
+    except RuntimeError:
+        pass
+    try:
+        dg = context.evaluated_depsgraph_get()
+        dg.update()
+        ev = obj.evaluated_get(dg)
+        em = ev.to_mesh()
+        try:
+            n = len(me.vertices)
+            if len(em.vertices) != n or len(em.loops) != len(me.loops):
+                return False
+            co = np.empty(n * 3, dtype=np.float64)
+            em.vertices.foreach_get('co', co)
+            normals = None
+            try:
+                normals = [tuple(cn.vector) for cn in em.corner_normals]
+            except AttributeError:
+                try:
+                    em.calc_normals_split()
+                    normals = [tuple(l.normal) for l in em.loops]
+                except AttributeError:
+                    normals = None
+        finally:
+            ev.to_mesh_clear()
+    finally:
+        for m in toggled:
+            m.show_viewport = True
+        obj.hide_viewport = was_vp_hidden
+        try:
+            obj.hide_set(was_hidden)
+        except RuntimeError:
+            pass
+
+    # other shape keys keep their offsets from the old basis
+    keep = []
+    keys = me.shape_keys
+    if keys is not None:
+        basis = np.empty(len(me.vertices) * 3)
+        keys.reference_key.data.foreach_get('co', basis)
+        for kb in keys.key_blocks:
+            if kb == keys.reference_key or kb.name in RB2_SHAPE_KEYS:
+                continue
+            d = np.empty(len(me.vertices) * 3)
+            kb.data.foreach_get('co', d)
+            keep.append((kb.name, kb.value, d - basis))
+        obj.shape_key_clear()
+    me.vertices.foreach_set('co', co)
+    if keep:
+        obj.shape_key_add(name="Basis", from_mix=False)
+        for name, value, delta in keep:
+            kb = obj.shape_key_add(name=name, from_mix=False)
+            kb.data.foreach_set('co', co + delta)
+            kb.value = value
+    me.update()
+    if normals is not None and len(normals) == len(me.loops):
+        try:
+            me.normals_split_custom_set(normals)
+        except (RuntimeError, TypeError, ValueError):
+            pass
+    for k in ("rb2_meshdeform",):
+        if k in obj:
+            del obj[k]                         # girth is in the mesh now
+    return True
+
+
+def bake_proportions(context, arm_obj, keep_copy=True, remove_hidden=False):
+    """Bakes the armature's current proportions into its rest pose and its meshes.
+    Returns (meshes baked, [skipped names], copy collection or None)."""
+    meshes = _armature_meshes(arm_obj)
+    copy = None
+    if keep_copy:
+        copy = _duplicate_character(context, arm_obj, meshes,
+                                    f"{arm_obj.name} (unbaked)")
+    if remove_hidden:
+        for o in [o for o in meshes if o.get("rb2_hidden_by_flags")]:
+            meshes.remove(o)
+            bpy.data.objects.remove(o, do_unlink=True)
+
+    baked, skipped = 0, []
+    for o in meshes:
+        if _capture_mesh(context, o):
+            baked += 1
+        else:
+            skipped.append(o.name)
+
+    # objects hanging from bones (no Armature modifier) keep their place
+    bone_children = [(o, o.matrix_world.copy()) for o in bpy.data.objects
+                     if o.parent is arm_obj and o.parent_type == 'BONE']
+
+    prev_active = context.view_layer.objects.active
+    prev_mode = arm_obj.mode
+    context.view_layer.objects.active = arm_obj
+    bpy.ops.object.mode_set(mode='POSE')
+    try:
+        bpy.ops.pose.armature_apply(selected=False)
+    finally:
+        bpy.ops.object.mode_set(mode='OBJECT')
+        context.view_layer.objects.active = prev_active
+    for o, mw in bone_children:
+        o.matrix_world = mw
+
+    pg = arm_obj.rb2_proportions
+    arm_obj[BAKED_KEY] = f"height {pg.height:g}, weight {pg.weight:g}"
+    _log(f"RB2 proportions: baked '{arm_obj.name}' at {arm_obj[BAKED_KEY]} - {baked} mesh(es)"
+         + (f"; skipped {', '.join(skipped)}" if skipped else "")
+         + (f"; unbaked copy in collection '{copy.name}'" if copy else ""))
+    return baked, skipped, copy
+
+
+# ---------------------------------------------------------------------------------------
 # Properties, operators, panel
 # ---------------------------------------------------------------------------------------
 
@@ -898,6 +1082,70 @@ class POSE_OT_rb2_load_girth(bpy.types.Operator, ImportHelper):
         return {'FINISHED'}
 
 
+class POSE_OT_rb2_bake_proportions(bpy.types.Operator):
+    """Bake the current height, weight and girth into the armature's rest pose and the
+    meshes, so the character exports as a plain rigged model (FBX, glTF ...)"""
+    bl_idname = "pose.rb2_bake_proportions"
+    bl_label = "Bake Body and Armature Locations"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keep_copy: BoolProperty(
+        name="Keep an Unbaked Copy", default=True,
+        description="Duplicate the armature and its meshes first, into a collection left "
+                    "out of the view layer, so the sliders can still be used on the copy")
+    remove_hidden: BoolProperty(
+        name="Remove Hidden Pieces", default=False,
+        description="Delete meshes hidden by the outfit's hide flags (covered by another "
+                    "part), so they aren't exported")
+    bake_textures: BoolProperty(
+        name="Also Bake Diffuse Textures", default=False,
+        description="Run 'Bake All Character Diffuse Textures' too, for a character ready to "
+                    "export in one step")
+
+    @classmethod
+    def poll(cls, context):
+        o = context.object
+        return o is not None and o.type == 'ARMATURE' and not o.get(BAKED_KEY)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=380)
+
+    def draw(self, context):
+        col = self.layout.column()
+        pg = context.object.rb2_proportions
+        col.label(text=f"Baking height {pg.height:g}, weight {pg.weight:g}", icon='INFO')
+        col.prop(self, "keep_copy")
+        col.prop(self, "remove_hidden")
+        col.prop(self, "bake_textures")
+        if not self.keep_copy:
+            col.label(text="Without a copy the bake can only be undone with Ctrl+Z",
+                      icon='ERROR')
+
+    def execute(self, context):
+        arm = context.object
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        try:
+            baked, skipped, copy = bake_proportions(context, arm, self.keep_copy,
+                                                    self.remove_hidden)
+        except Exception as e:
+            self.report({'ERROR'}, f"Bake failed: {e}")
+            return {'CANCELLED'}
+        if self.bake_textures:
+            try:
+                bpy.ops.material.rb2cc_bake_all('EXEC_DEFAULT')
+            except Exception as e:
+                self.report({'WARNING'}, f"Proportions baked; texture bake failed: {e}")
+                return {'FINISHED'}
+        msg = f"Baked {baked} mesh(es) and the rest pose"
+        if skipped:
+            msg += f"; {len(skipped)} skipped (see the log)"
+        if copy is not None:
+            msg += f"; unbaked copy in '{copy.name}'"
+        self.report({'WARNING'} if skipped else {'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class POSE_OT_rb2_proportion_preset(bpy.types.Operator):
     """Set height and weight to one of the character creator's body presets"""
     bl_idname = "pose.rb2_proportion_preset"
@@ -950,6 +1198,12 @@ class DATA_PT_rb2_proportions(bpy.types.Panel):
         layout = self.layout
         arm = context.object
         pg = arm.rb2_proportions
+        if arm.get(BAKED_KEY):
+            box = layout.box()
+            box.label(text=f"Baked at {arm[BAKED_KEY]}", icon='CHECKMARK')
+            box.label(text="The proportions are the rest pose now - the sliders are off. "
+                           "Use the unbaked copy to change them.")
+            return
         loaded = _deform_of(arm) is not None
         layout.operator(POSE_OT_rb2_load_deform.bl_idname,
                         text="Load Deform Milo" if not loaded else "Load Another Deform Milo",
@@ -984,6 +1238,8 @@ class DATA_PT_rb2_proportions(bpy.types.Panel):
             op = grid.operator(POSE_OT_rb2_proportion_preset.bl_idname, text=label)
             op.height, op.weight = h, w
         col.operator(POSE_OT_rb2_clear_proportions.bl_idname, icon='LOOP_BACK')
+        layout.separator()
+        layout.operator(POSE_OT_rb2_bake_proportions.bl_idname, icon='EXPORT')
 
 
 _classes = (
@@ -992,6 +1248,7 @@ _classes = (
     POSE_OT_rb2_load_girth,
     POSE_OT_rb2_proportion_preset,
     POSE_OT_rb2_clear_proportions,
+    POSE_OT_rb2_bake_proportions,
     DATA_PT_rb2_proportions,
 )
 
