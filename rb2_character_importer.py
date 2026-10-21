@@ -1004,12 +1004,22 @@ def retarget_to_part(context, armature, mesh_path, body_stems, hierarchy=None):
         for bn, M in mats.items():
             bind.setdefault(_stem(bn), (bn, M))
 
+    # A mounted part's own bones (hair physics strands) go where its meshes are bound,
+    # carried by the mount offset like the meshes themselves - not by their own transforms:
+    # nightcat_resource's bone_hair-L-back-03 says (57.8, 10.8, 66.6), 62 units to the side,
+    # while its mesh is bound to it at (-4.3, -2.0, 63.2), the end of the left back strand
+    # (the game's hair physics re-seats it). Built from its own transform it dragged that
+    # strand out sideways.
+    mount_offset = next(iter(mounts.values())) if mounts else None
+    file_parent = {_stem(n): _stem(p) for n, (_l, p) in fb.items()}
     move, add = {}, {}
     for st, (bn, M) in bind.items():
         an = by_stem.get(st)
         if an is None:
             if st not in file_defined:
                 add[st] = (bn, M)
+            elif mount_offset is not None:
+                add[st] = (bn, mount_offset @ M)
         elif not is_body(st) and st not in mount_stems:
             rest = bones[an].matrix_local
             if (M.to_translation() - rest.to_translation()).length > 1e-3 or \
@@ -1032,18 +1042,24 @@ def retarget_to_part(context, armature, mesh_path, body_stems, hierarchy=None):
             length = eb.length
             eb.matrix = M.normalized()
             eb.length = length
+        created = {}
         for st, (bn, M) in add.items():
             eb = ebs.new(bn)
             eb.head = (0.0, 0.0, 0.0)
             eb.tail = (0.0, 0.5, 0.0)
             eb.matrix = M.normalized()
+            created[st] = eb
+            added.append(bn)
+        for st, eb in created.items():
             parent = None
             if hierarchy and st in hierarchy:
                 gp = hierarchy[st][0]
                 parent = ebs.get(by_stem.get(gp, '')) if gp else None
-            if parent is not None:
+            if parent is None and st in file_parent:
+                fp = file_parent[st]
+                parent = created.get(fp) or ebs.get(by_stem.get(fp, ''))
+            if parent is not None and parent is not eb:
                 eb.parent = parent
-            added.append(bn)
     finally:
         bpy.ops.object.mode_set(mode='OBJECT')
         context.view_layer.objects.active = prev_active
@@ -1093,6 +1109,69 @@ def mount_meshes(armature, objects, mounts, mesh_path):
         me.transform(to_obj @ mounts[bone] @ to_obj.inverted())
         me.update()
         done.append(obj.name)
+    return done
+
+
+def frame_correct_meshes(armature, objects, mesh_path, tolerance=0.05):
+    """Meshes stored in a frame of their own, which the game's skinning undoes and the
+    mesh importer (finding every bone off the rig) leaves as stored.
+
+    modavengerboots_resource.mesh carries a Y mirror (its own transform is diag(1, -1, 1))
+    and is bound to bones mirrored the same way - bone_L-toe at y -2.86 where the rig has
+    +2.86, the front - so imported as stored the boots face backwards. When all of a
+    mesh's bones relate to the armature by the SAME transform T (rest @ bind^-1), the
+    game draws the mesh moved by T; so is it here - faces flipped back outward when T is a
+    mirror. Only meshes still exactly as the file stores them. Returns
+    [(object name, 'mirror' | 'moved')]."""
+    import numpy as np
+    from mathutils import Matrix
+    from .mesh_importer import parse_rb2_meshes
+    from .io import _milo_to_blender_matrix
+    try:
+        _dn, raw, _fb = parse_rb2_meshes(mesh_path)
+    except Exception:
+        return []
+    raw_by_name = {m['name']: m for m in raw}
+    bones = armature.data.bones
+    done = []
+    for obj in objects:
+        if obj.type != 'MESH':
+            continue
+        src = raw_by_name.get(re.sub(r'\.\d{3}$', '', obj.name)) or raw_by_name.get(obj.data.name)
+        me = obj.data
+        if src is None or len(src['verts']) != len(me.vertices) or not src.get('bone_names'):
+            continue
+        n = min(16, len(me.vertices))
+        co = np.empty(len(me.vertices) * 3)
+        me.vertices.foreach_get('co', co)
+        if np.abs(co.reshape(-1, 3)[:n] - np.array([v['co'] for v in src['verts'][:n]])).max() > 1e-3:
+            continue                                   # the importer already fitted it
+        ts = []
+        for bn, bm in zip(src['bone_names'], src['bone_mats']):
+            b = bones.get(bn)
+            if b is None:
+                continue
+            try:
+                # rest @ bind^-1, and bind^-1 is the bone table's own matrix
+                ts.append(b.matrix_local @ _milo_to_blender_matrix(bm))
+            except Exception:
+                continue
+        if not ts:
+            continue
+        t0 = ts[0]
+        if any(max(abs(a - c) for ra, rc in zip(t, t0) for a, c in zip(ra, rc)) > tolerance
+               for t in ts[1:]):
+            continue                                   # not one shared frame
+        if max(abs(a - c) for ra, rc in zip(t0, Matrix.Identity(4))
+               for a, c in zip(ra, rc)) < 1e-3:
+            continue                                   # already where the rig wants it
+        to_obj = obj.matrix_world.inverted() @ armature.matrix_world
+        me.transform(to_obj @ t0 @ to_obj.inverted())
+        mirrored = t0.to_3x3().determinant() < 0
+        if mirrored:
+            me.flip_normals()
+        me.update()
+        done.append((obj.name, 'mirror' if mirrored else 'moved'))
     return done
 
 
@@ -1621,6 +1700,14 @@ class IMPORT_OT_rb2_character(bpy.types.Operator, ImportHelper):
                              f"{', '.join(mounted)}")
                 except Exception as e:
                     _log(f"    attaching to the rig failed: {e}")
+            if armature is not None:
+                try:
+                    for name, how in frame_correct_meshes(armature, new_objs, mesh_src):
+                        _log(f"    '{name}': stored in a frame of its own "
+                             f"({'mirrored' if how == 'mirror' else 'shifted'}) - placed "
+                             f"through its bones as the game does")
+                except Exception as e:
+                    _log(f"    frame check failed: {e}")
             if mesh_src != milo:
                 new_objs += self._variant_fur_meshes(context, milo, armature)
             for o in new_objs:

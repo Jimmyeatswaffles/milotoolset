@@ -324,18 +324,36 @@ def write_tbrb_char_collide(w: MiloWriter, shape=1, radius0=0.5, length0=0.0, le
         w.block(END_MARKER)
 
 
+# CharHair revision 11 is what Rock Band 3 and Dance Central 1 load. Other games' .hair
+# revisions haven't been checked against retail files, so the export is limited to these.
+HAIR_EXPORT_GAMES = ('rb3', 'dc1')
+
+
+def exported_hair_files(hair):
+    """[(file name or "", physics source, strands, hair flags)] for an armature's hair
+    setup: its .hair files marked for export, or - for a setup made before multiple .hair
+    files existed - the armature-level strands as one file, exactly as before."""
+    files = getattr(hair, 'files', None)
+    if files is not None and len(files):
+        return [(f.name.strip(), f, f.strands, int(f.hair_flags)) for f in files if f.export]
+    if len(hair.strands):
+        return [("", hair, hair.strands, 0)]
+    return []
+
+
 def _hair_bone_names(armatures_used):
-    """Returns the set of all bone names referenced by any enabled hair strand across
+    """Returns the set of all bone names referenced by any exported hair strand across
     the given armatures - i.e. exactly the custom physics bones that need to exist as
-    Trans entries for the .hair file to have something to drive."""
+    Trans entries for the .hair files to have something to drive."""
     names = set()
     for armature_obj in armatures_used.values():
         hair = getattr(armature_obj.data, "gltfmilo_hair", None)
         if hair is None or not hair.enabled:
             continue
-        for strand in hair.strands:
-            for item in strand.bones:
-                names.add(item.name)
+        for _name, _phys, strands, _flags in exported_hair_files(hair):
+            for strand in strands:
+                for item in strand.bones:
+                    names.add(item.name)
     return names
 
 
@@ -377,7 +395,8 @@ def hair_profile_for_game(game):
 
 def build_char_hair_entries(armatures_used, root_name, zero_rotation=False):
     """Builds CharHair (.hair) entries from any armatures whose gltfmilo_hair.enabled
-    is set and that have at least one strand. Returns a list of
+    is set: one entry per .hair file marked for export (see exported_hair_files) that has
+    at least one strand. Returns a list of
     (entry_name, settings_dict, strands_list) tuples for build_milo_bytes /
     write_char_hair. Point positions/lengths and the base/root matrices are derived
     from each bone's rest transform; the engine's Hookup() largely recomputes them at
@@ -402,111 +421,124 @@ def build_char_hair_entries(armatures_used, root_name, zero_rotation=False):
     What actually breaks is MIXING them - real rotations on the Trans entries with
     identity matrices here (or vice versa) is the disagreement that twists strands."""
     entries = []
+    used_names = set()
+    unnamed = 0
     for armature_obj in armatures_used.values():
         hair = getattr(armature_obj.data, "gltfmilo_hair", None)
-        if hair is None or not hair.enabled or len(hair.strands) == 0:
+        if hair is None or not hair.enabled:
+            continue
+        for file_name, phys, strands, hair_flags in exported_hair_files(hair):
+            if not len(strands):
+                continue
+            if file_name:
+                base = sanitize_milo_name(file_name)
+            else:
+                # Unnamed files take the milo's name - what a single .hair was always
+                # called - with a number from the second one on.
+                unnamed += 1
+                base = sanitize_milo_name(root_name) + ("" if unnamed == 1 else f"_{unnamed}")
+            if base.lower().endswith('.hair'):
+                base = base[:-5]
+            entry_name, n = f"{base}.hair", 2
+            while entry_name.lower() in used_names:
+                entry_name, n = f"{base}_{n}.hair", n + 1
+            used_names.add(entry_name.lower())
+            strands_out = _build_hair_strands(armature_obj, strands, hair_flags, zero_rotation)
+            if strands_out:
+                settings = {key: getattr(phys, key) for key in
+                            ('stiffness', 'torsion', 'inertia', 'gravity', 'weight',
+                             'friction', 'min_slack', 'max_slack', 'simulate')}
+                settings['wind'] = DEFAULT_HAIR_WIND
+                settings['hair_flags'] = hair_flags
+                entries.append((entry_name, settings, strands_out))
+    return entries
+
+
+def _build_hair_strands(armature_obj, strands, hair_flags, zero_rotation):
+    """The strand dicts write_char_hair takes, for one .hair file's strands. Each strand's
+    hookup flags are its own OR-ed with the file's Hair Flags."""
+    strands_out = []
+    for strand in strands:
+        bone_names = [item.name for item in strand.bones]
+        if not bone_names:
             continue
 
-        settings = {
-            'stiffness': hair.stiffness,
-            'torsion': hair.torsion,
-            'inertia': hair.inertia,
-            'gravity': hair.gravity,
-            'weight': hair.weight,
-            'friction': hair.friction,
-            'min_slack': hair.min_slack,
-            'max_slack': hair.max_slack,
-            'simulate': hair.simulate,
-            'wind': DEFAULT_HAIR_WIND,
-        }
-
-        strands_out = []
-        for strand in hair.strands:
-            bone_names = [item.name for item in strand.bones]
-            if not bone_names:
+        # Gather the chain's world head positions first: each point's `length` refers
+        # to the gap with the PREVIOUS point, so the whole chain has to be known.
+        chain = []
+        for bname in bone_names:
+            bone = armature_obj.data.bones.get(bname)
+            if bone is None:
                 continue
+            world_head = armature_obj.matrix_world @ bone.head_local
+            chain.append((bname, bone, world_head))
 
-            # Gather the chain's world head positions first: each point's `length` refers
-            # to the gap with the PREVIOUS point, so the whole chain has to be known.
-            chain = []
-            for bname in bone_names:
-                bone = armature_obj.data.bones.get(bname)
-                if bone is None:
-                    continue
-                world_head = armature_obj.matrix_world @ bone.head_local
-                chain.append((bname, bone, world_head))
-
-            points = []
-            for idx, (bname, bone, world_head) in enumerate(chain):
-                # `length` is the rest span the solver holds each segment to, and it means
-                # "the span of MY bone" - the distance from this point to the next one in
-                # the strand. The tip has no next point, so retail repeats the previous
-                # span rather than inventing a value; every vanilla strand checked (RB3's
-                # hair_ladylayered and a vanilla DC1 character, 33 segments) ends with its
-                # last two lengths identical.
-                #
-                # Three earlier mistakes, all of which shipped and all of which are worth
-                # naming so they don't come back:
-                #   * Blender's bone.length is the bone's own head->tail DISPLAY length. It
-                #     only equals the chain gap when bones are connected head-to-tail, so
-                #     disconnected physics bones all report the same arbitrary value.
-                #   * Falling back to bone.length for the TIP point gave it a meaningless
-                #     span (1.0 on a default-length bone) and collapsed the end of a strand.
-                #   * Measuring the FIRST point back to its anchor bone stretches the strand
-                #     badly: the anchor is usually bone_head.mesh, whose origin sits deep in
-                #     the skull, so that distance came out 2.2-2.8x the real segment span
-                #     (5.36 where the actual gap was 2.27) and the root segment visibly
-                #     over-extended. A single-bone strand got ONLY that inflated number.
-                if idx + 1 < len(chain):
-                    seg_length = (chain[idx + 1][2] - world_head).length
-                elif len(chain) >= 2:
-                    seg_length = points[-1]['length']      # tip: repeat the previous span
-                else:
-                    seg_length = bone.length               # lone bone: nothing to measure
-                points.append({
-                    'pos': (world_head.x, world_head.y, world_head.z),
-                    'bone': bname,
-                    'length': seg_length,
-                    'radius': 0.0,
-                    'outer_radius': -1.0,
-                    'side_length': -1.0,
-                })
-
-            root_bone = armature_obj.data.bones.get(bone_names[0])
-            if root_bone is None or zero_rotation:
-                # Bones were written with their local rotation zeroed, so the strand's
-                # reference frame has to be identity to match them.
-                base_mat = IDENTITY_MATRIX3
+        points = []
+        for idx, (bname, bone, world_head) in enumerate(chain):
+            # `length` is the rest span the solver holds each segment to, and it means
+            # "the span of MY bone" - the distance from this point to the next one in
+            # the strand. The tip has no next point, so retail repeats the previous
+            # span rather than inventing a value; every vanilla strand checked (RB3's
+            # hair_ladylayered and a vanilla DC1 character, 33 segments) ends with its
+            # last two lengths identical.
+            #
+            # Three earlier mistakes, all of which shipped and all of which are worth
+            # naming so they don't come back:
+            #   * Blender's bone.length is the bone's own head->tail DISPLAY length. It
+            #     only equals the chain gap when bones are connected head-to-tail, so
+            #     disconnected physics bones all report the same arbitrary value.
+            #   * Falling back to bone.length for the TIP point gave it a meaningless
+            #     span (1.0 on a default-length bone) and collapsed the end of a strand.
+            #   * Measuring the FIRST point back to its anchor bone stretches the strand
+            #     badly: the anchor is usually bone_head.mesh, whose origin sits deep in
+            #     the skull, so that distance came out 2.2-2.8x the real segment span
+            #     (5.36 where the actual gap was 2.27) and the root segment visibly
+            #     over-extended. A single-bone strand got ONLY that inflated number.
+            if idx + 1 < len(chain):
+                seg_length = (chain[idx + 1][2] - world_head).length
+            elif len(chain) >= 2:
+                seg_length = points[-1]['length']      # tip: repeat the previous span
             else:
-                # Bones keep their real rotation, so the strand's reference frame must be
-                # the root bone's real Trans LOCAL rotation - the same value
-                # build_armature_trans_entries writes into that bone's localXfm. Retail
-                # DC1 files store exactly this (base_mat == root bone's Trans local
-                # rotation, matching to 0.0000). Taking the first 9 floats of the milo
-                # 4x3 is the rotation basis; the last 3 are translation, which Matrix3
-                # doesn't carry.
-                world_xfm = armature_obj.matrix_world @ root_bone.matrix_local
-                if root_bone.parent is not None:
-                    parent_world = armature_obj.matrix_world @ root_bone.parent.matrix_local
-                    local_xfm = parent_world.inverted() @ world_xfm
-                else:
-                    local_xfm = world_xfm
-                base_mat = tuple(_matrix_to_milo(local_xfm)[:9])
-
-            strands_out.append({
-                'root': bone_names[0],
-                'angle': strand.angle,
-                'points': points,
-                'base_mat': base_mat,
-                'root_mat': base_mat,
-                'hookup_flags': strand.hookup_flags,
+                seg_length = bone.length               # lone bone: nothing to measure
+            points.append({
+                'pos': (world_head.x, world_head.y, world_head.z),
+                'bone': bname,
+                'length': seg_length,
+                'radius': 0.0,
+                'outer_radius': -1.0,
+                'side_length': -1.0,
             })
 
-        if strands_out:
-            entry_name = f"{sanitize_milo_name(root_name)}.hair"
-            entries.append((entry_name, settings, strands_out))
+        root_bone = armature_obj.data.bones.get(bone_names[0])
+        if root_bone is None or zero_rotation:
+            # Bones were written with their local rotation zeroed, so the strand's
+            # reference frame has to be identity to match them.
+            base_mat = IDENTITY_MATRIX3
+        else:
+            # Bones keep their real rotation, so the strand's reference frame must be
+            # the root bone's real Trans LOCAL rotation - the same value
+            # build_armature_trans_entries writes into that bone's localXfm. Retail
+            # DC1 files store exactly this (base_mat == root bone's Trans local
+            # rotation, matching to 0.0000). Taking the first 9 floats of the milo
+            # 4x3 is the rotation basis; the last 3 are translation, which Matrix3
+            # doesn't carry.
+            world_xfm = armature_obj.matrix_world @ root_bone.matrix_local
+            if root_bone.parent is not None:
+                parent_world = armature_obj.matrix_world @ root_bone.parent.matrix_local
+                local_xfm = parent_world.inverted() @ world_xfm
+            else:
+                local_xfm = world_xfm
+            base_mat = tuple(_matrix_to_milo(local_xfm)[:9])
 
-    return entries
+        strands_out.append({
+            'root': bone_names[0],
+            'angle': strand.angle,
+            'points': points,
+            'base_mat': base_mat,
+            'root_mat': base_mat,
+            'hookup_flags': int(strand.hookup_flags) | int(hair_flags),
+        })
+    return strands_out
 
 
 def build_char_collide_entries(armatures_used, root_name):

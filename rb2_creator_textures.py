@@ -480,7 +480,7 @@ class MiloTextures:
     """What one texture/item milo offers: its material slots, textures, cfg choices."""
 
     def __init__(self, dir_name, slots, texs, choices, cfgs, notes, rendered,
-                 skin_source=None, makeup_rects=None):
+                 skin_source=None, makeup_rects=None, palettes=None):
         self.dir_name = dir_name
         self.slots = slots          # [slot dict]
         self.texs = texs            # {tex name: parsed tex}, real pixels preferred
@@ -493,6 +493,10 @@ class MiloTextures:
         self.skin_source = skin_source
         # {'eyes'|'lips': (x, y from top, w, h)} - where the head's skin proxy draws makeup.
         self.makeup_rects = makeup_rects or {}
+        # Palettes the milo carries itself. Most are unused (rings_chief.pal), but a cfg
+        # can name one: moddress_dottree's colour 1 is torso_cloth_doubledots.pal, which is
+        # only in that milo (its index 7 is the dress's orange, #FF8040).
+        self.palettes = palettes or {}
 
 
 def _has_pixels(tex):
@@ -514,6 +518,7 @@ def read_texture_milo(filepath):
     skin_source = None
     makeup_rects = {}
     furs, mat_raw = {}, {}
+    item_palettes = {}
     for o in objs:
         etype, ename, data = o['type'], o['name'], o['data']
         try:
@@ -525,6 +530,9 @@ def read_texture_milo(filepath):
             if etype == 'Fur':
                 from .rb2_fur import parse_fur
                 furs[ename] = parse_fur(data)
+                continue
+            if etype == 'ColorPalette':
+                item_palettes.setdefault(ename, parse_palette(data, ename))
                 continue
             if etype == 'Tex':
                 tex = parse_tex(data, ename)
@@ -576,7 +584,7 @@ def read_texture_milo(filepath):
                 sl['placeholder_names'] = (sl.get('placeholder_names', '') + ' ' + v).strip()
                 sl[k] = ''
     return MiloTextures(dir_name, slots, texs, choices, cfgs, notes, rendered, skin_source,
-                        makeup_rects)
+                        makeup_rects, item_palettes)
 
 
 # ---------------------------------------------------------------------------------------
@@ -996,9 +1004,24 @@ def _set_render_method(mat, alpha_cut):
                 break
 
 
+def _image_has_alpha(img):
+    """Whether an image's alpha actually varies. DXT1 textures (nightcat_diffuse.tex)
+    have no alpha channel and decode fully opaque - read as a keep mask, that keeps every
+    pixel its own colour and the palette never shows."""
+    import numpy as np
+    w, h = img.size
+    if not w or not h:
+        return False
+    px = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(px)
+    return float(px[3::4].min()) < 0.99
+
+
 def alpha_keeps(pg):
     """Whether the diffuse alpha is the keep mask (skin, eyes, one-colour items) rather
     than the colour-2 selector (two-colour items)."""
+    if not pg.id_data.get("rb2_diffuse_alpha", True):
+        return False             # no alpha in the texture (DXT1): nothing to keep
     if pg.id_data.get("rb2_fur"):
         return False             # fur: the diffuse alpha is the strand mask (coverage)
     if pg.id_data.get("rb2_alpha_coverage"):
@@ -1868,6 +1891,19 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
         pal_ok, pal_msg = ensure_palettes(context, filepath)
         if not pal_ok:
             _log(f"  {pal_msg}")
+    # A cfg can name a palette only its own milo carries (moddress_dottree ->
+    # torso_cloth_doubledots.pal): add the milo's palettes the store doesn't have yet.
+    wanted = {c.get(f'palette{ch}') for c in choices for ch in (1, 2)} | {
+        p for c in choices for pair in c.get('entries', {}).values() for p in pair}
+    item_pals = {n: v for n, v in getattr(info, 'palettes', {}).items() if n in wanted}
+    if item_pals:
+        have = dict(_palettes(context))
+        new = {n: v for n, v in item_pals.items() if n not in have}
+        if new:
+            have.update(new)
+            store_palettes(context.scene, have,
+                           context.scene.get("rb2cc_palettes_source", ""))
+            _log(f"  item palette(s) from {os.path.basename(filepath)}: {', '.join(new)}")
 
     if skin_dir is None:
         skin_dir = bpy.path.abspath(context.scene.rb2cc.skin_texture_dir) \
@@ -1922,6 +1958,7 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
                 img = build_image(name, tex, img_role, flip_green)
                 if img_role == 'diffuse':
                     img.alpha_mode = 'CHANNEL_PACKED'   # alpha is data, not coverage
+                    img["rb2_has_alpha"] = _image_has_alpha(img)
                 images[key] = img
             except (TextureImportError, ValueError) as e:
                 _log(f"  couldn't decode '{name}': {e}")
@@ -1960,6 +1997,11 @@ def dress_jobs(context, info, jobs, filepath, flip_green=True, choice_indices=No
             pg[f"sel_index{ch}"] = idx
             if pal and pal_ok and pal not in _palettes(context):
                 _log(f"  '{m.name}': palette '{pal}' isn't in the palettes milo")
+        dimg = images.get((sl.get('diffuse_tex'), 'diffuse'))
+        if dimg is None:
+            dnode = m.node_tree.nodes.get("RB2CC_Diffuse") if m.node_tree else None
+            dimg = getattr(dnode, 'image', None)
+        m["rb2_diffuse_alpha"] = bool(dimg.get("rb2_has_alpha", True)) if dimg else False
         wire_diffuse_alpha(m, alpha_keeps(pg))
         if kind == 'SKIN' and info.makeup_rects:
             m["rb2_makeup_rects"] = json.dumps(info.makeup_rects)

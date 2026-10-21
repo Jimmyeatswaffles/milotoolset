@@ -231,12 +231,72 @@ def _closest_on_path(points, path):
     return best, best_d
 
 
-def squeeze(points, weights, cu, chain=None):
+SHELL_MARGIN = 0.08          # how far inside the squeezing item's inner wall to stay
+_Z_BIN = 0.5
+FADE = 0.75                  # units over which the squeeze fades out at the cuff's ends
+SOFT = 0.75                  # the soft limit starts compressing at this fraction of it
+
+
+def _cuff_frame(points, world):
+    return np.c_[points, np.ones(len(points))] @ np.linalg.inv(world)
+
+
+def shell_profile(shell_points, cu):
+    """The squeezing item's wall along this cuff: (bin heights, distances) - one robust
+    value per height (the 15th percentile of the item's own vertices' distance from the
+    axis, on this cuff's side), so the limit doesn't jump from vertex to vertex on a
+    low-poly boot. None when the item doesn't reach the cuff."""
+    if shell_points is None or not len(shell_points):
+        return None
+    p = _cuff_frame(shell_points, np.array(cu['world']))
+    x, y, z = p[:, 0], p[:, 1], p[:, 2]
+    d = np.hypot(x, y)
+    (r0, o0), _m, (r2, o2) = cu['shape']
+    reach = max(float(cu.get('outer') or 0.0), r2) * 1.15
+    sel = (d < reach) & (z > o0 - 1.0) & (z < o2 + 1.0)
+    if sel.sum() < 4:
+        return None
+    zb = np.floor(z[sel] / _Z_BIN).astype(int)
+    heights, walls = [], []
+    for k in range(zb.min(), zb.max() + 1):
+        m = zb == k
+        if m.sum() >= 2:
+            heights.append((k + 0.5) * _Z_BIN)
+            walls.append(float(np.percentile(d[sel][m], 15)))
+    if not heights:
+        return None
+    walls = np.array(walls)
+    if len(walls) >= 3:                       # light smoothing along the height
+        walls = np.convolve(np.pad(walls, 1, mode='edge'), [0.25, 0.5, 0.25], 'valid')
+    return np.array(heights), walls
+
+
+def _soft_limit(r, limit):
+    """Distances above SOFT x limit are compressed smoothly toward the limit, never past
+    it and never out of order - a clamp folds cloth where neighbours fall either side."""
+    a0 = SOFT * limit
+    span = np.maximum(limit - a0, 1e-6)
+    over = np.maximum(r - a0, 0.0)
+    return np.where(r > a0, a0 + span * (1.0 - np.exp(-over / span)), r)
+
+
+def squeeze(points, weights, cu, chain=None, shell=None):
     """Armature-space points (N x 3) squeezed by one cuff; weights (N) = how much each point
     belongs to the cuff's bone subtree; chain = armature-space joint positions below the cuff
-    (ankle, toe ...) for the deep, closed part. Returns (new points, count squeezed)."""
+    (ankle, toe ...) for the deep, closed part; shell = the squeezing item's own vertices
+    (armature space) - its wall. Returns (new points, count moved).
+
+    Within the cuff's length a point's distance from the axis is held under the profile -
+    and, where the item's wall is known, just inside that wall. The cuff's numbers alone
+    can't serve both items seen: studdedcowboyboots' middle ring (2.4) is wider than its
+    own rim (~2.1), so the profile leaves the jeans poking through, while kissboots' outer
+    radius (5.5) is so much wider than its profile (2.5) that scaling by the ratio pinches
+    the flares inside a wide boot top. The wall fits both. The limit is soft (no folding)
+    and fades over the cuff's last FADE units, so the cloth doesn't tear where the squeeze
+    starts and stops. Past the inner ring of a closed cuff the inner radius holds, around
+    the leg (chain) rather than the cuff's straight axis."""
     world = np.array(cu['world'])                           # row-vector cuff -> armature
-    p = np.c_[points, np.ones(len(points))] @ np.linalg.inv(world)
+    p = _cuff_frame(points, world)
     x, y, z = p[:, 0], p[:, 1], p[:, 2]
     d = np.hypot(x, y)
     safe = np.where(d > 1e-6, d, 1.0)
@@ -244,32 +304,44 @@ def squeeze(points, weights, cu, chain=None):
     e2 = cu['ecc'] ** 2
     den = y * y / e2 + x * x
     ecc = np.sqrt((y * y + x * x) / np.where(den > 1e-12, den, 1.0))
-    (r0, o0), _mid, _out = cu['shape']
+    (r0, o0), _mid, (_r2, o2) = cu['shape']
     r, limited = _profile(cu, z)
     deep = np.zeros(len(z), dtype=bool)
     if not cu['open'] and chain:
-        deep = z < o0
-        limited = limited & ~deep
-    allowed = r * ecc
+        deep = z < o0                 # profile squeeze too, then handed over to the leg
+    allowed = r.copy()
+    wall = shell_profile(shell, cu)
+    if wall is not None:
+        heights, walls = wall
+        w_at = np.interp(z, heights, walls, left=np.inf, right=np.inf)
+        allowed = np.minimum(allowed, np.maximum(w_at - SHELL_MARGIN, 0.05))
+    allowed = allowed * ecc
     wts = np.clip(weights, 0.0, 1.0)
-    hit = limited & (d > allowed) & (weights > 1e-4)
-    k = np.where(hit, allowed / safe, 1.0)
-    k = 1.0 + (k - 1.0) * wts
+    # fade in from the cuff's top end (o2) downward
+    fade = np.clip((o2 - z) / FADE, 0.0, 1.0)
+    target = _soft_limit(d, allowed)
+    new_d = d + (target - d) * fade * wts
+    moved = limited & (weights > 1e-4) & (new_d < d - 1e-5)
+    k = np.where(moved, new_d / safe, 1.0)
     p[:, 0] *= k
     p[:, 1] *= k
     out = (p @ world)[:, :3]
-    count = int(hit.sum())
+    count = int(moved.sum())
     if deep.any():
-        # Inside the boot past the inner ring: hold the inner radius around the leg itself.
+        # Inside the boot past the inner ring: hold the inner radius around the leg itself,
+        # blending in over FADE below the ring so the two regions meet smoothly.
         start = (np.array([0.0, 0.0, o0, 1.0]) @ world)[:3]
         path = np.vstack([start, np.asarray(chain, dtype=float)])
         pts = points[deep]
         c, dist = _closest_on_path(pts, path)
-        over = (dist > r0) & (weights[deep] > 1e-4)
-        f = np.where(over, r0 / np.where(dist > 1e-6, dist, 1.0), 1.0)
+        tgt = _soft_limit(dist, np.full(len(dist), r0))
+        blend = np.clip((o0 - z[deep]) / FADE, 0.0, 1.0)
+        # what the profile part would give at the ring, faded into the leg-following hold
+        f = np.where(dist > 1e-6, tgt / np.where(dist > 1e-6, dist, 1.0), 1.0)
         f = 1.0 + (f - 1.0) * wts[deep]
-        out[deep] = c + (pts - c) * f[:, None]
-        count += int(over.sum())
+        deep_pts = c + (pts - c) * f[:, None]
+        out[deep] = out[deep] * (1 - blend[:, None]) + deep_pts * blend[:, None]
+        count += int(((f < 1.0) & (weights[deep] > 1e-4)).sum())
     return out, count
 
 
@@ -318,7 +390,27 @@ def apply_cuffs(parts, arm_obj):
     arm_inv = np.array(arm_obj.matrix_world.inverted())
     results = []
     deltas = {}
+    def shell_of(category):
+        """The squeezing item's own vertices, in armature space."""
+        pts = []
+        for c, _f, objs in parts:
+            if c != category:
+                continue
+            for o in objs:
+                if o.type != 'MESH' or not len(o.data.vertices):
+                    continue
+                me = o.data
+                co = np.empty(len(me.vertices) * 3)
+                src = me.shape_keys.reference_key.data if me.shape_keys else me.vertices
+                src.foreach_get('co', co)
+                m = arm_inv @ np.array(o.matrix_world)
+                pts.append((np.c_[co.reshape(-1, 3), np.ones(len(me.vertices))] @ m.T)[:, :3])
+        return np.vstack(pts) if pts else None
+    shells = {}
+
     for _cat, name, cu, ignore in winners:
+        if _cat not in shells:
+            shells[_cat] = shell_of(_cat)
         targets = [o for c, _f, objs in parts if c == cu['category'] for o in objs
                    if o.type == 'MESH' and _BLENDER_DUP.sub('', o.name) not in ignore
                    and _stem(_BLENDER_DUP.sub('', o.name)) not in ignore]
@@ -356,7 +448,7 @@ def apply_cuffs(parts, arm_obj):
                 co = co.reshape(n, 3)
             to_arm = arm_inv @ np.array(obj.matrix_world)
             p_arm = (np.c_[co, np.ones(n)] @ to_arm.T)[:, :3]
-            moved, count = squeeze(p_arm, w, cu, chain)
+            moved, count = squeeze(p_arm, w, cu, chain, shells.get(_cat))
             back = np.c_[moved, np.ones(n)] @ np.linalg.inv(to_arm).T
             deltas[obj.name] = back[:, :3]
             results.append((name, obj.name, count))

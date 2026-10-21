@@ -60,7 +60,7 @@ from .gh2_exporter import (
     check_gh2_root_bones, GH2_OPTIONAL_DONOR_TYPES,
     write_gh2_rnd_mat, write_gh2_rnd_tex, build_gh2_texture_blocks,
 )
-from .physics_exporter import _hair_bone_names, hair_profile_for_game
+from .physics_exporter import _hair_bone_names, hair_profile_for_game, HAIR_EXPORT_GAMES
 from .skeleton_exporter import _read_skeleton_milo_trans, _trans_world_translation
 
 
@@ -656,22 +656,38 @@ class GltfMiloHairStrand(bpy.types.PropertyGroup):
                      "(hookup_flags & collide.flags != 0). Set this to the OR of the group "
                      "bits of every collision volume you want this strand to bump against. "
                      "e.g. 63 (= 1+2+4+8+16+32) collides with volumes in groups 1 through 6. "
-                     "If 0, this strand collides with nothing",
+                     "If 0 (and the .hair file's Hair Flags are 0), this strand collides "
+                     "with nothing. The file's Hair Flags are added to this on export",
         default=1, min=0,
     )
     bones: CollectionProperty(type=GltfMiloHairBoneItem)
 
 
-class GltfMiloHairSettings(bpy.types.PropertyGroup):
-    """Armature-level CharHair physics settings + the list of authored strands.
-    Float defaults match the values seen in real RB3 .hair files (see the reference
-    screenshot: stiffness/torsion 0.1, inertia 0.65, gravity 1.0, weight 0.5)."""
-    enabled: BoolProperty(
-        name="Export CharHair (.hair) for this Armature",
-        description="When on (and 'Export Hair Physics' is enabled in the exporter), "
-                     "embeds a CharHair asset built from the strands below",
-        default=False,
-    )
+HAIR_PHYSICS_KEYS = ('simulate', 'stiffness', 'torsion', 'inertia', 'gravity', 'weight',
+                     'friction', 'min_slack', 'max_slack')
+
+
+class GltfMiloHairFile(bpy.types.PropertyGroup):
+    """One CharHair (.hair) file: its own strands and physics settings. An armature can
+    export several (e.g. one for the hair, one for a coat tail)."""
+    name: StringProperty(
+        name="File Name",
+        description="Exported as <name>.hair. Leave empty to use the milo's own name "
+                     "(what a single .hair was always called)",
+        default="")
+    export: BoolProperty(
+        name="Export",
+        description="Include this .hair file in the export",
+        default=True)
+    hair_flags: IntProperty(
+        name="Hair Flags",
+        description="A collision-group bitmask applied to every strand in this .hair "
+                     "file: it's OR-ed into each strand's own Hookup Flags when exported. "
+                     "A strand collides with a CharCollide volume when the result shares a "
+                     "bit with the volume's 'Collision Group Flags' - e.g. 63 (= 1+2+4+8+16"
+                     "+32) collides with groups 1 to 6. 0 leaves the strands' own flags as "
+                     "they are",
+        default=0, min=0)
     simulate: BoolProperty(
         name="Simulate Physics?",
         description="CharHair.simulate - run the hair/cloth physics simulation",
@@ -685,9 +701,75 @@ class GltfMiloHairSettings(bpy.types.PropertyGroup):
     friction: FloatProperty(name="Friction", description="CharHair.friction - hair friction against each other", default=0.0)
     min_slack: FloatProperty(name="Min Slack", description="CharHair.minSlack - if using sides, how far in it could go", default=0.0)
     max_slack: FloatProperty(name="Max Slack", description="CharHair.maxSlack - if using sides, how far out it could go", default=0.0)
-
     strands: CollectionProperty(type=GltfMiloHairStrand)
     active_strand_index: IntProperty(default=0)
+
+
+class GltfMiloHairSettings(bpy.types.PropertyGroup):
+    """Armature-level hair setup: the list of .hair files this armature exports. The
+    physics values and `strands` here are the single-file layout from before multiple
+    .hair files; they're still exported as-is until moved into a file (Add Hair File)."""
+    enabled: BoolProperty(
+        name="Export CharHair (.hair) for this Armature",
+        description="When on (and 'Export Hair Physics' is enabled in the exporter), "
+                     "embeds the .hair files listed below",
+        default=False,
+    )
+    files: CollectionProperty(type=GltfMiloHairFile)
+    active_file_index: IntProperty(default=0)
+
+    # pre-multi-file layout (one .hair per armature)
+    simulate: BoolProperty(
+        name="Simulate Physics?",
+        description="CharHair.simulate - run the hair/cloth physics simulation",
+        default=True,
+    )
+    stiffness: FloatProperty(name="Stiffness", description="CharHair.stiffness - stiffness of each strand", default=0.1)
+    torsion: FloatProperty(name="Torsion", description="CharHair.torsion - rotational stiffness of each strand", default=0.1)
+    inertia: FloatProperty(name="Inertia", description="CharHair.inertia - inertia of the hair, zero means none", default=0.65)
+    gravity: FloatProperty(name="Gravity", description="CharHair.gravity - gravity of the hair, one is normal", default=1.0)
+    weight: FloatProperty(name="Weight", description="CharHair.weight - weight of the hair, one is normal", default=0.5)
+    friction: FloatProperty(name="Friction", description="CharHair.friction - hair friction against each other", default=0.0)
+    min_slack: FloatProperty(name="Min Slack", description="CharHair.minSlack - if using sides, how far in it could go", default=0.0)
+    max_slack: FloatProperty(name="Max Slack", description="CharHair.maxSlack - if using sides, how far out it could go", default=0.0)
+    strands: CollectionProperty(type=GltfMiloHairStrand)
+    active_strand_index: IntProperty(default=0)
+
+
+def hair_file_label(hair_file, index):
+    """How a hair file is shown in the UI: its export name, or the milo-name default."""
+    if hair_file.name.strip():
+        return f"{hair_file.name.strip()}.hair"
+    return "<milo name>.hair" if index == 0 else f"<milo name>_{index + 1}.hair"
+
+
+def _active_hair_file(hair):
+    if 0 <= hair.active_file_index < len(hair.files):
+        return hair.files[hair.active_file_index]
+    return None
+
+
+def _new_hair_file(hair):
+    """Adds a hair file. The first one takes over a pre-multi-file setup (its strands
+    and physics values), so nothing authored before is lost."""
+    first = len(hair.files) == 0
+    f = hair.files.add()
+    if first:
+        f.name = ""
+        if len(hair.strands):
+            for key in HAIR_PHYSICS_KEYS:
+                setattr(f, key, getattr(hair, key))
+            for old in hair.strands:
+                st = f.strands.add()
+                st.name, st.angle, st.hookup_flags = old.name, old.angle, old.hookup_flags
+                for b in old.bones:
+                    st.bones.add().name = b.name
+            hair.strands.clear()
+            hair.active_strand_index = 0
+    else:
+        f.name = f"hair_{len(hair.files)}"
+    hair.active_file_index = len(hair.files) - 1
+    return f
 
 
 def _selected_bone_names(context, armature_obj):
@@ -786,15 +868,24 @@ class ARMATURE_OT_gltfmilo_create_hair_strand(bpy.types.Operator):
             return {'CANCELLED'}
 
         hair = armature_obj.data.gltfmilo_hair
-        strand = hair.strands.add()
-        strand.name = f"Strand {len(hair.strands)}"
+        hair_file = _active_hair_file(hair) or _new_hair_file(hair)
+        strand = hair_file.strands.add()
+        strand.name = f"Strand {len(hair_file.strands)}"
         for bone in ordered:
             item = strand.bones.add()
             item.name = bone.name
-        hair.active_strand_index = len(hair.strands) - 1
+        hair_file.active_strand_index = len(hair_file.strands) - 1
 
-        self.report({'INFO'}, f"Created '{strand.name}' from {len(ordered)} bone(s): "
-                              f"{' -> '.join(b.name for b in ordered)}")
+        used = {b.name: hair_file_label(f, i) for i, f in enumerate(hair.files)
+                for st in f.strands if st != strand for b in st.bones}
+        clash = [b.name for b in ordered if b.name in used]
+        msg = (f"Added '{strand.name}' to {hair_file_label(hair_file, hair.active_file_index)} "
+               f"from {len(ordered)} bone(s): {' -> '.join(b.name for b in ordered)}")
+        if clash:
+            self.report({'WARNING'}, msg + f". Already used by another strand: "
+                                           f"{', '.join(clash)}")
+        else:
+            self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -809,15 +900,95 @@ class ARMATURE_OT_gltfmilo_remove_hair_strand(bpy.types.Operator):
         obj = context.object
         if obj is None or obj.type != 'ARMATURE':
             return False
-        return len(obj.data.gltfmilo_hair.strands) > 0
+        f = _active_hair_file(obj.data.gltfmilo_hair)
+        return f is not None and len(f.strands) > 0
+
+    def execute(self, context):
+        f = _active_hair_file(context.object.data.gltfmilo_hair)
+        idx = f.active_strand_index
+        if 0 <= idx < len(f.strands):
+            f.strands.remove(idx)
+            f.active_strand_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class ARMATURE_OT_gltfmilo_add_hair_file(bpy.types.Operator):
+    """Add a .hair file to this armature's hair setup. Strands created from selected bones
+    go into the active file"""
+    bl_idname = "armature.gltfmilo_add_hair_file"
+    bl_label = "Add Hair File"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return obj is not None and obj.type == 'ARMATURE'
 
     def execute(self, context):
         hair = context.object.data.gltfmilo_hair
-        idx = hair.active_strand_index
-        if 0 <= idx < len(hair.strands):
-            hair.strands.remove(idx)
-            hair.active_strand_index = max(0, idx - 1)
+        had_legacy = len(hair.files) == 0 and len(hair.strands) > 0
+        f = _new_hair_file(hair)
+        if had_legacy:
+            self.report({'INFO'}, f"Moved the existing {len(f.strands)} strand(s) into "
+                                  f"{hair_file_label(f, 0)}")
         return {'FINISHED'}
+
+
+class ARMATURE_OT_gltfmilo_remove_hair_file(bpy.types.Operator):
+    """Remove the selected .hair file and its strands"""
+    bl_idname = "armature.gltfmilo_remove_hair_file"
+    bl_label = "Remove Hair File"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == 'ARMATURE'
+                and _active_hair_file(obj.data.gltfmilo_hair) is not None)
+
+    def execute(self, context):
+        hair = context.object.data.gltfmilo_hair
+        idx = hair.active_file_index
+        hair.files.remove(idx)
+        hair.active_file_index = max(0, min(idx, len(hair.files) - 1))
+        return {'FINISHED'}
+
+
+class ARMATURE_OT_gltfmilo_select_hair_bones(bpy.types.Operator):
+    """Select this .hair file's bones in Pose mode, to see which bones it drives"""
+    bl_idname = "armature.gltfmilo_select_hair_bones"
+    bl_label = "Select Bones"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.object
+        return (obj is not None and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+                and _active_hair_file(obj.data.gltfmilo_hair) is not None)
+
+    def execute(self, context):
+        obj = context.object
+        f = _active_hair_file(obj.data.gltfmilo_hair)
+        names = {b.name for st in f.strands for b in st.bones}
+        for pb in obj.pose.bones:
+            sel = pb.name in names
+            for target in (pb, getattr(pb, 'bone', None)):
+                if target is not None and hasattr(target, 'select'):
+                    try:
+                        target.select = sel
+                    except (AttributeError, TypeError):
+                        pass
+        self.report({'INFO'}, f"Selected {len(names)} bone(s)")
+        return {'FINISHED'}
+
+
+class DATA_UL_gltfmilo_hair_files(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        row = layout.row(align=True)
+        row.prop(item, "export", text="")
+        row.label(text=hair_file_label(item, index), icon='FILE')
+        n_bones = sum(len(st.bones) for st in item.strands)
+        row.label(text=f"{len(item.strands)} strand(s), {n_bones} bone(s)")
 
 
 class DATA_UL_gltfmilo_hair_strands(bpy.types.UIList):
@@ -827,8 +998,18 @@ class DATA_UL_gltfmilo_hair_strands(bpy.types.UIList):
         row.label(text=f"{len(item.bones)} bone(s)")
 
 
+def _hair_bone_owners(hair):
+    """{bone name: [(file label, strand name)]} across every .hair file of an armature."""
+    owners = {}
+    for i, f in enumerate(hair.files):
+        for st in f.strands:
+            for b in st.bones:
+                owners.setdefault(b.name, []).append((hair_file_label(f, i), st.name))
+    return owners
+
+
 class DATA_PT_gltfmilo_hair(bpy.types.Panel):
-    bl_label = "glTFMilo Hair Setup"
+    bl_label = "Rock Band Hair Setup"
     bl_idname = "DATA_PT_gltfmilo_hair"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
@@ -840,43 +1021,89 @@ class DATA_PT_gltfmilo_hair(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        hair = context.object.data.gltfmilo_hair
+        arm = context.object
+        hair = arm.data.gltfmilo_hair
 
         layout.prop(hair, "enabled")
-
         col = layout.column()
         col.enabled = hair.enabled
+        col.label(text="Exported with Rock Band 3 and Dance Central 1 only", icon='INFO')
 
-        col.operator("armature.gltfmilo_create_hair_strand", icon='ADD')
+        if len(hair.files) == 0 and len(hair.strands):
+            warn = col.box()
+            warn.label(text=f"{len(hair.strands)} strand(s) from the single-file setup",
+                       icon='ERROR')
+            warn.label(text="They still export as one .hair. Add Hair File moves them")
+            warn.label(text="into the list below so more files can be added.")
 
+        # --- .hair files ---
+        col.label(text=".hair Files", icon='FILE')
         row = col.row()
-        row.template_list("DATA_UL_gltfmilo_hair_strands", "", hair, "strands",
-                          hair, "active_strand_index", rows=3)
+        row.template_list("DATA_UL_gltfmilo_hair_files", "", hair, "files",
+                          hair, "active_file_index", rows=3)
+        side = row.column(align=True)
+        side.operator("armature.gltfmilo_add_hair_file", icon='ADD', text="")
+        side.operator("armature.gltfmilo_remove_hair_file", icon='REMOVE', text="")
+
+        hair_file = _active_hair_file(hair)
+        if hair_file is None:
+            col.operator("armature.gltfmilo_create_hair_strand", icon='ADD')
+            col.label(text="Creating a strand also creates the first .hair file")
+            return
+
+        box = col.box()
+        box.prop(hair_file, "name")
+        box.prop(hair_file, "hair_flags")
+
+        # --- strands of the active file ---
+        col.operator("armature.gltfmilo_create_hair_strand", icon='ADD')
+        row = col.row()
+        row.template_list("DATA_UL_gltfmilo_hair_strands", "", hair_file, "strands",
+                          hair_file, "active_strand_index", rows=3)
         side = row.column(align=True)
         side.operator("armature.gltfmilo_remove_hair_strand", icon='REMOVE', text="")
 
-        if 0 <= hair.active_strand_index < len(hair.strands):
-            strand = hair.strands[hair.active_strand_index]
+        if 0 <= hair_file.active_strand_index < len(hair_file.strands):
+            strand = hair_file.strands[hair_file.active_strand_index]
             box = col.box()
             box.prop(strand, "name")
             box.prop(strand, "angle")
             box.prop(strand, "hookup_flags")
-            box.label(text="Bones (root -> tip):")
-            for item in strand.bones:
-                box.label(text=f"    {item.name}", icon='BONE_DATA')
+            if hair_file.hair_flags:
+                box.label(text=f"Exported hookup flags: "
+                               f"{strand.hookup_flags | hair_file.hair_flags} "
+                               f"(with the file's Hair Flags)", icon='INFO')
 
+        # --- every bone this .hair file drives, read live from its strands ---
+        owners = _hair_bone_owners(hair)
+        idx = hair.active_file_index
+        bones_box = col.box()
+        head = bones_box.row()
+        head.label(text=f"Bones in {hair_file_label(hair_file, idx)} (root -> tip)",
+                   icon='BONE_DATA')
+        head.operator("armature.gltfmilo_select_hair_bones", text="", icon='RESTRICT_SELECT_OFF')
+        if not hair_file.strands:
+            bones_box.label(text="No strands yet - select a bone chain and click Create")
+        for si, st in enumerate(hair_file.strands):
+            active = si == hair_file.active_strand_index
+            bones_box.label(text=st.name, icon='STRANDS' if not active else 'RIGHTARROW')
+            sub = bones_box.column(align=True)
+            for b in st.bones:
+                missing = b.name not in arm.data.bones
+                shared = len(owners.get(b.name, ())) > 1
+                r = sub.row()
+                r.alert = missing or shared
+                note = "  (not in this armature)" if missing else \
+                    ("  (also in another strand)" if shared else "")
+                r.label(text=f"    {b.name}{note}",
+                        icon='ERROR' if (missing or shared) else 'BONE_DATA')
+
+        # --- physics, per file ---
         col.separator()
         box = col.box()
-        box.label(text="Physics Settings", icon='PHYSICS')
-        box.prop(hair, "simulate")
-        box.prop(hair, "stiffness")
-        box.prop(hair, "torsion")
-        box.prop(hair, "inertia")
-        box.prop(hair, "gravity")
-        box.prop(hair, "weight")
-        box.prop(hair, "friction")
-        box.prop(hair, "min_slack")
-        box.prop(hair, "max_slack")
+        box.label(text=f"Physics Settings ({hair_file_label(hair_file, idx)})", icon='PHYSICS')
+        for key in HAIR_PHYSICS_KEYS:
+            box.prop(hair_file, key)
         box.label(text="Wind: world.wind (fixed)", icon='FORCE_WIND')
 
 
@@ -1235,7 +1462,7 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                      "of george's, including their local transforms. Hair and cloth in the "
                      "outfit milo collide against these BY NAME, so a skeleton without them "
                      "is missing something the rest of the character expects. This is "
-                     "separate from the per-bone Milo Collision panel because TBRB puts "
+                     "separate from the per-bone Rock Band Collision Setup panel because TBRB puts "
                      "THREE volumes on bone_head.mesh, which the one-volume-per-bone UI "
                      "can't express. Turn off to use your own per-bone volumes instead",
         default=True,
@@ -1369,13 +1596,13 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
     )
     export_hair: BoolProperty(
         name="Export Hair Physics (.hair) (Experimental)",
-        description="Embeds a CharHair (.hair) asset for any armature that has "
-                     "'Export CharHair' enabled in its glTFMilo Hair Setup (in the "
-                     "armature Data properties). Format is confirmed against MiloLib "
-                     "and the RB3 decomp, but whether hair physics actually work from "
-                     "a generated .hair alone is untested - collision (.coll) files "
-                     "aren't implemented yet, so collisions won't work either way. "
-                     "Only applies to Type=Character",
+        description="Embeds the CharHair (.hair) files of every armature that has "
+                     "'Export CharHair' enabled in its Rock Band Hair Setup (in the "
+                     "armature Data properties). Rock Band 3 and Dance Central 1 only: "
+                     "the .hair writer is revision 11, which is what those two games use; "
+                     "other games' .hair revisions haven't been checked. Format is "
+                     "confirmed against MiloLib and the RB3 decomp. Applies to "
+                     "Type=Character and Instrument",
         default=False,
     )
     export_tangents: BoolProperty(
@@ -1665,8 +1892,11 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         row.enabled = (self.milo_type == 'character')
         row.prop(self, "hide_head")
         row = box.row()
-        row.enabled = (self.milo_type in ('character', 'instrument'))
+        row.enabled = (self.milo_type in ('character', 'instrument')
+                       and self.game in HAIR_EXPORT_GAMES)
         row.prop(self, "export_hair")
+        if self.game not in HAIR_EXPORT_GAMES:
+            box.label(text=".hair export is Rock Band 3 / Dance Central 1 only", icon='INFO')
         row = box.row()
         row.enabled = (self.milo_type == 'character')
         row.prop(self, "stock_rest_offsets")
@@ -2798,7 +3028,8 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
             # Either way the bones must not be claimed by the general pass below with
             # untracked rotation, or the two sides silently disagree.
             hair_bones_reserved = set()
-            if (self.export_hair and self.milo_type in ('character', 'instrument')
+            if (self.export_hair and self.game in HAIR_EXPORT_GAMES
+                    and self.milo_type in ('character', 'instrument')
                     and armatures_used):
                 hair_bones_reserved = _hair_bone_names(armatures_used)
                 if hair_bones_reserved:
@@ -2835,13 +3066,18 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
             _log(f"  Exported '{hide_entry_name}'.")
 
         char_hair_entries = []
-        if self.export_hair and self.milo_type in ('character', 'instrument') and armatures_used:
+        if self.export_hair and self.game not in HAIR_EXPORT_GAMES:
+            _log("  .hair export skipped: only Rock Band 3 and Dance Central 1 are "
+                 "supported (CharHair revision 11).")
+        if self.export_hair and self.game in HAIR_EXPORT_GAMES \
+                and self.milo_type in ('character', 'instrument') and armatures_used:
             _log("--- CharHair (.hair) ---")
             char_hair_entries = build_char_hair_entries(armatures_used, root_name,
                                                         zero_rotation=zero_hair_rotation)
             for (hair_entry_name, hair_settings, strands) in char_hair_entries:
                 total_points = sum(len(s['points']) for s in strands)
                 _log(f"Created CharHair '{hair_entry_name}': {len(strands)} strand(s), "
+                     f"hair flags {hair_settings.get('hair_flags', 0)}, "
                      f"{total_points} point(s) total, simulate={hair_settings['simulate']}, "
                      f"wind={hair_settings['wind']}.")
                 for s in strands:
@@ -2903,7 +3139,7 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                  f"all lists empty) so the instrument doesn't crash on select.")
 
         # CharCollide (.coll) volumes - gathered from any bone with collision enabled in
-        # the Bone properties "Milo Collision" panel. Independent of the export type; if a
+        # the Bone properties "Rock Band Collision Setup" panel. Independent of the export type; if a
         # bone has a volume authored, it gets emitted.
         char_collide_entries = []
         if armatures_used:
@@ -3346,7 +3582,7 @@ def _unregister_coll_draw_handler():
 
 
 class BONE_PT_gltfmilo_collision(bpy.types.Panel):
-    bl_label = "Milo Collision (.coll)"
+    bl_label = "Rock Band Collision Setup"
     bl_idname = "BONE_PT_gltfmilo_collision"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
@@ -3393,7 +3629,7 @@ class BONE_PT_gltfmilo_collision(bpy.types.Panel):
             col.prop(coll, "radius0", text="Size")
 
         col.prop(coll, "flags")
-        layout.label(text="Preview only - .coll export not wired up yet.", icon='INFO')
+        layout.label(text="Exported as <bone>.coll with the milo", icon='INFO')
 
 
 class OBJECT_PT_gltfmilo_object(bpy.types.Panel):
@@ -3468,7 +3704,7 @@ class _IMPORT_OT_milo_skeleton_rev25_base(bpy.types.Operator, ImportHelper):
     import_collisions: BoolProperty(
         name="Import Collision Volumes",
         description="Copy each CharCollide's shape/radius/length/flags onto its parent bone's "
-                     "Milo Collision panel. NOTE: the panel holds ONE volume per bone, and "
+                     "Rock Band Collision Setup panel. NOTE: the panel holds ONE volume per bone, and "
                      "TBRB puts three on bone_head.mesh - only the first is stored. Export "
                      "with 'Retail Head/Neck Collisions' on to emit all four correctly",
         default=True,
@@ -3574,7 +3810,7 @@ class _IMPORT_OT_milo_skeleton_base(bpy.types.Operator, ImportHelper):
     import_collisions: BoolProperty(
         name="Import Collision Volumes",
         description="Copy each CharCollide's shape/radius/length/flags onto its parent bone's "
-                     "Milo Collision panel. The panel holds ONE volume per bone; if a milo "
+                     "Rock Band Collision Setup panel. The panel holds ONE volume per bone; if a milo "
                      "puts more than one on the same bone only the first is stored",
         default=True,
     )
@@ -4692,9 +4928,14 @@ classes = (
     MATERIAL_PT_gltfmilo_refract,
     GltfMiloHairBoneItem,
     GltfMiloHairStrand,
+    GltfMiloHairFile,
     GltfMiloHairSettings,
     ARMATURE_OT_gltfmilo_create_hair_strand,
     ARMATURE_OT_gltfmilo_remove_hair_strand,
+    ARMATURE_OT_gltfmilo_add_hair_file,
+    ARMATURE_OT_gltfmilo_remove_hair_file,
+    ARMATURE_OT_gltfmilo_select_hair_bones,
+    DATA_UL_gltfmilo_hair_files,
     DATA_UL_gltfmilo_hair_strands,
     DATA_PT_gltfmilo_hair,
     GltfMiloObjectSettings,
