@@ -572,6 +572,7 @@ def find_viseme_clips_rev25(filepath):
 _MILO_VISEME_TAG = "milo_viseme"          # bool custom property on the Action
 _MILO_VISEME_NAME = "milo_viseme_name"    # original clip name (Action name may get suffixed)
 _MILO_VISEME_SET = "milo_viseme_set"      # source CharClipSet dir_name
+_MILO_VISEME_CONVENTION = "milo_viseme_convention"   # 'ROW' / 'COLUMN' measured on import
 
 # The animated-component suffix used by CharBonesSamples channel names. These say WHICH
 # transform component the samples drive, and are not part of the bone's identity.
@@ -886,6 +887,10 @@ def _build_viseme_action(armature_obj, clip_name, set_name, pose, bone_lookup=No
     action[_MILO_VISEME_TAG] = True
     action[_MILO_VISEME_NAME] = clip_name
     action[_MILO_VISEME_SET] = set_name
+    if rot_space == 'AUTO':
+        # The measured convention, so the DC1 viseme exporter can store rotations back the
+        # same way (it's that exporter's Auto setting).
+        action[_MILO_VISEME_CONVENTION] = convention
 
     slot = action.slots.new(id_type='OBJECT', name=armature_obj.name)
     channelbag = _get_or_create_channelbag(action, slot)
@@ -1346,6 +1351,21 @@ class IMPORT_OT_gdrb_viseme_set(_IMPORT_OT_viseme_set_base):
 
     def _find_clips(self, filepath):
         return find_viseme_clips_rev25(filepath)
+
+
+class IMPORT_OT_dc1_viseme_set(_IMPORT_OT_viseme_set_base):
+    """Import a Dance Central 1 viseme milo (Xbox 360) as one Action per named viseme on the
+    active armature - a starting point for the DC1 viseme export. DC1 stores its visemes
+    exactly as Rock Band 3 does (milo revision 28, CharClip version 19), so it's read with
+    the RB3 finder; all 30 clips of a retail DC1 viseme.milo_xbox parse"""
+    bl_idname = "import_scene.dc1_viseme_set"
+    bl_label = "Import DC1 Viseme Set (X360)"
+    _game_label = "DC1"
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+
+    def _find_clips(self, filepath):
+        return find_viseme_clips(filepath)
 
 
 class IMPORT_OT_rb2_viseme_set(_IMPORT_OT_viseme_set_base):

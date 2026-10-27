@@ -43,6 +43,7 @@ from .gh2_lipsync import *
 from .dc_clip_importer import *
 from .dc_routine_importer import *
 from .gdrb_clip_exporter import *
+from .rb3_clip_exporter import EXPORT_OT_rb3_clip_inject
 from .lipsync_importer import *
 from . import rb2_creator_textures
 from . import rb2_character_importer
@@ -1144,6 +1145,23 @@ def _milo_platform_items(self, context):
     )
 
 
+def _tbrb_vertex_format(platform):
+    """vertex_format for collect_mesh_entries on the TBRB export paths, chosen per console
+    so the two consoles stay separate.
+
+    Xbox 360 -> 'uncompressed'. TBRB writes the plain revision-34 vertex
+    (write_tbrb_rnd_mesh), whose bone indices pair with the weights in natural order.
+    The default 'compressed' setting applied the RB3 packed-vertex rule of REVERSING the
+    four bone indices on Xbox, so every weight drove the wrong bone (spiky, torn meshes
+    in-game). Confirmed by byte-diffing an Xbox TBRB export against the working PS3 one:
+    the bone indices were the only difference, stored back to front.
+
+    PS3 -> 'compressed', i.e. exactly what this path passed before the fix. PS3 was
+    already correct (natural index order) and is in-game verified, so its output is
+    left byte-for-byte unchanged."""
+    return 'uncompressed' if platform == 'xbox360' else 'compressed'
+
+
 def _milo_game_items(self, context):
     """Dynamic EnumProperty items for Game, with per-game icons (see
     _milo_platform_items for why this is a function). Dance Central 3 has no icon
@@ -1681,7 +1699,7 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
              "still reference the texture by its eventual '.tex' name, since that's what "
              "the finished, compiled asset the compiler produces will be called"),
         ),
-        default='tex',
+        default='png',
     )
     custom_song_mat_revision: EnumProperty(
         name="Material Revision",
@@ -2445,7 +2463,8 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                 offset_multiply_order=self.offset_multiply_order,
                 stock_reference_armature=None,
                 platform=self.platform,
-                include_tangents=self.export_tangents)
+                include_tangents=self.export_tangents,
+                vertex_format=_tbrb_vertex_format(self.platform))
         except BoneLimitExceeded as e:
             details = "; ".join(f"'{n}': {c} bones (max {MAX_BONES_PER_MESH})"
                                  for n, c in e.offenders)
@@ -2546,7 +2565,8 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                 offset_multiply_order=self.offset_multiply_order,
                 stock_reference_armature=None,
                 platform=self.platform,
-                include_tangents=self.export_tangents)
+                include_tangents=self.export_tangents,
+                vertex_format=_tbrb_vertex_format(self.platform))
         except BoneLimitExceeded as e:
             details = "; ".join(f"'{n}': {c} bones (max {MAX_BONES_PER_MESH})"
                                  for n, c in e.offenders)
@@ -3271,17 +3291,19 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
 def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_milo_scene.bl_idname, text="Milo Scene (.milo)",
                           icon_value=_milo_icon_id('MILO_EXPORT'))
-    # Patches an EXISTING viseme milo rather than producing a new scene, so it sits as
-    # its own entry. Needs an armature selected; the engine resolves the face's base
-    # pose by the clip name "Base", so only that one clip is rewritten.
-    self.layout.operator(EXPORT_OT_milo_inject_base_viseme.bl_idname,
-                          text="Inject New Base Viseme (Experimental)",
-                          icon_value=_milo_icon_id('TBRB'))
+    # A complete Dance Central 1 viseme milo built from face-only Actions on the selected
+    # armature: Base from its rest pose, every viseme rebuilt for the custom face.
+    self.layout.operator(EXPORT_OT_dc1_viseme_milo.bl_idname,
+                          text="Dance Central 1 Viseme Milo (.milo_xbox)",
+                          icon_value=_milo_icon_id('DC1'))
     # Loose GDRB animation clips (CharClipSamples) to compile into a milo by hand, like
     # the TBRB custom song asset export.
     self.layout.operator(EXPORT_OT_gdrb_raw_charclips.bl_idname,
                          text="Green Day: Rock Band Raw CharClips",
                          icon_value=_milo_icon_id('GDRB'))
+    self.layout.operator(EXPORT_OT_rb3_clip_inject.bl_idname,
+                         text="RB3 CharClip Into Song Milo (.milo_xbox)",
+                         icon_value=_milo_icon_id('RB3'))
 
 
 def _coll_redraw(self, context):
@@ -4646,6 +4668,9 @@ class TOPBAR_MT_milo_viseme_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_viseme_set.bl_idname,
                         text="Green Day: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        layout.operator(IMPORT_OT_dc1_viseme_set.bl_idname,
+                        text="Dance Central 1 (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC1'))
         layout.operator(IMPORT_OT_gh2_viseme_set.bl_idname,
                         text="Guitar Hero 2 (.milo_xbox)",
                         icon_value=_milo_icon_id('GH2'))
@@ -4969,14 +4994,16 @@ classes = (
     IMPORT_OT_gh2_meshes,
     IMPORT_OT_rb3_viseme_set,
     IMPORT_OT_gdrb_viseme_set,
+    IMPORT_OT_dc1_viseme_set,
     IMPORT_OT_rb2_viseme_set,
     IMPORT_OT_tbrb_viseme_set,
     IMPORT_OT_gh2_viseme_set,
     IMPORT_OT_gh2_voc,
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
-    EXPORT_OT_milo_inject_base_viseme,
+    EXPORT_OT_dc1_viseme_milo,
     EXPORT_OT_gdrb_raw_charclips,
+    EXPORT_OT_rb3_clip_inject,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
     TOPBAR_MT_milo_mesh_import,
