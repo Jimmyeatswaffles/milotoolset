@@ -24,6 +24,13 @@ in line with GDRB's 37. Compression 1 - positions as floats, rotations as int16 
 shared decoder applies; quaternions come out unit length and hinge joints land in natural
 ranges (elbow -100 to -14 deg, knee -33 to -18, finger joints 0 to 27).
 
+DC1 SONG MILOS - verified on the retail cantgetyou.milo_xbox: the same version-19 clips, but
+each routine clip (moves, A_B transitions, expert_01/02, rest, groove) carries a transition
+list with one entry per clip in the song between the header and the samples. The samples are
+found by walking that list (_dc1_samples_start); all 55 clips decode, every quaternion unit
+length, and 'idle' (empty list) reads identically to the old fixed-window search, which is
+kept as a fallback.
+
 No clip animates a twist bone (59 distinct channels across all 17), so as in GDRB the arm
 twist bones are solved from the arm pose (twist_solvers), here with the standard settings.
 
@@ -235,6 +242,79 @@ def _scan_samples(chunk, start):
             return full, one
 
 
+def _dc1_samples_start(chunk, after):
+    """Offset of a DC1 (version-19) clip's first sample block, found by walking the fields
+    between the frame rate and the samples - verified on the retail cantgetyou.milo_xbox,
+    all 55 clips:
+
+        flags, play flags, blend width, range       4 x u32
+        relative clip                               symbol (empty in every retail clip)
+        (unknown)                                   u32 (4 in every retail clip)
+        (unknown)                                   u8
+        transitions                                 u32 node-buffer size, u32 clip count,
+                                                    then per clip: name symbol, u32 node
+                                                    count, node count x (f32, f32)
+        beat events                                 u32 count (0 in every retail clip)
+
+    The transition list is what the earlier fixed-window search tripped over. A song's move
+    clips each carry one entry per clip in the song (55 in cantgetyou, 2,036 bytes), which
+    pushes the samples to byte ~2,100 - far past the 32-110 byte window that only fitted the
+    generic clips.milo clips, whose lists are empty (so only cantgetyou's 'idle' imported).
+    Raises on anything implausible so the caller can fall back to a search."""
+    def u32(p):
+        return struct.unpack_from('>I', chunk, p)[0]
+
+    p = after + 16
+    n = u32(p)
+    if n > 256:
+        raise DCClipImportError("implausible relative-clip name")
+    p += 4 + n + 4 + 1
+    _size, count = u32(p), u32(p + 4)
+    p += 8
+    if count > 4096:
+        raise DCClipImportError(f"implausible transition count {count}")
+    for _ in range(count):
+        n = u32(p)
+        if n > 256:
+            raise DCClipImportError("implausible transition clip name")
+        p += 4 + n
+        nodes = u32(p)
+        if nodes > 4096:
+            raise DCClipImportError("implausible transition node count")
+        p += 4 + 8 * nodes
+    events = u32(p)
+    p += 4
+    if events > 4096:
+        raise DCClipImportError(f"implausible beat event count {events}")
+    for _ in range(events):
+        # Not seen populated in a DC1 clip; read as (symbol, beat) like RB3's beat events.
+        # If that guess is wrong the sample scan below simply won't start exactly here.
+        n = u32(p)
+        if n > 256:
+            raise DCClipImportError("implausible beat event name")
+        p += 4 + n + 4
+    if p > len(chunk):
+        raise DCClipImportError("clip header runs past the end of the clip")
+    return p
+
+
+def _read_dc1_samples(chunk, after):
+    """(full, one) for a DC1 clip: the walked header first, then the original fixed-window
+    search (the layout every clips.milo clip was verified against), then a structural scan
+    of the whole clip as a last resort."""
+    try:
+        start = _dc1_samples_start(chunk, after)
+        return _scan_samples(chunk, start)
+    except (DCClipImportError, struct.error, IndexError):
+        pass
+    try:
+        _off, full, one, _end = _locate_bone_samples(chunk)
+        return full, one
+    except Exception:
+        pass
+    return _scan_samples(chunk, after)
+
+
 # CharClip versions read with the DC3-style header walk and structural sample scan.
 # Rock Band 3 shares DC1's CharClip version (19) but carries a data tree in its clip headers
 # (viseme_group / exp_rocker_smile_mellow ...), so it takes this path, not DC1's.
@@ -344,8 +424,8 @@ def read_dc_clips(filepath, game='DC1'):
                 fps, after = _clip_fps(chunk, versions=_HEADER_TREE_VERSIONS[game])
                 full, one = _scan_samples(chunk, after)
             else:
-                fps, _after = _clip_fps(chunk, versions=(19,))
-                _off, full, one, _end = _locate_bone_samples(chunk)
+                fps, after = _clip_fps(chunk, versions=(19,))
+                full, one = _read_dc1_samples(chunk, after)
         except Exception as e:
             failed.append((name, str(e)))
             continue

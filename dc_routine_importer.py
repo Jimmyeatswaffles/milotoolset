@@ -398,7 +398,8 @@ class IMPORT_OT_dc_routine(bpy.types.Operator, ImportHelper):
 #
 # The expression names are the DC viseme set's own clip names, so the weights land on the
 # same viseme_<name> channels a .lipsync import creates, and Bake Lipsync Preview drives the
-# DC visemes (imported with the Rock Band 3 viseme option) from them unchanged.
+# DC visemes (imported with Milo Viseme Import > Dance Central, Import Base Viseme on - DC's
+# visemes are offsets from Base, which isn't the rest pose) from them unchanged.
 
 _INTERP_TO_BLENDER = {0: 'CONSTANT', 1: 'LINEAR', 2: 'BEZIER', 3: 'BEZIER', 4: 'BEZIER',
                       5: 'BEZIER', 6: 'BEZIER'}
@@ -512,7 +513,7 @@ class IMPORT_OT_dc_lipsync(bpy.types.Operator, ImportHelper):
         _log(f"===== DC face animation '{song}': {len(names)} expression track(s), "
              f"{total} key(s), {last / LIPSYNC_FPS:.1f}s =====")
         _log(f"  used: {', '.join(used)}")
-        _log("  Import the song's DC visemes (Milo Viseme Import > Rock Band 3) onto the same "
-             "armature, then Bake Lipsync Preview.")
+        _log("  Import the character's DC visemes (Milo Viseme Import > Dance Central, with "
+             "Import Base Viseme on) onto the same armature, then Bake Lipsync Preview.")
         self.report({'INFO'}, f"Imported {len(names)} DC face track(s) as '{action.name}'")
         return {'FINISHED'}

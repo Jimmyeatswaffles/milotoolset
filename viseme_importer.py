@@ -1357,12 +1357,36 @@ class IMPORT_OT_dc1_viseme_set(_IMPORT_OT_viseme_set_base):
     """Import a Dance Central 1 viseme milo (Xbox 360) as one Action per named viseme on the
     active armature - a starting point for the DC1 viseme export. DC1 stores its visemes
     exactly as Rock Band 3 does (milo revision 28, CharClip version 19), so it's read with
-    the RB3 finder; all 30 clips of a retail DC1 viseme.milo_xbox parse"""
+    the RB3 finder; all 30 clips of a retail DC1 viseme.milo_xbox parse. Dance Central 3's
+    viseme milos (revision 32, CharClip version 22) read through the same finder: all 36
+    clips of a retail viseme.milo_xbox parse.
+
+    BASE IS ON BY DEFAULT HERE. Dance Central's visemes are offsets from the set's Base
+    clip, and unlike Rock Band 3's, Base is NOT the character's rest pose. Verified on DC3's
+    viseme.milo_xbox against emilia01.milo_xbox (the character that uses it): Base sits up to
+    1.1 units from emilia's rest pose on the lip corners, 0.1-0.25 on the cheeks, creases,
+    brows and lips, and turns the lower eyelids 6 degrees, the lids and jaw 2. The set's
+    'Neutral' viseme settles it: its offsets are exactly rest minus Base on all 16 mouth and
+    cheek bones it drives (to 0.001), so in the game Base + Neutral = the rest pose. Without
+    the Base layer the face is off by Base's difference everywhere - most visibly the mouth
+    corners. (Every viseme clip also names Base as its relative clip in its header.)"""
     bl_idname = "import_scene.dc1_viseme_set"
-    bl_label = "Import DC1 Viseme Set (X360)"
-    _game_label = "DC1"
+    bl_label = "Import Dance Central Viseme Set (X360)"
+    _game_label = "DC"
     filename_ext = ".milo_xbox"
     filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
+
+    neutral_from_base: BoolProperty(
+        name="Import Base Viseme",
+        description="Create VISEME_Base: the pose that moves the face from the skeleton's "
+                     "rest pose to the set's Base clip, the game's neutral face. The lipsync "
+                     "bake layers it under the visemes automatically. On by default for "
+                     "Dance Central: its visemes are offsets from Base, and Base differs from "
+                     "the character's rest pose (by about 1 unit at the mouth corners on "
+                     "emilia), so without it the face is off. Turning it off also removes "
+                     "this armature's existing VISEME_Base",
+        default=True,
+    )
 
     def _find_clips(self, filepath):
         return find_viseme_clips(filepath)
