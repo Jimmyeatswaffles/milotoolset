@@ -150,7 +150,7 @@ import numpy as np
 
 from .io import read_milo_container_body
 from .utilities import _log
-from .mesh_importer import _read_dir_entries, _entry_spans
+from .mesh_importer import _read_dir_entries, _entry_spans, walk_milo_entries, MeshImportError
 
 
 # RndTex::Type bit for render targets (kRendered = 2; kRenderedNoZ = 0x22 also has it).
@@ -165,9 +165,15 @@ _BLOCK_BYTES = {ENC_DXT1: 8, ENC_DXT5: 16, ENC_ATI2: 16}
 # Offset of the width, by texture revision. GDRB's revision 11 has one more header byte
 # than TBRB's revision 10; everything after the width is laid out the same.
 TEX_HEADER_END = {10: 17, 11: 18}
+# RB3 / Dance Central revision 11: one header byte fewer than GDRB (see parse_tex).
+TEX_HEADER_END_RB3 = 17
 MAT_OBJECT_HEADER_END = 17     # revision + 13-byte object header, before blend
 # Material revisions sharing the slot layout read here: 55 is TBRB, 56 is GDRB.
 MAT_REVISIONS = (55, 56)
+# RB3-era material (Rock Band 3, Dance Central 1): read by _parse_mat_68.
+MAT_REVISION_RB3 = 68
+# Dance Central 3 material: read by _parse_mat_70.
+MAT_REVISION_DC3 = 70
 
 
 class TextureImportError(Exception):
@@ -204,28 +210,60 @@ class _R:
 
 
 def parse_tex(data, name):
-    """RndTex revision 11 + RndBitmap revision 1. Returns a dict with the bitmap header
-    and the base level's pixel data."""
-    r = _R(data)
-    rev = r.u32()
+    """RndTex revision 10/11 + RndBitmap revision 1. Returns a dict with the bitmap header
+    and the base level's pixel data.
+
+    Revision 11 comes in two layouts. GDRB's has a 14-byte object header and one flag after
+    the texture type; RB3's and Dance Central's (what texture_exporter.write_rnd_tex writes)
+    have a 13-byte header and two flags, optimizeForPS3 and useExternalPath. The bitmap that
+    follows is the same in both. Each layout is tried, and the one whose pixel data comes
+    out exactly the size its dimensions predict is used - verified on all 18 textures in
+    the retail Dance Central 1 angel01.milo_xbox, every one landing exactly."""
+    rev = struct.unpack_from('>I', data, 0)[0] if len(data) >= 4 else None
     if rev not in TEX_HEADER_END:
         raise TextureImportError(f"'{name}' is texture revision {rev}; only 10 (TBRB) and "
-                                 f"11 (GDRB) are supported")
-    r.p = TEX_HEADER_END[rev]
+                                 f"11 (GDRB, RB3, Dance Central) are supported")
+    layouts = [(TEX_HEADER_END[rev], 1)]
+    if rev == 11:
+        layouts.append((TEX_HEADER_END_RB3, 2))
+    first_error = None
+    for header_end, flags in layouts:
+        try:
+            return _parse_tex_layout(data, name, header_end, flags)
+        except (TextureImportError, struct.error, IndexError) as e:
+            first_error = first_error or e
+    raise TextureImportError(str(first_error))
+
+
+def _parse_tex_layout(data, name, header_end, flags):
+    r = _R(data)
+    r.u32()
+    r.p = header_end
     r.u32(); r.u32(); r.u32()            # width, height, bpp (repeated in the bitmap)
     r.sym()                              # source path
     r.f32()                              # mip bias
     tex_type = r.u32()
-    r.u8()                               # flag
-    r.u8()                               # bitmap revision
+    r.p += flags                         # GDRB: one flag; RB3/DC: optimizeForPS3, useExternalPath
+    if r.p >= len(data) and (tex_type & TEX_RENDERED):
+        # Dance Central's render target stops here: no bitmap at all.
+        return dict(width=0, height=0, bpp=0, encoding=0, mips=0, data=b'',
+                    render_target=True)
+    bitmap_rev = r.u8()
+    pad = 17
+    if bitmap_rev >= 2:
+        # Dance Central 3's RndBitmap revision 2: a 4-byte per-texture field (different on
+        # every texture - most likely a hash) right after the revision, with the trailing
+        # padding 4 bytes shorter. All 17 textures in tan01.milo_xbox land exactly with it.
+        r.u32()
+        pad = 13
     bpp = r.u8()
     enc = r.u32()
     mips = r.u8()
     w = r.u16()
     h = r.u16()
     r.u16(); r.u16()                     # bytes per line, Wii field
-    r.p += 17
-    if (tex_type & TEX_RENDERED) and w == 0 and h == 0:
+    r.p += pad
+    if (tex_type & TEX_RENDERED) and (w == 0 and h == 0 or r.p >= len(data)):
         # A render target: the game draws into it at runtime, so there are no pixels to
         # decode. TBRB's head uses one as its normal map - the TexBlender's output.
         return dict(width=0, height=0, bpp=bpp, encoding=enc, mips=0, data=b'',
@@ -308,9 +346,13 @@ def parse_mat(data, name):
     couldn't be read cleanly; those fields then hold neutral defaults."""
     r = _R(data)
     rev = r.u32()
+    if rev == MAT_REVISION_RB3:
+        return _parse_mat_68(data, name)
+    if rev == MAT_REVISION_DC3:
+        return _parse_mat_70(data, name)
     if rev not in MAT_REVISIONS:
-        raise TextureImportError(f"'{name}' is material revision {rev}; only 55 (TBRB) and "
-                                 f"56 (GDRB) are supported")
+        raise TextureImportError(f"'{name}' is material revision {rev}; only 55 (TBRB), "
+                                 f"56 (GDRB) and 68 (RB3, Dance Central) are supported")
     r.p = MAT_OBJECT_HEADER_END
     m = dict(revision=rev)
     m['blend'] = r.u32()
@@ -341,6 +383,186 @@ def parse_mat(data, name):
         tail = None
     m.update(tail if tail is not None else _MAT_TAIL_DEFAULTS)
     m['tail_ok'] = tail is not None
+    return m
+
+
+def _parse_mat_68(data, name):
+    """RndMat revision 68 (Rock Band 3, Dance Central 1), in the order
+    texture_exporter.write_rnd_mat writes it. The slots up to the specular map match 55/56;
+    after it come the environment map, a short, perPixelLit, stencil, fur, the detail-normal
+    fields, four light/fog flags (no projLights), rim, screenAligned, shaderVariation,
+    specular2, three perf flags and the refraction settings. All 13 materials in the retail
+    angel01.milo_xbox end exactly on their object boundary, which is required here."""
+    r = _R(data)
+    rev = r.u32()
+    r.p = MAT_OBJECT_HEADER_END
+    m = dict(revision=rev)
+    m['blend'] = r.u32()
+    m['color'] = (r.f32(), r.f32(), r.f32(), r.f32())
+    m['prelit'] = bool(r.u8())
+    m['use_environ'] = bool(r.u8())
+    m['z_mode'] = r.u32()
+    m['alpha_cut'] = bool(r.u8())
+    m['alpha_threshold'] = r.u32()
+    m['alpha_write'] = bool(r.u8())
+    m['tex_gen'] = r.u32()
+    m['tex_wrap'] = r.u32()
+    r.p += 48                                           # texture transform
+    m['diffuse'] = r.sym()
+    m['next_pass'] = r.sym()
+    m['intensify'] = bool(r.u8())
+    m['cull'] = bool(r.u8())
+    m['emissive_multiplier'] = r.f32()
+    m['specular_rgb'] = (r.f32(), r.f32(), r.f32())
+    m['specular_power'] = r.f32()
+    m['normal'] = r.sym()
+    m['emissive'] = r.sym()
+    m['specular'] = r.sym()
+    m['environ_map'] = r.sym()
+    r.u16()                                             # unknown short
+    m['per_pixel_lit'] = bool(r.u8())
+    m['stencil'] = r.u32()
+    m['fur'] = r.sym()
+    m['de_normal'] = r.f32()
+    m['anisotropy'] = r.f32()
+    m['detail_tiling'] = r.f32()
+    m['detail_strength'] = r.f32()
+    m['detail_normal'] = r.sym()
+    m['point_lights'] = bool(r.u8())
+    m['proj_lights'] = False
+    m['fog'] = bool(r.u8())
+    m['fadeout'] = bool(r.u8())
+    m['color_adjust'] = bool(r.u8())
+    m['rim_rgb'] = (r.f32(), r.f32(), r.f32())
+    m['rim_power'] = r.f32()
+    m['rim_map'] = r.sym()
+    m['rim_always_show'] = bool(r.u8())
+    m['screen_aligned'] = bool(r.u8())
+    m['shader_variation'] = r.u32()
+    m['specular2_rgb'] = (r.f32(), r.f32(), r.f32())
+    m['specular2_power'] = r.f32()
+    r.u8(); r.u8(); r.u8()                              # recvProjLights, ps3ForceTrilinear,
+                                                        # recvPointCubeTex
+    m['refract_enabled'] = bool(r.u8())
+    m['refract_strength'] = r.f32()
+    m['refract_normal'] = r.sym()
+    if r.p != len(data):
+        raise TextureImportError(f"'{name}': revision-68 material ended {len(data) - r.p} "
+                                 f"byte(s) short of its object")
+    if m['shader_variation'] > 2:
+        raise TextureImportError(f"'{name}': implausible shader variation "
+                                 f"{m['shader_variation']}")
+    m['tail_ok'] = True
+    return m
+
+
+def _skip_data_array(r):
+    """Steps over a serialized DataArray (an object's type properties): three shorts - size,
+    line, a deprecated field - then that many typed nodes. Node types per the engine's
+    DataType enum (obj/Data.h in the dc3 decomp)."""
+    size = struct.unpack_from('>h', r.d, r.p)[0]
+    r.p += 6
+    for _ in range(size):
+        t = r.u32()
+        if t in (0, 1, 6, 8, 9, 36):                    # int, float, unhandled, else...
+            r.p += 4
+        elif t in (2, 3, 4, 5, 7, 32, 33, 34, 35, 37):  # symbol-like, object name
+            r.sym()
+        elif t in (18, 20):                             # string, glob
+            n = struct.unpack_from('>i', r.d, r.p)[0]
+            r.p += 4 + abs(n)
+        elif t in (16, 17, 19):                         # array, command, property
+            _skip_data_array(r)
+        else:
+            raise TextureImportError(f"unknown data node type {t}")
+
+
+def _parse_mat_70(data, name):
+    """RndMat revision 70 (Dance Central 3): the material is now a BaseMaterial (revision 8)
+    with its own object header, then the MetaMaterial ('.mmat') it was built from. Field
+    order from BaseMaterial::Load in the dc3 decomp (as texture_exporter.write_dc3_rnd_mat
+    writes it). Specular and rim powers live in the alpha of their colours, and cull is an
+    int (0 none, 1 normal, 2 reversed). All 18 materials in tan01.milo_xbox end exactly on
+    their object boundary.
+
+    The MetaMaterial isn't needed: the editor applies a template's values to the material
+    before saving it. Checked against the game's templates (metamaterials.milo): all 698
+    template-controlled values across tan01's 16 char_basic materials, and all 22 of
+    all_edit's on its other two, are already the template's."""
+    r = _R(data)
+    m = dict(revision=r.u32())
+    r.u32()                                             # BaseMaterial revision
+    r.u32()                                             # object revision
+    r.sym()                                             # object type
+    if r.u8():
+        _skip_data_array(r)                             # type properties
+    note_len = r.u32()
+    r.p += note_len
+    m['blend'] = r.u32()
+    m['color'] = (r.f32(), r.f32(), r.f32(), r.f32())
+    m['use_environ'] = bool(r.u8())
+    m['prelit'] = bool(r.u8())
+    m['z_mode'] = r.u32()
+    m['alpha_cut'] = bool(r.u8())
+    m['alpha_threshold'] = r.u32()
+    m['alpha_write'] = bool(r.u8())
+    m['tex_gen'] = r.u32()
+    m['tex_wrap'] = r.u32()
+    r.p += 48                                           # texture transform
+    m['diffuse'] = r.sym()
+    m['next_pass'] = r.sym()
+    m['intensify'] = bool(r.u8())
+    m['cull'] = r.u32()
+    m['emissive_multiplier'] = r.f32()
+    spec = (r.f32(), r.f32(), r.f32(), r.f32())
+    m['specular_rgb'], m['specular_power'] = spec[:3], spec[3]
+    m['normal'] = r.sym()
+    m['emissive'] = r.sym()
+    m['specular'] = r.sym()
+    m['environ_map'] = r.sym()
+    m['environ_map_falloff'] = bool(r.u8())
+    m['environ_map_specmask'] = bool(r.u8())
+    m['per_pixel_lit'] = bool(r.u8())
+    m['stencil'] = r.u32()
+    m['fur'] = r.sym()
+    m['de_normal'] = r.f32()
+    m['anisotropy'] = r.f32()
+    m['detail_tiling'] = r.f32()
+    m['detail_strength'] = r.f32()
+    m['detail_normal'] = r.sym()
+    m['point_lights'] = bool(r.u8())
+    m['proj_lights'] = False
+    m['fog'] = bool(r.u8())
+    m['fadeout'] = bool(r.u8())
+    m['color_adjust'] = bool(r.u8())
+    rim = (r.f32(), r.f32(), r.f32(), r.f32())
+    m['rim_rgb'], m['rim_power'] = rim[:3], rim[3]
+    m['rim_map'] = r.sym()
+    m['rim_light_under'] = bool(r.u8())
+    m['rim_always_show'] = False                        # gone in DC3: the rim is always lit
+    m['screen_aligned'] = bool(r.u8())
+    m['shader_variation'] = r.u32()
+    spec2 = (r.f32(), r.f32(), r.f32(), r.f32())
+    m['specular2_rgb'], m['specular2_power'] = spec2[:3], spec2[3]
+    r.u8(); r.u8(); r.u8()                              # recvProjLights, ps3ForceTrilinear,
+                                                        # recvPointCubeTex
+    m['refract_enabled'] = bool(r.u8())
+    m['refract_strength'] = r.f32()
+    m['refract_normal'] = r.sym()
+    m['bloom_multiplier'] = r.f32()
+    r.u8()                                              # neverFitToSpline
+    r.u8()                                              # allowDistortionEffects
+    r.f32()                                             # shockwaveMult
+    r.f32(); r.f32(); r.f32()                           # world projection tiling/blends
+    m['diffuse2'] = r.sym()
+    r.u8()                                              # forceAlphaWrite
+    m['meta_material'] = r.sym()
+    if r.p != len(data):
+        raise TextureImportError(f"'{name}': revision-70 material ended {len(data) - r.p} "
+                                 f"byte(s) short of its object")
+    if m['shader_variation'] > 2 or m['cull'] > 2:
+        raise TextureImportError(f"'{name}': implausible shader variation or cull")
+    m['tail_ok'] = True
     return m
 
 
@@ -379,8 +601,19 @@ def read_milo_materials(filepath):
         body = read_milo_container_body(f.read())
     _rev, _dt, _dn, entries = _read_dir_entries(body)
     spans = _entry_spans(body, len(entries))
+    objs = [(t, n, s, e) for (t, n), (s, e) in zip(entries, spans)]
+    # Dance Central keeps a character's textures in nested texture directories (inline
+    # copies of its textures milo), not in the root - so objects from nested directories
+    # are read too. The root's own entries come first and win any name clash.
+    try:
+        objs += [(t, n, s, e) for d, _p, t, n, s, e in walk_milo_entries(body)
+                 if d > 0 and t in ('Tex', 'Mat', 'TexBlender')]
+    except MeshImportError:
+        pass
     texs, mats, failed, blenders = {}, {}, [], []
-    for (etype, ename), (s, e) in zip(entries, spans):
+    for etype, ename, s, e in objs:
+        if (etype == 'Tex' and ename in texs) or (etype == 'Mat' and ename in mats):
+            continue
         try:
             if etype == 'Tex':
                 texs[ename] = parse_tex(body[s:e], ename)
@@ -618,10 +851,75 @@ def decode_rgba(tex):
     return img[:h, :w]
 
 
+# A normal map's flat areas encode "straight out", 128 on both channels. Dance Central's
+# aubrey02 dress maps (dress, lefttwist, righttwist) sit at ~156 on both, over the islands
+# and the padding alike: a constant authoring offset that, decoded as-is, tilts every normal
+# on the dress ~17 degrees. A map whose islands' flat value is further than this from 128
+# is re-centred on it.
+#
+# The padding between UV islands can't be trusted as the reference: emilia01's maps fill it
+# with junk - (2, 2) on her body and head, (253, 2) on the jersey and cleats, which aren't
+# even unit-length normals, and flat green on her hair, which is. That padding is the most
+# common value in those maps, so judging by the whole map would have shifted her real
+# normals by ~126. So the flat value is taken from the islands only: texels that aren't
+# valid normals are dropped, then the single largest flat region (the padding, whatever
+# value it holds) is set aside, and the mode of what remains is the islands' flat value.
+NORMAL_BIAS_THRESHOLD = 12
+
+
+def _channel_mode(c):
+    """The most common value of an 8-bit channel, smoothed over +-2 so DXT noise can't pick
+    a stray spike."""
+    h = np.bincount(np.clip(c, 0, 255).astype(np.int64).ravel(), minlength=256)
+    smooth = np.convolve(h, np.ones(5), mode='same')
+    return int(np.argmax(smooth))
+
+
+def _island_flat_offset(raw):
+    """(offset ch0, offset ch1) of a normal map's flat value from 128, or None if it's
+    centred (see NORMAL_BIAS_THRESHOLD).
+
+    The largest flat region is found as the JOINT most common value of both channels - per
+    channel modes can each come from a different region (emilia's hair: 128 from the islands
+    on one channel, 50 from the green padding on the other, a value no texel has). Everything
+    outside it is island, centred on its median - the mode there can be bright surface
+    detail (aubrey02's sequin facets peak at ~196). When the flat region agrees with the
+    islands it's the cleanest reading of the offset and is used; when it doesn't, it's
+    padding with a value of its own and only the islands count."""
+    c0, c1 = raw[..., 0].ravel(), raw[..., 1].ravel()
+    u, v = c0 / 127.5 - 1.0, c1 / 127.5 - 1.0
+    valid = (u * u + v * v) <= 1.0
+    if valid.mean() < 0.05:
+        return None
+    c0, c1 = c0[valid], c1[valid]
+    hist, _e0, _e1 = np.histogram2d(c0, c1, bins=64, range=[[0, 256], [0, 256]])
+    b0, b1 = np.unravel_index(int(np.argmax(hist)), hist.shape)
+    flat = (np.abs(c0 - (b0 * 4 + 2)) <= 6) & (np.abs(c1 - (b1 * 4 + 2)) <= 6)
+    f0, f1 = float(np.median(c0[flat])), float(np.median(c1[flat]))
+    rest = ~flat
+    if rest.mean() >= 0.05:
+        i0, i1 = float(np.median(c0[rest])), float(np.median(c1[rest]))
+        agree = abs(i0 - f0) <= NORMAL_BIAS_THRESHOLD and abs(i1 - f1) <= NORMAL_BIAS_THRESHOLD
+        centre = (f0, f1) if agree else (i0, i1)
+    else:
+        centre = (f0, f1)
+    off = (int(round(centre[0] - 128)), int(round(centre[1] - 128)))
+    if max(abs(off[0]), abs(off[1])) <= NORMAL_BIAS_THRESHOLD:
+        return None
+    return off
+
+
 def decode_normal(tex, flip_green=True):
     """An ATI2 normal map as a standard OpenGL-convention RGB normal map (see the module
-    docstring for why each step is needed)."""
+    docstring for why each step is needed). A map whose flat background is offset from 128
+    is re-centred first (see NORMAL_BIAS_THRESHOLD); the offset is recorded on the texture
+    dict as 'normal_bias' for the log."""
     raw = decode_rgba(tex)
+    off = _island_flat_offset(raw)
+    if off is not None:
+        raw[..., 0] -= off[0]
+        raw[..., 1] -= off[1]
+    tex['normal_bias'] = off
     y = raw[..., 0] / 127.5 - 1.0         # first block is Y
     x = raw[..., 1] / 127.5 - 1.0         # second block is X
     if flip_green:
@@ -685,6 +983,19 @@ def build_image(tex_name, tex, role, flip_green=True):
             name = f"{base}_{'color' if colorspace == 'sRGB' else 'data'}"
         img = bpy.data.images.new(name, width=w, height=h, alpha=True)
     img.colorspace_settings.name = colorspace
+    # The alpha of these textures is mostly DATA - a specular map's gloss or exponent, Dance
+    # Central's per-texel masks in diffuse alpha - and the material wires it to the shader
+    # separately. Blender's Image Texture node returns its Color PREMULTIPLIED by alpha
+    # whenever the Alpha output is connected, unless the image is channel-packed. That
+    # darkened every such texture: aubrey02's skin (diffuse alpha ~26/255 over the skin)
+    # came out at a tenth of its brightness, aubrey01's light-cyan shirt (alpha ~44) a dark
+    # teal, and every Dance Central specular map (alpha 10-60) 4-25x too dim. Channel-packed
+    # keeps RGB and alpha independent; alpha-blended materials still get their transparency
+    # from the Alpha output, now over the straight colour.
+    try:
+        img.alpha_mode = 'CHANNEL_PACKED'
+    except (AttributeError, TypeError):
+        pass
     # Blender stores pixels bottom row first; the decoded image is top row first. Flipping
     # here is what makes the mesh importer's V-flipped UVs land on the right texels.
     pixels = np.ascontiguousarray(np.flipud(rgba) / 255.0, dtype=np.float32)
@@ -718,7 +1029,7 @@ def _lin3(rgb):
 
 
 SHADER_GROUP_NAME = "Milo Character Shader"
-SHADER_GROUP_VERSION = 4
+SHADER_GROUP_VERSION = 7
 SHADER_NODE_NAME = "MiloCharShader"
 
 # (name, socket type, default, min, max). Colours are linear (Blender's working space);
@@ -740,6 +1051,12 @@ _GROUP_INPUTS = (
     ("Specular 2 Color", 'NodeSocketColor', (0.0, 0.0, 0.0, 1.0), None, None),
     ("Specular 2 Power", 'NodeSocketFloat', 10.0, 0.0, 10000.0),
     ("Hair Anisotropy", 'NodeSocketFloat', 0.0, -1.0, 1.0),
+    # 1: the specular map's colour scales the primary highlight (every non-hair material).
+    # 0: it doesn't - Dance Central hair, whose map masks only the secondary highlight.
+    ("Specular Map On Primary", 'NodeSocketFloat', 1.0, 0.0, 1.0),
+    # 1: highlights are multiplied by the diffuse colour, as the hair model Dance Central's
+    # hair follows does ((diffuse + specular) x hair texture). 0: added on top untinted.
+    ("Specular Tinted By Diffuse", 'NodeSocketFloat', 0.0, 0.0, 1.0),
     ("Rim Color", 'NodeSocketColor', (0.0, 0.0, 0.0, 1.0), None, None),
     ("Rim Power", 'NodeSocketFloat', 4.0, 0.0, 1000.0),
     ("Rim Always Show", 'NodeSocketFloat', 0.0, 0.0, 1.0),
@@ -865,14 +1182,24 @@ def ensure_shader_group():
     links.new(I["Emissive Multiplier"], emis.inputs['Scale'])
     emis_total = vmath('ADD', rim_c.outputs[0], emis.outputs[0], x=200, y=980)
 
-    # lit rim -> sheen; roughness from the rim power
+    # ---- lit rim: rimRGB x (1 - N.V)^power x N.L ----
+    # Without rimAlwaysShow the rim only shows where the surface is lit. It used to be the
+    # Principled sheen, which was invisible while every character's rim was black - but
+    # Dance Central's emilia01 has a coloured lit rim (pink 1/0.5/0.75 at power 3 on her
+    # skin, near-white 0.96 at power 5 on her hair), and Blender's sheen, a broad microfiber
+    # layer that doesn't follow (1 - N.V)^power, washed her whole skin pink and turned hair
+    # cards seen edge-on white. Now the game's own falloff is computed explicitly and fed
+    # through a Diffuse BSDF, whose response to light is exactly the N.L the game multiplies
+    # in, so it appears at the silhouette and only where lit.
     not_always = math('SUBTRACT', 1.0, I["Rim Always Show"], x=-500, y=700, clamp=True)
-    sheen_w = math('MULTIPLY', not_always, I["Rim Strength"], x=-330, y=700)
-    sq = math('SQRT', I["Rim Power"], x=-500, y=560)
-    sq = math('MAXIMUM', sq, 0.001, x=-330, y=560)
-    # 0.6/sqrt(power): power 4 -> 0.3, 25 -> 0.12. Tight enough to stay at the silhouette
-    # like the game's (1-N.V)^power; broader sheen hazes the whole surface.
-    sheen_r = math('DIVIDE', 0.6, sq, x=-160, y=560, clamp=True)
+    lit_f = math('POWER', lw.outputs['Facing'], I["Rim Power"], x=-500, y=760, clamp=True)
+    lit_f = math('MULTIPLY', lit_f, I["Rim Strength"], x=-330, y=760)
+    lit_f = math('MULTIPLY', lit_f, not_always, x=-160, y=760)
+    lit_c = vmath('SCALE', I["Rim Color"], x=20, y=760)
+    links.new(lit_f, lit_c.inputs['Scale'])
+    lit_rim = node('ShaderNodeBsdfDiffuse', 450, 900)
+    links.new(lit_c.outputs[0], lit_rim.inputs['Color'])
+    links.new(normal, lit_rim.inputs['Normal'])
 
     bsdf = node('ShaderNodeBsdfPrincipled', 450, 600)
     links.new(base, bsdf.inputs['Base Color'])
@@ -882,13 +1209,9 @@ def ensure_shader_group():
         if sock is not None:
             sock.default_value = v
     links.new(normal, bsdf.inputs['Normal'])
-    for nm, src in (('Sheen Weight', sheen_w), ('Sheen Roughness', sheen_r)):
-        sock = _input(bsdf, nm)
-        if sock is not None:
-            links.new(src, sock)
-    sock = _input(bsdf, 'Sheen Tint')
+    sock = _input(bsdf, 'Sheen Weight')
     if sock is not None:
-        links.new(I["Rim Color"], sock)
+        sock.default_value = 0.0
     sock = _input(bsdf, 'Emission Color', 'Emission')
     if sock is not None:
         links.new(emis_total.outputs[0], sock)
@@ -906,7 +1229,7 @@ def ensure_shader_group():
     links.new(I["Gloss Map Influence"], gloss.inputs[0])
     links.new(I["Gloss Map"], gloss.inputs[3])
 
-    def lobe(color_in, power_in, scale_power_by_gloss, y):
+    def lobe(color_in, power_in, scale_power_by_gloss, y, map_factor=None):
         n = power_in
         if scale_power_by_gloss:
             n = math('MULTIPLY', n, gloss.outputs[0], x=-1100, y=y)
@@ -923,6 +1246,12 @@ def ensure_shader_group():
         energy = math('MINIMUM', math('DIVIDE', 8.0, n7, x=-500, y=y - 140), 1.0,
                       x=-330, y=y - 140)
         col = mul_rgb(color_in, spec_map.outputs['Color'], -500, y - 300)
+        if map_factor is not None:
+            col.node.inputs['Factor'].default_value = 1.0
+            links.new(map_factor, col.node.inputs['Factor'])
+        tint = mul_rgb(col, base, -330, y - 420)
+        links.new(I["Specular Tinted By Diffuse"], tint.node.inputs['Factor'])
+        col = tint
         col_v = vmath('SCALE', col, x=-160, y=y - 200)
         links.new(energy, col_v.inputs['Scale'])
         g = node('ShaderNodeBsdfGlossy', 450, y)
@@ -942,13 +1271,17 @@ def ensure_shader_group():
                 links.new(src, sock)
         return g.outputs[0]
 
-    spec1 = lobe(I["Specular Color"], I["Specular Power"], True, 100)
+    spec1 = lobe(I["Specular Color"], I["Specular Power"], True, 100,
+                 map_factor=I["Specular Map On Primary"])
     spec2 = lobe(I["Specular 2 Color"], I["Specular 2 Power"], False, -250)
 
     add1 = node('ShaderNodeAddShader', 750, 200)
     links.new(spec1, add1.inputs[0]); links.new(spec2, add1.inputs[1])
     surface = node('ShaderNodeAddShader', 900, 400)
     links.new(bsdf.outputs[0], surface.inputs[0]); links.new(add1.outputs[0], surface.inputs[1])
+    with_rim = node('ShaderNodeAddShader', 1000, 550)
+    links.new(surface.outputs[0], with_rim.inputs[0]); links.new(lit_rim.outputs[0], with_rim.inputs[1])
+    surface = with_rim
 
     # ---- alpha: diffuse x material alpha, optionally cut at the threshold ----
     a = math('MULTIPLY', I["Diffuse Alpha"], I["Material Alpha"], x=-1300, y=-1250)
@@ -1094,10 +1427,15 @@ def build_material_tree(mat, slots, images):
     gi["Alpha Cut"].default_value = 1.0 if alpha_cut else 0.0
     gi["Alpha Threshold"].default_value = min(1.0, slots.get('alpha_threshold', 0) / 255.0)
     gi["Additive"].default_value = 1.0 if blend in (BLEND_ADD, BLEND_SRC_ALPHA_ADD) else 0.0
-    if use_alpha or blend in (BLEND_ADD, BLEND_SRC_ALPHA_ADD):
-        _set_render_method(mat, 'BLEND')
-    elif alpha_cut:
+    if alpha_cut and not blend in (BLEND_ADD, BLEND_SRC_ALPHA_ADD):
+        # Cut first, even when the material also blends. Such a material writes depth
+        # (emilia_hair: kBlendSrcAlpha, cut at 100, double-sided, kZModeNormal), so the game
+        # draws its cards depth-correct. Blender's Blended mode doesn't write depth and sorts
+        # per object, which drew the ponytail's inner cards over its outer ones - the
+        # "inside out" look. Dithered keeps depth and still shows the soft tips.
         _set_render_method(mat, 'CLIP')
+    elif use_alpha or blend in (BLEND_ADD, BLEND_SRC_ALPHA_ADD):
+        _set_render_method(mat, 'BLEND')
     else:
         _set_render_method(mat, 'OPAQUE')
     mat.use_backface_culling = bool(slots.get('cull'))
@@ -1235,7 +1573,55 @@ def _borrowed_specular(mat_name, slots, mats, texs):
     return (best[1], best[2]) if best else None
 
 
-def apply_textures(filepath, material_names, flip_green=True, source=None):
+# How a specular map's alpha drives the specular power.
+#   'gloss'    - GDRB/TBRB: a 0-1 multiplier on the material's power (see the module notes).
+#   'exponent' - Dance Central: the alpha IS the exponent, power = alpha x 255. In the retail
+#                angel01 milo every material stores power 10 (the hair 15), while the maps'
+#                alphas run 10-30 on the jacket, 20-62 on the accessories, 8-64 over 95% of
+#                the body and 187-255 on the hair. Read as GDRB's multiplier, the jacket
+#                would get power ~0.7 - a flat wash over the whole surface - and the hair ~13;
+#                read as exponents they're cloth, buckles and a tight hair highlight under
+#                its broad specular2 lobe (power 10), the same pairing GDRB's hair stores
+#                explicitly (200 + 10). Inferred from the data, not confirmed against the
+#                game's shaders. Maps with no alpha channel (DXT1) keep the material power.
+# DC_HAIR_SPECULAR - Dance Central hair (shaderVariation 2) uses the two-highlight
+# anisotropic hair model (Scheuermann's): a primary highlight in the material's specular
+# colour and power, and a secondary, tinted one (specular2) broken up by a noise mask, both
+# shifted along the strands by a shift map. Its specular map carries exactly those two: the
+# RGB is a dim strand-noise mask (0-82, painted only on the strands) and the alpha a
+# mid-to-high shift map (179-255), the two strongly anti-correlated - -0.80, -0.91 and
+# -0.94 on aubrey, angel and emilia. Read as an ordinary map, the alpha became a ~219
+# exponent and the mask (median 5/255, ~0.0001 after gamma) scaled the primary highlight to
+# nothing, leaving the hair flat and deaf to lighting. So for DC hair the primary lobe uses
+# the material's own power and isn't masked; the map's colour masks the secondary lobe.
+# The shift isn't reproduced - Blender's Glossy can't slide a highlight along the tangent -
+# but both lobes are stretched across the strands as before (Hair Anisotropy).
+#
+# In that model the whole lighting, specular included, is multiplied by the hair texture:
+# (diffuse + specular) x base colour. Added untinted instead, the broad primary highlight
+# (power 15) lifted aubrey's dark strands as much as her light ones - under an HDRI, which
+# a broad Glossy reflects almost evenly, the light/dark contrast fell from 3.1x to 1.2x and
+# the orange turned beige. Tinted by the diffuse colour it stays 3.2x and the highlights
+# come out orange, as in the game. ("Specular Tinted By Diffuse" on the shader group.)
+SPEC_ALPHA_GLOSS = 'gloss'
+SPEC_ALPHA_EXPONENT = 'exponent'
+SPEC_EXPONENT_SCALE = 255.0
+
+
+def alpha_holds_data(tex):
+    """False when a texture's alpha is just a full, unpainted channel. aubrey_head_spec.tex
+    (DXT5) is 98.4% exactly 255 with 5 distinct values - read as an exponent it would give
+    the face pin-sharp highlights at power 255. Every painted specular alpha checked (12
+    maps across angel01, aubrey01, aubrey02) has hundreds to thousands of distinct values
+    and almost nothing at full."""
+    if tex.get('encoding') != ENC_DXT5 or not tex.get('data'):
+        return False
+    a = decode_rgba(tex)[..., 3]
+    return not (np.mean(a >= 250) > 0.95 and len(np.unique(a)) < 16)
+
+
+def apply_textures(filepath, material_names, flip_green=True, source=None,
+                   spec_alpha=SPEC_ALPHA_GLOSS):
     """Builds the Milo Character Shader node tree for the named materials from a milo's own
     Tex and Mat entries, and fills each material's glTFMilo settings. Textures the materials
     name but this milo doesn't hold are looked up automatically in the milos it references
@@ -1286,6 +1672,11 @@ def apply_textures(filepath, material_names, flip_green=True, source=None):
         if key not in images:
             try:
                 images[key] = build_image(tex_name, texs[tex_name], img_role, flip_green)
+                bias = texs[tex_name].get('normal_bias')
+                if img_role == 'normal' and bias:
+                    notes.append(f"'{tex_name}': flat areas sat at {128 + bias[0]}/"
+                                 f"{128 + bias[1]} instead of 128/128 - re-centred so its "
+                                 f"normals aren't all tilted")
             except (TextureImportError, ValueError) as e:
                 notes.append(f"could not decode '{tex_name}': {e}")
                 images[key] = None
@@ -1313,6 +1704,37 @@ def apply_textures(filepath, material_names, flip_green=True, source=None):
                 notes.append(f"'{mat_name}' has no specular map; using '{borrowed[1]}' from "
                              f"'{borrowed[0]}', which shares its diffuse texture")
         build_material_tree(mat, slots, imgs)
+        if spec_alpha == SPEC_ALPHA_EXPONENT and own_imgs['specular'] is not None:
+            grp = mat.node_tree.nodes.get(SHADER_NODE_NAME)
+            spec_tex = texs.get(slots.get('specular')) or {}
+            if (grp is not None and slots.get('shader_variation') == SHADER_VARIATION_HAIR
+                    and slots.get('revision') == MAT_REVISION_RB3):
+                # (DC1 only. DC3's hair specular map is an ordinary one - colour and alpha
+                # rise together, +0.99 on tan01, and its templates leave specular2 black -
+                # so it takes the general path below.)
+                # Dance Central hair maps aren't gloss maps - see DC_HAIR_SPECULAR.
+                grp.inputs["Gloss Map Influence"].default_value = 0.0
+                grp.inputs["Specular Power"].default_value = float(
+                    slots.get('specular_power') or 15.0)
+                grp.inputs["Specular Map On Primary"].default_value = 0.0
+                grp.inputs["Specular Tinted By Diffuse"].default_value = 1.0
+                notes.append(f"'{mat_name}': hair - primary highlight at the material's power "
+                             f"{slots.get('specular_power', 0.0):g}, unmasked; "
+                             f"'{slots['specular']}' masks the secondary highlight only")
+            elif grp is not None:
+                if alpha_holds_data(spec_tex):
+                    # power = 255 x alpha, i.e. the alpha's raw value (see SPEC_ALPHA_EXPONENT)
+                    grp.inputs["Specular Power"].default_value = SPEC_EXPONENT_SCALE
+                    grp.inputs["Gloss Map Influence"].default_value = 1.0
+                else:
+                    # DXT1, or an alpha that's full everywhere: no exponent to read, so the
+                    # material's own power applies.
+                    grp.inputs["Gloss Map Influence"].default_value = 0.0
+                    if spec_tex.get('encoding') == ENC_DXT5:
+                        notes.append(f"'{mat_name}': '{slots['specular']}' has an unpainted "
+                                     f"alpha; using the material's specular power "
+                                     f"{slots.get('specular_power', 0.0):g}")
+            mat["milo_spec_alpha_mode"] = SPEC_ALPHA_EXPONENT
         if imgs['specular'] is not None and own_imgs['specular'] is None:
             # A borrowed map's alpha is tuned to the lender's specular power, not this
             # material's, so only its colour (where the surface is shiny) is used.

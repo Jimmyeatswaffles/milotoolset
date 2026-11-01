@@ -1,14 +1,26 @@
 """
-Raw Green Day: Rock Band CharClip export.
+Green Day: Rock Band character body performance export.
 
-Writes Blender Actions as standalone GDRB animation clips - CharClipSamples objects - for
-compiling into a GDRB milo by hand, the way the TBRB 'Custom Song Asset' export writes loose
-.mesh/.mat/.tex files. Each clip is its own file: the object's bytes (revision, body) followed
-by the 0xADDEADDE end marker, named after the clip with no extension (GDRB clip objects carry
-none - main_anim, j_e_idle_01) and placed in a CharClipSamples/ folder, the layout milo
-extraction tools use. A clip object doesn't store its own name - the file name supplies it - so
-characters Windows forbids (Dance Central names contain '->') are replaced in the file name, and
-names.txt beside the files maps each file back to the clip's exact name.
+Writes a Blender Action as a complete GDRB song body milo - the per-song mocap file each band
+member's 'song' outfit category loads (char/<member>/.../song/<song>.milo, or a custom path
+through outfitloader.dta's create_path). The file matches the retail layout of
+americanidiot.milo_xbox:
+
+  uncompressed milo, revision 25, a CharClipSet named 'body' (its own object body is the same
+  429 bytes in every retail and working file, kept verbatim below), holding in this order
+    CharClipGroup   song_<song>        -> main_anim   (group field 'which' = -1)
+    CharClipGroup   song_<song>_ramp   -> ramp        (group field 'which' = 0)
+    CharClipSamples main_anim          the whole-song performance (play flags 0x20200)
+    CharClipSamples ramp               the alternate clip retail uses with the stage-ramp
+                                       waypoint configs (play flags 0x200)
+  stored as two blocks: everything up to main_anim's end marker, then ramp. Without a ramp
+  clip the file is the single-group layout of the Good Riddance export that played in game.
+
+The game finds the performance by listing the clip set's CharClipGroups whose names start with
+'song_' (the director's get_song_clips), so the group names follow song_<short name>.
+
+The clips themselves are encoded exactly as the earlier raw CharClip export did, template mode
+included; only the container is new.
 
 ===========================================================================================
 FORMAT - reproduced against two retail GDRB clips
@@ -60,7 +72,6 @@ them.
 
 import math
 import os
-import re
 import struct
 
 import bpy
@@ -80,9 +91,6 @@ POS_SCALE = 1300.0
 ROT_CHANNEL_SCALE = 0.00061035156
 CLIP_FPS = 30.0
 END_MARKER = b'\xAD\xDE\xAD\xDE'
-# Characters Windows forbids in file names. Dance Central clip names contain '->'
-# ("Chump_L->Chump_R_..."), so those can't be written as-is; see _safe_filename.
-_FORBIDDEN = re.compile(r'[<>:"/\\|?*]')
 
 # Header field values and sample compression copied from the two retail clips, for the two
 # kinds of clip they are: j_e_idle_01 (a clip-set clip) stores positions as floats
@@ -93,8 +101,14 @@ HEADER_PRESETS = {
     'performance': dict(flags=0x0007f303, play_flags=0x00020200, blend_width=2.0,
                         range_=0.0, relative='', old_version=2, do_not_compress=0,
                         tail_byte=1),
+    # americanidiot.milo_xbox's 'ramp': the performance's flags without play flag 0x20000.
+    'ramp': dict(flags=0x0007f303, play_flags=0x00000200, blend_width=2.0, range_=0.0,
+                 relative='', old_version=2, do_not_compress=0, tail_byte=1),
 }
-PRESET_COMPRESSION = {'clip': 1, 'performance': 2}
+PRESET_COMPRESSION = {'clip': 1, 'performance': 2, 'ramp': 2}
+# Retail song performances all run their clips at 1.5 beats per second (90 BPM),
+# whatever the song's tempo.
+PERFORMANCE_BPM = 90.0
 
 
 class _W:
@@ -414,11 +428,18 @@ def build_clip_bytes(arm_obj, action, scene_fps, clip_type, preset, bpm, include
 HINGE_OFF_AXIS_WARN = 0.05      # x/y quaternion magnitude (about 5.7 degrees) worth reporting
 
 
-def read_template_clip(path):
-    """The pieces of an existing GDRB clip a template export copies."""
+def read_template_clip(path, clip_name='main_anim'):
+    """The pieces of an existing GDRB clip a template export copies. `path` is either a raw
+    CharClipSamples file or a GDRB body milo, from which the clip named `clip_name` is used."""
     from .viseme_importer import _Reader, _read_char_bones_samples
     with open(path, 'rb') as f:
         raw = f.read()
+    if len(raw) >= 4 and struct.unpack_from('<I', raw, 0)[0] in _MILO_MAGICS:
+        clips = read_body_milo_clips(raw)
+        if clip_name not in clips:
+            raise ValueError(f"no CharClipSamples '{clip_name}' in {os.path.basename(path)} "
+                             f"(it has: {', '.join(clips) or 'none'})")
+        raw = clips[clip_name] + END_MARKER
     has_marker = raw.endswith(END_MARKER)
     c = raw[:-4] if has_marker else raw
     header, off = parse_clip_header(c)
@@ -510,64 +531,234 @@ def build_clip_from_template(arm_obj, action, scene_fps, template, include_twist
                       marker=template['has_marker'])
 
 
-def _safe_filename(name):
-    """A clip name made safe as a file name on every platform. The object's real name is
-    kept in names.txt beside the files."""
-    return _FORBIDDEN.sub('_', name).rstrip('. ') or "clip"
+# ---------------------------------------------------------------------------------------
+# Character body performance milo
+# ---------------------------------------------------------------------------------------
+
+MILO_REVISION = 25
+BODY_DIR_TYPE = "CharClipSet"
+BODY_DIR_NAME = "body"
+GROUP_REV = 4
+MAIN_CLIP = "main_anim"
+RAMP_CLIP = "ramp"
+_MILO_MAGICS = (0xCABEDEAF, 0xCBBEDEAF, 0xCCBEDEAF, 0xCDBEDEAF)
+MILO_START = 0x810
+
+# The CharClipSet 'body' object's own body, verbatim: identical in americanidiot.milo_xbox and
+# the Good Riddance export that played in game (CharClipSet header, the clip type
+# guitar_body_right, the preview transforms and settings).
+BODY_DIR_BODY = bytes.fromhex(
+    "000000190000001600000002000000116775697461725f626f64795f7269676874000000"
+    "073f3504f3bf3504f3000000003f13cd3a3f13cd3abf13cd3a3ed105eb3ed105eb3f5105"
+    "ebc3ddb3d7c3ddb3d743ddb3d700000000bf800000000000003f80000000000000000000"
+    "0000000000000000003f800000c44000000000000000000000000000003f800000000000"
+    "00bf800000000000000000000000000000000000003f8000004440000000000000000000"
+    "003f80000000000000000000000000000000000000bf800000000000003f800000000000"
+    "000000000000000000444000003f800000000000000000000000000000000000003f8000"
+    "0000000000bf800000000000000000000000000000c44000003f80000000000000000000"
+    "00000000003f8000000000000000000000000000003f80000000000000c4400000000000"
+    "00bf800000000000000000000000000000bf8000000000000000000000000000003f8000"
+    "000000000044400000000000000000000001000000000000000000000000000000000000"
+    "00000000000000000000000000000000000000000000005a000000000000000000")
 
 
-class EXPORT_OT_gdrb_raw_charclips(bpy.types.Operator, ExportHelper):
-    """Export Actions as raw Green Day: Rock Band CharClip objects (CharClipSamples) - loose
-    files to compile into a GDRB milo yourself, like the TBRB custom song asset export"""
-    bl_idname = "export_scene.gdrb_raw_charclips"
-    bl_label = "Export GDRB Raw CharClips"
+def encode_clip_group(clips, which):
+    """A CharClipGroup (revision 4) body, no end marker: object header with an empty type,
+    note and no data tree, the clip names, then 'which' (-1 on retail main groups, 0 on ramp
+    groups), two zero fields, weight 1.0 and a zero byte - as in americanidiot.milo_xbox."""
+    w = _W()
+    w.i32(GROUP_REV)
+    w.i32(OBJECT_REV)
+    w.sym('')
+    w.sym('')
+    w.u8(0)
+    w.u32(len(clips))
+    for c in clips:
+        w.sym(c)
+    w.i32(which)
+    w.u32(0)
+    w.u32(0)
+    w.f32(1.0)
+    w.u8(0)
+    return bytes(w.b)
+
+
+def build_body_milo(song, main_clip, ramp_clip=None):
+    """The complete milo file for a song body performance. `main_clip`/`ramp_clip` are
+    CharClipSamples bodies without end markers. Returns the file bytes."""
+    ents = [('CharClipGroup', f"song_{song}", encode_clip_group([MAIN_CLIP], -1))]
+    if ramp_clip is not None:
+        ents.append(('CharClipGroup', f"song_{song}_ramp", encode_clip_group([RAMP_CLIP], 0)))
+    ents.append(('CharClipSamples', MAIN_CLIP, main_clip))
+    if ramp_clip is not None:
+        ents.append(('CharClipSamples', RAMP_CLIP, ramp_clip))
+    w = _W()
+    w.u32(MILO_REVISION)
+    w.sym(BODY_DIR_TYPE)
+    w.sym(BODY_DIR_NAME)
+    w.u32(2 * (len(ents) + 1))
+    w.u32(sum(len(n) + 1 for _t, n, _b in ents) + len(BODY_DIR_NAME) + 1)
+    w.u32(len(ents))
+    for t, n, _b in ents:
+        w.sym(t)
+        w.sym(n)
+    w.b += BODY_DIR_BODY + END_MARKER
+    blocks = []
+    for t, n, b in ents:
+        w.b += b + END_MARKER
+        if n == MAIN_CLIP and ramp_clip is not None:
+            # Retail stores the ramp clip as a second block.
+            blocks.append(len(w.b))
+    body = bytes(w.b)
+    sizes, start = [], 0
+    for end in blocks + [len(body)]:
+        sizes.append(end - start)
+        start = end
+    head = struct.pack('<4I', 0xCABEDEAF, MILO_START, len(sizes), max(sizes))
+    head += b''.join(struct.pack('<I', s) for s in sizes)
+    return head.ljust(MILO_START, b'\x00') + body
+
+
+def _clip_samples_length(body, p):
+    """Byte length of the CharClipSamples object starting at body[p] (no end marker)."""
+    from .viseme_importer import _Reader, _read_char_bones_samples
+    _h, off = parse_clip_header(body[p:])
+    r = _Reader(body, p + off)
+    _read_char_bones_samples(r)
+    _read_char_bones_samples(r)
+    return r.p + 4 - p
+
+
+def _clip_group_length(body, p):
+    """Byte length of the CharClipGroup object starting at body[p] (no end marker)."""
+    q = p + 8
+    for _ in range(2):
+        q += 4 + struct.unpack_from('>I', body, q)[0]
+    if body[q]:
+        raise ValueError("CharClipGroup with a data tree isn't supported")
+    q += 1
+    n = struct.unpack_from('>I', body, q)[0]
+    q += 4
+    for _ in range(n):
+        q += 4 + struct.unpack_from('>I', body, q)[0]
+    return q + 4 + 4 + 4 + 4 + 1 - p
+
+
+def read_body_milo_clips(data):
+    """{clip name: CharClipSamples body} from a GDRB body milo (any container type). Objects
+    are walked by their parsed lengths, not by searching for end markers, since sample data
+    can contain the marker bytes."""
+    from .io import read_milo_container_body
+    body = read_milo_container_body(data)
+    p = [0]
+
+    def u32():
+        v = struct.unpack_from('>I', body, p[0])[0]; p[0] += 4; return v
+
+    def sym():
+        n = u32(); v = body[p[0]:p[0] + n].decode('latin-1'); p[0] += n; return v
+
+    u32()
+    if sym() != BODY_DIR_TYPE:
+        raise ValueError("not a CharClipSet milo")
+    sym()
+    u32(); u32()
+    ents = [(sym(), sym()) for _ in range(u32())]
+    m = body.find(END_MARKER, p[0])
+    if m < 0:
+        raise ValueError("no end marker after the CharClipSet body")
+    q = m + 4
+    clips = {}
+    for t, n in ents:
+        if t == 'CharClipSamples':
+            ln = _clip_samples_length(body, q)
+            clips[n] = body[q:q + ln]
+        elif t == 'CharClipGroup':
+            ln = _clip_group_length(body, q)
+        else:
+            raise ValueError(f"unexpected {t} '{n}' in a body milo")
+        if body[q + ln:q + ln + 4] != END_MARKER:
+            raise ValueError(f"{t} '{n}' doesn't end where expected")
+        q += ln + 4
+    return clips
+
+
+def _is_milo(path):
+    with open(path, 'rb') as f:
+        head = f.read(4)
+    return len(head) == 4 and struct.unpack('<I', head)[0] in _MILO_MAGICS
+
+
+def _ramp_template(template):
+    """A copy of a performance template with the retail ramp clip's play flags."""
+    t = dict(template)
+    t['header'] = dict(template['header'], play_flags=HEADER_PRESETS['ramp']['play_flags'])
+    return t
+
+
+class EXPORT_OT_gdrb_body_performance_milo(bpy.types.Operator, ExportHelper):
+    """Create a Green Day: Rock Band character body performance milo (like
+    americanidiot.milo_xbox) from an Action: a CharClipSet 'body' holding song_<song> with
+    main_anim, and optionally song_<song>_ramp with ramp"""
+    bl_idname = "export_scene.gdrb_body_performance_milo"
+    bl_label = "Create Character Body Performance Milo"
     bl_options = {'REGISTER'}
 
-    filename_ext = ""
-    filter_glob: StringProperty(default="*", options={'HIDDEN'})
+    filename_ext = ".milo_xbox"
+    filter_glob: StringProperty(default="*.milo_xbox;*.milo_ps3", options={'HIDDEN'})
 
-    which: EnumProperty(
-        name="Actions",
-        items=[('ACTIVE', "Active Action", "The armature's active Action only"),
-               ('CLIPS', "All Imported Clips", "Every CLIP_ Action imported onto this "
-                                               "armature")],
-        default='CLIPS',
+    song_name: StringProperty(
+        name="Song Short Name",
+        description="The song's short name, used for the clip groups song_<name> and "
+                     "song_<name>_ramp (e.g. forgetyou). Empty: the file name",
+        default="",
     )
-    preset: EnumProperty(
-        name="Clip Kind",
-        description="Header flags copied from a retail GDRB clip of this kind",
-        items=[('clip', "Clip (like j_e_idle_01)", "Flags from a retail clip-set clip"),
-               ('performance', "Performance (like main_anim)",
-                "Flags from a retail song performance")],
-        default='clip',
+    performance_action: StringProperty(
+        name="Performance Action",
+        description="The Action written as main_anim. Empty: the armature's active Action",
+        default="",
     )
-    clip_type: StringProperty(
-        name="Clip Type",
-        description="The clip's type symbol. Retail GDRB clips use the CharClipSet's type, "
-                     "e.g. guitar_body_right",
-        default="guitar_body_right",
+    ramp_mode: EnumProperty(
+        name="Ramp Clip",
+        description="What to write as the ramp clip (retail uses it with the stage-ramp "
+                     "waypoint configs)",
+        items=[('COPY', "Copy of Performance",
+                "Write the performance again as ramp, so the file has the full retail layout"),
+               ('ACTION', "Separate Action", "Write another Action as ramp"),
+               ('NONE', "None", "Only song_<name> and main_anim, like the Good Riddance "
+                                "export that played in game")],
+        default='COPY',
+    )
+    ramp_action: StringProperty(
+        name="Ramp Action",
+        description="The Action written as ramp when Ramp Clip is Separate Action",
+        default="",
     )
     bpm: FloatProperty(
         name="Tempo (BPM)",
-        description="Written as the clip's beats per second (bpm / 60); the end beat is the "
-                     "clip's length at this tempo",
-        default=120.0, min=1.0, max=400.0,
+        description="Written as the clips' beats per second (bpm / 60). Retail performances "
+                     "all use 90. Ignored with a template",
+        default=PERFORMANCE_BPM, min=1.0, max=400.0,
+    )
+    clip_type: StringProperty(
+        name="Clip Type",
+        description="The clips' type symbol (retail: guitar_body_right). Ignored with a "
+                     "template",
+        default="guitar_body_right",
     )
     # Plain text on purpose: a file-path field's folder button can't open a second file
     # browser from inside this export dialog. Paste the path.
     template_path: StringProperty(
-        name="Template Clip",
-        description="Optional: the original clip you're replacing (a raw CharClipSamples "
-                     "file, e.g. a song's main_anim as your tool extracts it). The export then "
-                     "copies its channel layout (names, types, order), header settings and "
-                     "length, so the clip fits what the game expects for its clip type. "
-                     "Overrides Clip Kind, Clip Type and Tempo",
+        name="Template",
+        description="Optional, recommended: the clip you're replacing - a retail body milo "
+                     "(e.g. americanidiot.milo_xbox; its main_anim and ramp are used) or a raw "
+                     "CharClipSamples file. The export then copies its channel layout, header "
+                     "settings and length, so the clip fits what the game expects",
         default="",
     )
     pad_to_template: BoolProperty(
         name="Pad To Template Length",
-        description="With a template: hold the last pose until the template's length, so a "
-                     "song performance covers the whole song",
+        description="With a template: hold the last pose until the template's length",
         default=True,
     )
     include_twist: BoolProperty(
@@ -576,83 +767,129 @@ class EXPORT_OT_gdrb_raw_charclips(bpy.types.Operator, ExportHelper):
         default=False,
     )
 
+    def draw(self, context):
+        col = self.layout.column()
+        col.prop(self, "song_name")
+        col.prop_search(self, "performance_action", bpy.data, "actions")
+        col.prop(self, "ramp_mode")
+        if self.ramp_mode == 'ACTION':
+            col.prop_search(self, "ramp_action", bpy.data, "actions")
+        col.separator()
+        col.prop(self, "template_path")
+        sub = col.column()
+        sub.enabled = bool(self.template_path)
+        sub.prop(self, "pad_to_template")
+        sub = col.column()
+        sub.enabled = not self.template_path
+        sub.prop(self, "clip_type")
+        sub.prop(self, "bpm")
+        col.separator()
+        col.prop(self, "include_twist")
+        col.label(text="For PS3, rename the file to .milo_ps3 (same bytes).", icon='INFO')
+
+    def _build(self, arm, action, fps, template, preset):
+        if template is not None:
+            data, info = build_clip_from_template(arm, action, fps, template,
+                                                  self.include_twist, self.pad_to_template)
+        else:
+            data, info = build_clip_bytes(arm, action, fps, self.clip_type, preset, self.bpm,
+                                          self.include_twist)
+        return data, info
+
+    def _log_info(self, label, data, info, template):
+        _log(f"  {label}: {info['samples']} sample(s), {info['seconds']:.2f}s, "
+             f"{info['full']} animated + {info['one']} constant channel(s), {len(data)} bytes")
+        if template is None:
+            return
+        if info['held']:
+            _log(f"    held at the template's first pose (not in the Action): "
+                 f"{', '.join(info['held'])}")
+        if info['dropped']:
+            _log(f"    animated but not part of the template's layout, so left out: "
+                 f"{', '.join(info['dropped'][:12])}")
+        for bone, stray in sorted(info['off_axis'].items()):
+            _log(f"    WARNING: {bone} is a hinge (rotz) in the template but bends up to "
+                 f"{math.degrees(2 * math.asin(min(1.0, stray))):.1f} deg off its axis "
+                 f"in the Action - that part can't be stored")
+
     def execute(self, context):
         arm = context.active_object
         if arm is None or arm.type != 'ARMATURE':
-            self.report({'ERROR'}, "Select the armature the Actions were imported onto.")
+            self.report({'ERROR'}, "Select the armature the Action animates.")
             return {'CANCELLED'}
-        if self.which == 'ACTIVE':
-            act = arm.animation_data.action if arm.animation_data else None
-            actions = [act] if act else []
+        if self.performance_action:
+            action = bpy.data.actions.get(self.performance_action)
+            if action is None:
+                self.report({'ERROR'}, f"No Action named '{self.performance_action}'.")
+                return {'CANCELLED'}
         else:
-            actions = [a for a in bpy.data.actions if a.get("milo_clip")]
-        if not actions:
-            self.report({'ERROR'}, "No Actions to export.")
+            action = arm.animation_data.action if arm.animation_data else None
+            if action is None:
+                self.report({'ERROR'}, f"'{arm.name}' has no active Action - pick a "
+                                       f"Performance Action.")
+                return {'CANCELLED'}
+        ramp_action = None
+        if self.ramp_mode == 'ACTION':
+            ramp_action = bpy.data.actions.get(self.ramp_action)
+            if ramp_action is None:
+                self.report({'ERROR'}, "Pick the Ramp Action (or choose another Ramp Clip "
+                                       "option).")
+                return {'CANCELLED'}
+
+        out_path = bpy.path.abspath(self.filepath)
+        song = self.song_name.strip() or os.path.basename(out_path).split('.', 1)[0]
+        if not song:
+            self.report({'ERROR'}, "Set the Song Short Name.")
             return {'CANCELLED'}
-        out_dir = os.path.join(os.path.dirname(bpy.path.abspath(self.filepath)),
-                               "CharClipSamples")
-        os.makedirs(out_dir, exist_ok=True)
         scene = context.scene
         fps = scene.render.fps / max(scene.render.fps_base, 1e-6)
-        template = None
+
+        template = ramp_template = None
         if self.template_path:
+            tpath = bpy.path.abspath(self.template_path)
             try:
-                template = read_template_clip(bpy.path.abspath(self.template_path))
+                template = read_template_clip(tpath, MAIN_CLIP)
             except Exception as e:
-                self.report({'ERROR'}, f"Couldn't read the template clip: {e}")
+                self.report({'ERROR'}, f"Couldn't read the template: {e}")
                 return {'CANCELLED'}
-        _log(f"===== Exporting {len(actions)} GDRB raw CharClip(s) to {out_dir} =====")
+            ramp_template = _ramp_template(template)
+            if self.ramp_mode == 'ACTION' and _is_milo(tpath):
+                # A body milo template with its own ramp clip supplies the ramp's layout and
+                # length; otherwise the performance template is used with ramp play flags.
+                try:
+                    ramp_template = read_template_clip(tpath, RAMP_CLIP)
+                except Exception:
+                    pass
+
+        _log(f"===== Creating GDRB body performance milo for '{song}' -> {out_path} =====")
         if template is not None:
             th = template['header']
             _log(f"  template: {len(template['channels'])} channels, clip type "
                  f"'{th['clip_type']}', flags {th['flags']:#x}/{th['play_flags']:#x}, "
                  f"{th['beats_per_sec'] * 60:g} BPM, compression {template['compression']}, "
-                 f"{template['seconds']:.1f}s, end marker "
-                 f"{'yes' if template['has_marker'] else 'no'}")
-        written = 0
-        manifest = []
-        for act in actions:
-            name = act.get("milo_clip_name") or (act.name[5:] if act.name.startswith("CLIP_")
-                                                 else act.name)
-            try:
+                 f"{template['seconds']:.1f}s")
+        try:
+            main, info = self._build(arm, action, fps, template, 'performance')
+            self._log_info(f"main_anim from '{action.name}'", main, info, template)
+            ramp = None
+            if self.ramp_mode == 'COPY':
                 if template is not None:
-                    data, info = build_clip_from_template(arm, act, fps, template,
-                                                          self.include_twist,
-                                                          self.pad_to_template)
+                    ramp, rinfo = self._build(arm, action, fps, ramp_template, 'ramp')
                 else:
-                    data, info = build_clip_bytes(arm, act, fps, self.clip_type, self.preset,
-                                                  self.bpm, self.include_twist)
-            except Exception as e:
-                _log(f"  SKIPPED {act.name}: {e}")
-                continue
-            fname = _safe_filename(name)
-            with open(os.path.join(out_dir, fname), 'wb') as f:
-                f.write(data + (END_MARKER if info.get('marker', True) else b''))
-            if template is not None:
-                if info['held']:
-                    _log(f"    held at the template's first pose (not in the Action): "
-                         f"{', '.join(info['held'])}")
-                if info['dropped']:
-                    _log(f"    animated but not part of the template's layout, so left out: "
-                         f"{', '.join(info['dropped'][:12])}")
-                for bone, stray in sorted(info['off_axis'].items()):
-                    _log(f"    WARNING: {bone} is a hinge (rotz) in the template but bends up to "
-                         f"{math.degrees(2 * math.asin(min(1.0, stray))):.1f} deg off its axis "
-                         f"in the Action - that part can't be stored")
-            manifest.append((fname, name))
-            if fname != name:
-                _log(f"  '{name}' written as '{fname}' (characters Windows forbids replaced)")
-            written += 1
-            _log(f"  '{name}': {info['samples']} sample(s), {info['seconds']:.2f}s, "
-                 f"{info['full']} animated + {info['one']} constant channel(s), "
-                 f"{len(data) + 4} bytes")
-        # The clip object doesn't store its own name - it comes from the file - so record
-        # each file's original clip name for whatever compiles these into a milo.
-        with open(os.path.join(out_dir, "names.txt"), 'w', encoding='utf-8') as f:
-            f.write("# file name<TAB>CharClipSamples object name\n")
-            for fname, name in manifest:
-                f.write(f"{fname}\t{name}\n")
-        summary = f"Wrote {written} raw CharClip(s) to {out_dir}"
-        _log(f"===== {summary} =====")
+                    ramp, rinfo = self._build(arm, action, fps, None, 'ramp')
+                self._log_info("ramp (copy of the performance)", ramp, rinfo, None)
+            elif self.ramp_mode == 'ACTION':
+                ramp, rinfo = self._build(arm, ramp_action, fps, ramp_template, 'ramp')
+                self._log_info(f"ramp from '{ramp_action.name}'", ramp, rinfo, ramp_template)
+            data = build_body_milo(song, main, ramp)
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            return {'CANCELLED'}
+        with open(out_path, 'wb') as f:
+            f.write(data)
+        groups = f"song_{song}" + (f" + song_{song}_ramp" if ramp is not None else "")
+        summary = (f"Wrote body performance milo ({groups}, {info['seconds']:.1f}s) to "
+                   f"{os.path.basename(out_path)}")
+        _log(f"===== {summary} ({len(data)} bytes) =====")
         self.report({'INFO'}, summary)
         return {'FINISHED'}

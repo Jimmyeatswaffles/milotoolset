@@ -166,6 +166,12 @@ def _decode_unorm_10_10_10_2(v):
 # Container / entry walking
 # ---------------------------------------------------------------------------------------
 
+# From directory revision 32 (Dance Central 3) the table has one more byte between the
+# hash/string-table sizes and the entry count. Verified on tan01.milo_xbox: without it the
+# count reads as 0; with it all 175 root entries and every nested table parse.
+DIR_REVISION_EXTRA_BYTE = 32
+
+
 def _read_dir_entries(body):
     p = [0]
 
@@ -183,6 +189,8 @@ def _read_dir_entries(body):
     dir_type = sym()
     dir_name = sym()
     u32(); u32()
+    if revision >= DIR_REVISION_EXTRA_BYTE:
+        p[0] += 1
     count = u32()
     if count > 65535:
         raise MeshImportError(f"implausible entry count {count}")
@@ -190,9 +198,14 @@ def _read_dir_entries(body):
 
 
 def _entry_spans(body, entry_count):
-    """Entry byte ranges, delimited by end markers. The generic walker can't traverse
-    revision-25 dirs, and a count mismatch means the split would be silently wrong, so
-    it's asserted rather than assumed."""
+    """Byte ranges of the ROOT directory's entries, each ending at its end marker.
+
+    A flat directory has exactly one marker for its own data plus one per entry, so the
+    split is a straight read of the markers. Files with nested directories (Dance Central
+    character milos) have far more markers than that - the inline subdirs' own data and
+    entries carry markers too - so those are handed to the structural walker below, which
+    tracks which markers belong to which directory. Anything neither path accounts for
+    exactly is rejected rather than guessed at, since a wrong split is silently wrong."""
     marks = []
     i = 0
     while True:
@@ -201,11 +214,167 @@ def _entry_spans(body, entry_count):
             break
         marks.append(j)
         i = j + 4
-    if len(marks) != entry_count + 1:
+    if len(marks) == entry_count + 1:
+        return [(marks[k] + 4, marks[k + 1]) for k in range(entry_count)]
+    try:
+        walked = walk_milo_entries(body)
+    except MeshImportError as e:
         raise MeshImportError(
-            f"found {len(marks)} end markers but expected {entry_count + 1} - this "
-            f"file's layout isn't what this importer understands")
-    return [(marks[k] + 4, marks[k + 1]) for k in range(entry_count)]
+            f"found {len(marks)} end markers but expected {entry_count + 1}, and the "
+            f"nested-directory walk failed too ({e}) - this file's layout isn't what "
+            f"this importer understands")
+    root = [(s, e) for depth, _path, _t, _n, s, e in walked if depth == 0]
+    if len(root) != entry_count:
+        raise MeshImportError(
+            f"nested-directory walk found {len(root)} root entries but the table lists "
+            f"{entry_count}")
+    return root
+
+
+# ---------------------------------------------------------------------------------------
+# Nested directories (Dance Central)
+# ---------------------------------------------------------------------------------------
+#
+# Verified on a retail Dance Central 1 character milo (angel01.milo_xbox, revision 28):
+# 139 root entries but 273 end markers. The extra ones belong to two kinds of nesting:
+#
+#  1. Inline subdirs inside the root Character's OWN data. The root's data starts with its
+#     subdir references ('../male_skeleton_angel.milo', the textures milo) and inline flags,
+#     then each inline subdir follows IN FULL - its table, its data (end marker), then its
+#     entries (one marker each) - and only after the last of them does the rest of the
+#     root's data and its end marker come. angel01 has three: the skeleton ('Character
+#     uniq0', 74 Trans) and two texture dirs ('RndDir uniq0', 11 and 7 Tex).
+#  2. An entry that is itself a directory. The 'clips' CharClipSet's object data ends with
+#     its marker as usual, and is then followed directly by its own table (also named
+#     'clips'), data and 37 entries.
+#
+# The walker below handles both: a directory table found before an object's end marker is an
+# inline subdir that owns those markers; one found right after an entry's marker and named
+# like that entry (or that name plus a number, as DC3's 'clips' -> 'clips1') is that entry's
+# own directory. Dance Central 3 (directory revision 32) nests the same two ways - tan01: an
+# inline skeleton 'Character uniq0' and the clip set's directory - and the walk accounts for
+# all 323 of its end markers. The walk must end exactly at the end of the
+# body, which confirms every marker was assigned.
+
+_IDENT_RE = re.compile(rb'[A-Za-z][A-Za-z0-9_]*\Z')
+
+
+def _dir_table_at(body, o):
+    """(revision, type, name, [(type, name)], end) for a directory table at o, or None. Strict
+    enough that object data can't pass for one: identifier-like class names, printable object
+    names, and hash-table and string-table sizes that cover the entry list - true of every
+    table in the retail file (hash size >= 2 x entries, string size >= the names' bytes)."""
+    n = len(body)
+    if o + 24 > n:
+        return None
+    try:
+        rev = _u32(body, o)
+        if not 6 <= rev <= 64:
+            return None
+        p = o + 4
+
+        def sym(lo, hi):
+            nonlocal p
+            ln = _u32(body, p)
+            if not lo <= ln <= hi or p + 4 + ln > n:
+                raise ValueError
+            s = body[p + 4:p + 4 + ln]
+            if not all(32 <= c < 127 for c in s):
+                raise ValueError
+            p += 4 + ln
+            return s
+
+        dtype = sym(1, 64)
+        if not _IDENT_RE.match(dtype):
+            return None
+        dname = sym(0, 256)
+        hash_size = _u32(body, p)
+        str_size = _u32(body, p + 4)
+        p += 8
+        if rev >= DIR_REVISION_EXTRA_BYTE:
+            p += 1
+        count = _u32(body, p)
+        p += 4
+        if count > 65535 or hash_size < 2 * count or hash_size > 4 * count + 4096:
+            return None
+        ents = []
+        for _ in range(count):
+            et = sym(1, 64)
+            if not _IDENT_RE.match(et):
+                return None
+            ents.append((et.decode('latin-1'), sym(1, 256).decode('latin-1')))
+        if str_size < sum(len(en) + 1 for _t, en in ents):
+            return None
+        return rev, dtype.decode('latin-1'), dname.decode('latin-1'), ents, p
+    except (ValueError, struct.error):
+        return None
+
+
+def _walk_dir(body, o, depth, path, out):
+    """Walks the directory whose table is at o, appending (depth, path, type, name, start,
+    end) for each entry. Returns the offset just past its last entry."""
+    if depth > 16:
+        raise MeshImportError("directories nested implausibly deep")
+    table = _dir_table_at(body, o)
+    if table is None:
+        raise MeshImportError(f"expected a directory table at {o:#x}")
+    _rev, _dtype, dname, ents, p = table
+    path = path + (dname,)
+    _end, p = _walk_object(body, p, depth, path, out, owner=None)
+    for etype, ename in ents:
+        start = p
+        end, p = _walk_object(body, p, depth, path, out, owner=ename)
+        out.append((depth, path, etype, ename, start, end))
+    return p
+
+
+def _walk_object(body, p, depth, path, out, owner):
+    """One object's data up to its end marker, walking any inline subdir found before that
+    marker and - for an entry - its own directory found right after it. Returns (end of the
+    object's data, offset after everything it owns)."""
+    while True:
+        m = body.find(MILO_END_MARKER, p)
+        if m < 0:
+            raise MeshImportError(f"object at {p:#x} has no end marker")
+        # Every table starts with a big-endian revision, so only these spots can hold one.
+        q, nested = p, None
+        while True:
+            q = body.find(b'\x00\x00\x00', q, m)
+            if q < 0:
+                break
+            if _dir_table_at(body, q) is not None:
+                nested = q
+                break
+            q += 1
+        if nested is None:
+            break
+        p = _walk_dir(body, nested, depth + 1, path, out)
+    p = m + 4
+    if owner is not None and p < len(body):
+        table = _dir_table_at(body, p)
+        if table is not None and _names_owner(table[2], owner):
+            p = _walk_dir(body, p, depth + 1, path, out)
+    return m, p
+
+
+def _names_owner(dir_name, owner):
+    """A directory following an entry belongs to it when it carries the entry's name - in
+    Dance Central 3 sometimes with a number appended (tan01's 'clips' entry is followed by
+    its directory 'clips1')."""
+    return dir_name == owner or (dir_name.startswith(owner)
+                                 and dir_name[len(owner):].isdigit())
+
+
+def walk_milo_entries(body):
+    """Every entry in a milo body, nested directories included, as (depth, dir path, type,
+    name, start, end) in file order; depth 0 is the root directory. Raises MeshImportError
+    unless the walk accounts for the whole body."""
+    out = []
+    end = _walk_dir(body, 0, 0, (), out)
+    if end != len(body):
+        raise MeshImportError(
+            f"directory walk stopped at {end:#x} of {len(body):#x} bytes")
+    return out
 
 
 # ---------------------------------------------------------------------------------------

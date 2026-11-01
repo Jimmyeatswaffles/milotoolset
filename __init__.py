@@ -37,6 +37,7 @@ from .gh2_exporter import *
 from .viseme_importer import *
 from .viseme_exporter import *
 from .mesh_importer import *
+from .dc_mesh_importer import IMPORT_OT_dc_meshes, IMPORT_OT_dc3_meshes
 from .anim_importer import *
 from .cam_importer import *
 from .gh2_lipsync import *
@@ -3296,10 +3297,10 @@ def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_dc1_viseme_milo.bl_idname,
                           text="Dance Central 1 Viseme Milo (.milo_xbox)",
                           icon_value=_milo_icon_id('DC1'))
-    # Loose GDRB animation clips (CharClipSamples) to compile into a milo by hand, like
-    # the TBRB custom song asset export.
-    self.layout.operator(EXPORT_OT_gdrb_raw_charclips.bl_idname,
-                         text="Green Day: Rock Band Raw CharClips",
+    # A complete GDRB character body performance milo (CharClipSet 'body' with
+    # song_<song> / main_anim and the ramp group), laid out like americanidiot.milo_xbox.
+    self.layout.operator(EXPORT_OT_gdrb_body_performance_milo.bl_idname,
+                         text="Green Day: Rock Band Character Body Performance (.milo_xbox)",
                          icon_value=_milo_icon_id('GDRB'))
     self.layout.operator(EXPORT_OT_rb3_clip_inject.bl_idname,
                          text="RB3 CharClip Into Song Milo (.milo_xbox)",
@@ -4588,6 +4589,18 @@ class TOPBAR_MT_milo_mesh_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
                         text="Green Day: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
+        # Dance Central: RB3's RndMesh 38, but its own operator - meshes stored turned 180
+        # degrees from the skeleton, face rig kept in the character milo, LODs declared by
+        # lod groups. See dc_mesh_importer.
+        layout.separator()
+        layout.label(text="Dance Central")
+        layout.operator(IMPORT_OT_dc_meshes.bl_idname,
+                        text="Dance Central 1 (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC1'))
+        layout.operator(IMPORT_OT_dc3_meshes.bl_idname,
+                        text="Dance Central 3 (.milo_xbox)",
+                        icon_value=_milo_icon_id('DC3'))
+        layout.separator()
         # RndMesh 34: plain-float vertices, read by content (see parse_rb2_meshes).
         # Placeholder materials only - RB2's textures come from its character creator.
         self.layout.operator(IMPORT_OT_rb2_meshes.bl_idname,
@@ -4972,6 +4985,8 @@ classes = (
     IMPORT_OT_gdrb_skeleton,
     IMPORT_OT_gdrb_meshes,
     IMPORT_OT_rb3_meshes,
+    IMPORT_OT_dc_meshes,
+    IMPORT_OT_dc3_meshes,
     IMPORT_OT_rb2_meshes,
     IMPORT_OT_tbrb_meshes,
     IMPORT_OT_gdrb_animation,
@@ -5002,7 +5017,7 @@ classes = (
     IMPORT_OT_rb3_lipsync,
     POSE_OT_bake_lipsync_preview,
     EXPORT_OT_dc1_viseme_milo,
-    EXPORT_OT_gdrb_raw_charclips,
+    EXPORT_OT_gdrb_body_performance_milo,
     EXPORT_OT_rb3_clip_inject,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
