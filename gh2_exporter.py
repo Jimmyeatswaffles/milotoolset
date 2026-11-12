@@ -206,7 +206,8 @@ def write_gh2_rnd_trans(w, local_xfm, world_xfm, parent_name="",
 
 
 def write_gh2_rnd_mesh(w, entry_name, local_xfm, world_xfm, parent_name,
-                       vertices, faces, bone_palette, mat_name=""):
+                       vertices, faces, bone_palette, mat_name="", showing=True,
+                       draw_order=0.0, mutable=0):
     """RndMesh at revision 28.
 
     Layout mirrors _try_parse_gh2_mesh_body in io.py exactly (that function is the
@@ -230,6 +231,18 @@ def write_gh2_rnd_mesh(w, entry_name, local_xfm, world_xfm, parent_name,
     slot i's float is this vertex's weight for bone_palette[i]. That positional
     mapping (rather than a separate bone-index array, which this format simply does
     not have) is why the palette is capped at four and why meshes must be split.
+
+    An EMPTY bone_palette is written the way retail writes a rigid (unskinned) mesh:
+    a single empty symbol and nothing else - no further slots, no matrices. Confirmed
+    on all four meshes of retail flyingv_v2.milo_xbox (guitar body, strings, fire card,
+    shadow), every one of which ends `00000000 ADDEADDE`. Skinned character pieces are
+    unaffected: their first slot is always a real bone, so they still get all four
+    names and all four matrices.
+
+    `showing`, `draw_order` and `mutable` default to the values every retail character
+    mesh carries. The guitar shows they are not constant everywhere: its strings draw
+    at order 0.1 (after the body, for alpha blending) and its hidden fire card is
+    showing=0 with mutable=63.
     """
     w.u32(GH2_MESH_REVISION)
     write_gh2_object_fields(w)
@@ -239,16 +252,16 @@ def write_gh2_rnd_mesh(w, entry_name, local_xfm, world_xfm, parent_name,
 
     # --- RndDrawable rev 3 (shared shape with RB3, LE here) ---
     w.u32(GH2_DRAW_REVISION)
-    w.boolean(True)          # showing
+    w.boolean(showing)
     w.f32(0.0); w.f32(0.0); w.f32(0.0); w.f32(0.0)   # bounding sphere
-    w.f32(0.0)               # drawOrder
+    w.f32(draw_order)
     # rev 3 < 4, so no trailing drawable symbol (that gate is the DC3-only one).
 
     w.symbol(mat_name)
     w.symbol(entry_name)     # geomOwner - retail always names the mesh ITSELF here
                              # (verified: 143/143 entries in goth2.milo_xbox match)
-    w.u32(0)                 # mutable
-    w.u32(1)                 # volume (retail value for character meshes)
+    w.u32(mutable)
+    w.u32(1)                 # volume (retail value for character and guitar meshes)
     w.u8(0)                  # bspNode.hasValue
 
     # --- vertices: 12 plain float32s each, no packing anywhere ---
@@ -284,6 +297,12 @@ def write_gh2_rnd_mesh(w, entry_name, local_xfm, world_xfm, parent_name,
         w.u8(g)
 
     # --- bone palette: FOUR names, then FOUR matrices (see GH2_MAX_BONES_PER_MESH) ---
+    if not bone_palette:
+        # Rigid mesh - see the docstring. One empty symbol ends it.
+        w.symbol("")
+        w.block(END_MARKER)
+        return
+
     if len(bone_palette) > GH2_MAX_BONES_PER_MESH:
         raise ValueError(
             f"Mesh '{entry_name}' has {len(bone_palette)} bones but GH2 meshes hold at "
@@ -900,7 +919,7 @@ GH2_ANIM_REVISION = 4
 
 
 def write_gh2_group(w, name, object_names, anim_frame=-1.08, anim_flag=1,
-                    parent_name=""):
+                    parent_name="", showing=True):
     """Group at revision 12 - a named list of objects that render together.
 
     Decoded field-for-field off funk1's `shadow` group and confirmed against
@@ -915,6 +934,9 @@ def write_gh2_group(w, name, object_names, anim_frame=-1.08, anim_flag=1,
     so a mesh that exists as an entry but is not listed in lod0.grp simply never draws.
     That is why injection can't just append meshes to the entry table and stop - the
     group membership has to be rewritten to match, which is what this writer is for.
+
+    `showing` is the drawable flag. Retail flyingv_v2 writes it 1 on lod0 and on
+    shadow.grp but 0 on lod1 - the hidden LOD is switched on by the engine.
     """
     w.u32(GH2_GROUP_REVISION)
     write_gh2_object_fields(w)
@@ -928,7 +950,7 @@ def write_gh2_group(w, name, object_names, anim_frame=-1.08, anim_flag=1,
                         parent_name, standalone=False)
 
     w.u32(GH2_DRAW_REVISION)
-    w.boolean(True)
+    w.boolean(showing)
     w.f32(0.0); w.f32(0.0); w.f32(0.0); w.f32(0.0)
     w.f32(0.0)
 
@@ -1543,7 +1565,8 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
                       blend=1, z_mode=1, cull=True, pre_lit=True,
                       use_environment=True, emissive_multiplier=1.0,
                       specular_rgb=(0.0, 0.0, 0.0), specular_power=40.0,
-                      standalone=True, tex_wrap='kTexWrapRepeat'):
+                      standalone=True, tex_wrap='kTexWrapRepeat',
+                      intensify=False, alpha_cut=False, emissive_tex=""):
     """RndMat.Write at revision 28 (Guitar Hero 2).
 
     Defaults reproduce a retail OPAQUE character body material.
@@ -1557,6 +1580,12 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
 
     `skin_tex` is the rev<51 symbol slot described above - retail puts the shared skin
     tint texture there on "skin" materials and leaves it empty elsewhere.
+
+    `intensify`, `alpha_cut` and `emissive_tex` fill fields that used to be hardcoded
+    (False / False / empty). Their defaults keep the old output byte-identical. The
+    emissive slot is part of the rev-28 layout (it sits between normalMap and
+    specularMap), but no retail GH2 character checked so far fills it, so whether the
+    GH2 shader honours it is unverified.
     """
     from .texture_exporter import (
         MAT_STENCIL_IGNORE, MAT_TEXGEN_NONE, MAT_TEXWRAP_REPEAT, MAT_TEXWRAP_VALUES,
@@ -1572,7 +1601,7 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
     w.boolean(pre_lit)
     w.boolean(use_environment)
     w.i32(z_mode)
-    w.boolean(False)                     # alphaCut
+    w.boolean(alpha_cut)
     # revision 28 is NOT > 37 -> no alphaThreshold field
     w.boolean(False)                     # alphaWrite
     w.i32(MAT_TEXGEN_NONE)
@@ -1580,13 +1609,13 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
     write_matrix(w, IDENTITY_MATRIX)     # texXfm
     w.symbol(diffuse_tex)
     w.symbol("")                         # nextPass
-    w.boolean(False)                     # intensify
+    w.boolean(intensify)
     w.boolean(cull)
     w.f32(emissive_multiplier)
     w.f32(specular_rgb[0]); w.f32(specular_rgb[1]); w.f32(specular_rgb[2])
     w.f32(specular_power)
     w.symbol(normal_tex)
-    w.symbol("")                         # emissiveMap
+    w.symbol(emissive_tex)
     w.symbol(specular_tex)
     w.symbol(skin_tex)                   # revision < 51 -> this slot exists
     w.symbol("")                         # environMap
@@ -1598,3 +1627,185 @@ def write_gh2_rnd_mat(w, diffuse_tex="", normal_tex="", specular_tex="",
 
     if standalone:
         w.block(END_MARKER)
+
+
+# ---------------------------------------------------------------------------------
+# Instruments (guitar / bass) - built from scratch, no donor.
+#
+# Everything below was decoded from retail flyingv_v2.milo_xbox. Unlike a character,
+# an instrument's directory body carries no gameplay behaviour: it is a plain
+# `Character` (not `BandCharacter`) whose only references are its two LOD groups, its
+# shadow group and its own name. That is what makes a donor unnecessary here.
+#
+#   DirectoryMeta 25, type "Character"
+#   Character 10 -> RndDir 9 -> ObjectDir 17
+#     7 viewports (48-byte matrix + 4-byte pad each), currentViewport 6
+#     20 zero bytes (proxy / subdir / name fields - all empty in retail, so their
+#                    exact split at this revision is not needed to write them)
+#     objFields rev 1 | RndAnimatable 4 | RndDrawable 3 (sphere) | RndTrans 9
+#     environ symbol   (no testEvent: RndDir 9 is the revision that skips it)
+#   Character 10 body:
+#     u32 lodCount, then (f32 screenSize, symbol group) per LOD  - "lod0", "lod1"
+#     symbol shadow group                                         - "shadow.grp"
+#     bool selfShadow                                             - 0
+#     symbol sphereBase                                           - the dir's own name
+#     a 62-byte tail of constants (CharacterTesting-style: "none" twice, 120, ...)
+#
+# write_gh2_instrument_dir reproduces the retail body byte for byte when given the
+# retail values; see GH2_INSTRUMENT_VIEWPORTS / GH2_INSTRUMENT_CHAR_TAIL.
+# ---------------------------------------------------------------------------------
+
+GH2_INSTRUMENT_DIR_TYPE = "Character"
+GH2_CHARACTER_REVISION = 10
+GH2_RNDDIR_REVISION = 9
+GH2_OBJDIR_REVISION = 17
+
+# The 7 retail viewport matrices with their 4-byte per-viewport pad (ObjectDir <= 17),
+# copied verbatim. They are editor camera views, not geometry.
+GH2_INSTRUMENT_VIEWPORTS = bytes.fromhex(
+    "f304353ff30435bf000000003acd133f3acd133f3acd13bfeb05d13eeb05d13e"
+    "eb05513fd7b3ddc3d7b3ddc3d7b3dd431034450000000000000080bf00000000"
+    "0000803f000000000000000000000000000000000000803f000040c400000000"
+    "0000000010344500000000000000803f00000000000080bf0000000000000000"
+    "00000000000000000000803f000040440000000000000000103445000000803f"
+    "00000000000000000000000000000000000080bf000000000000803f00000000"
+    "000000000000000000004044103445000000803f000000000000000000000000"
+    "000000000000803f00000000000080bf000000000000000000000000000040c4"
+    "103445000000803f0000000000000000000000000000803f0000000000000000"
+    "000000000000803f00000000000040c40000000010344500d19572bf1b7aa33e"
+    "000000002b8569bef4422dbf8d26333ffecd643e49c3293fc0d7363f06163241"
+    "36028542346d6ac210344500"
+)
+GH2_INSTRUMENT_VIEWPORT_COUNT = 7
+
+# Everything after sphereBase, up to and including the terminator. Constants only.
+GH2_INSTRUMENT_CHAR_TAIL = bytes.fromhex(
+    "060000000000000000000000000000000000000000000000040000006e6f6e65"
+    "00000000010000000000000000000000040000006e6f6e65000078000000adde"
+    "adde"
+)
+
+# Retail instrument entry order. The table and the body must follow the same order
+# (see build_gh2_character_milo_bytes); this one matches flyingv_v2.
+GH2_INSTRUMENT_ENTRY_ORDER = ('Tex', 'Mat', 'Mesh', 'Group', 'Trans')
+
+# The fixed rig names a GH2 guitar is played through. Missing ones are reported, not
+# invented - the export still runs, but the hands won't find what's absent.
+GH2_INSTRUMENT_RIG_BONES = (
+    ('bone_pelvis.mesh', 'bone_pos_guitar.mesh', 'bone_strum.mesh', 'bone_fret.mesh',
+     'bone_strum_hand.mesh', 'bone_fret_hand.mesh', 'spot_neck_base.mesh')
+    + tuple(f"spot_neck_fret{i:02d}.mesh" for i in range(1, 21))
+)
+
+
+# The frame retail guitar.mesh carries relative to bone_pos_guitar.mesh (flyingv_v2):
+# roughly -90 degrees about Z with a ~1.9 degree tilt, origin near the neck joint. In this
+# frame the guitar's vertices stand UPRIGHT - neck along +Z, face along Y - which is
+# what the guitar-select menu shows. The menu evidently places the meshes by their own
+# frame rather than by the play rig, so geometry has to be stored in this frame for
+# the menu to match retail; in-game the parent chain composes it back to the same
+# place either way. Applied by the instrument export to every mesh it parents to
+# bone_pos_guitar.mesh.
+GH2_GUITAR_BODY_FRAME = (
+    -1.7692765652554954e-07, -1.0, -3.527436831518571e-08,
+    0.9994618892669678, -1.9894662273145514e-07, 0.03280127793550491,
+    -0.0328013077378273, 2.6390827301270292e-08, 0.999461829662323,
+    2.2877960205078125, 0.5433278679847717, 9.998895645141602,
+)
+
+
+def write_gh2_instrument_dir(w, root_name, lods=((0.0, "lod0"), (0.0, "lod1")),
+                             shadow_group="shadow.grp", sphere=(0.0, 0.0, 0.0, 0.0),
+                             environ=""):
+    """The `Character` directory body of a GH2 instrument (see the block comment
+    above). Ends with the terminator."""
+    identity = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+
+    w.u32(GH2_CHARACTER_REVISION)
+    w.u32(GH2_RNDDIR_REVISION)
+    w.u32(GH2_OBJDIR_REVISION)
+    w.u32(GH2_INSTRUMENT_VIEWPORT_COUNT)
+    w.block(GH2_INSTRUMENT_VIEWPORTS)
+    w.u32(6)                            # currentViewportIdx (retail)
+    w.block(b"\x00" * 20)               # proxy / subdir / name fields, all empty
+    write_gh2_object_fields(w)
+
+    w.u32(GH2_ANIM_REVISION)            # RndAnimatable
+    w.f32(0.0)
+    w.u32(0)
+
+    w.u32(GH2_DRAW_REVISION)            # RndDrawable
+    w.boolean(True)
+    w.f32(sphere[0]); w.f32(sphere[1]); w.f32(sphere[2]); w.f32(sphere[3])
+    w.f32(0.0)
+
+    write_gh2_rnd_trans(w, identity, identity, "", standalone=False)
+    w.symbol(environ)
+
+    w.u32(len(lods))
+    for screen, group in lods:
+        w.f32(screen)
+        w.symbol(group)
+    w.symbol(shadow_group)
+    w.boolean(False)                    # selfShadow
+    w.symbol(root_name)                 # sphereBase
+    w.block(GH2_INSTRUMENT_CHAR_TAIL)
+
+
+def build_gh2_instrument_milo_bytes(root_name, entries, dir_body):
+    """Assemble a GH2 instrument milo from already-serialized objects.
+
+    `entries` is a list of (type, name, object_bytes), each object ending with its own
+    terminator. They are written - table and body alike - in
+    GH2_INSTRUMENT_ENTRY_ORDER by type, keeping the caller's order within a type.
+    `dir_body` is write_gh2_instrument_dir's output.
+    """
+    rank = {t: i for i, t in enumerate(GH2_INSTRUMENT_ENTRY_ORDER)}
+    ordered = sorted(enumerate(entries),
+                     key=lambda ie: (rank.get(ie[1][0], len(rank)), ie[0]))
+    ordered = [e for _i, e in ordered]
+
+    body = MiloWriter(big_endian=False)
+    body.u32(GH2_MILO_REVISION)
+    body.symbol(GH2_INSTRUMENT_DIR_TYPE)
+    body.symbol(root_name)
+    stc, sts = gh2_string_table_hint(GH2_INSTRUMENT_DIR_TYPE, root_name,
+                                     [(t, n) for t, n, _b in ordered])
+    body.i32(stc)
+    body.u32(sts)
+    body.i32(len(ordered))
+    for t, n, _b in ordered:
+        body.symbol(t)
+        body.symbol(n)
+    body.block(dir_body)
+
+    # Blocks may only break right after a terminator - same rule as the character
+    # builder above.
+    block_sizes = []
+    last = 0
+    for _t, _n, obj in ordered:
+        if len(body.buf) - last > MAX_MILO_BLOCK_SIZE:
+            block_sizes.append(len(body.buf) - last)
+            last = len(body.buf)
+        body.block(obj)
+    body_bytes = bytes(body.buf)
+    if len(body_bytes) - last > 0:
+        block_sizes.append(len(body_bytes) - last)
+
+    header = MiloWriter(big_endian=False)
+    START_OFFSET = 0x810
+    header.u32(0xCABEDEAF)
+    header.u32(START_OFFSET)
+    header.u32(len(block_sizes))
+    header.u32(max(block_sizes))
+    for sz in block_sizes:
+        header.u32(sz)
+    header.block(bytes(START_OFFSET - len(header.buf)))
+
+    counts = {}
+    for t, _n, _b in ordered:
+        counts[t] = counts.get(t, 0) + 1
+    _log(f"GH2 instrument container: "
+         + ", ".join(f"{counts[t]} {t}" for t in GH2_INSTRUMENT_ENTRY_ORDER if t in counts)
+         + f", {len(body_bytes)} body bytes in {len(block_sizes)} block(s).")
+    return bytes(header.buf) + body_bytes

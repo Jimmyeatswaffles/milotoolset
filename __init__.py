@@ -62,6 +62,9 @@ from .gh2_exporter import (
     build_gh2_reverse_donor_milo_bytes, check_gh2_all_references,
     check_gh2_root_bones, GH2_OPTIONAL_DONOR_TYPES,
     write_gh2_rnd_mat, write_gh2_rnd_tex, build_gh2_texture_blocks,
+    write_gh2_rnd_mesh, write_gh2_rnd_trans, write_gh2_group,
+    write_gh2_instrument_dir, build_gh2_instrument_milo_bytes,
+    GH2_INSTRUMENT_RIG_BONES, GH2_GUITAR_BODY_FRAME,
 )
 from .physics_exporter import _hair_bone_names, hair_profile_for_game, HAIR_EXPORT_GAMES
 from .skeleton_exporter import _read_skeleton_milo_trans, _trans_world_translation
@@ -167,8 +170,9 @@ MAT_VERSION_ITEMS = (
      "RndMat revision 28 as used for The Beatles: Rock Band custom song loose assets - a "
      "reduced field set"),
     ('REV_28_GH2', "Rev 28 (Guitar Hero II)",
-     "RndMat revision 28 as Guitar Hero II writes it - only the textures and texture "
-     "mapping are taken from these settings"),
+     "RndMat revision 28 as Guitar Hero II writes it - the same reduced field set as "
+     "the TBRB rev-28 option (blend, base color, lighting flags, z-mode, alpha cut, "
+     "textures, specular, emissive, cull)"),
 )
 
 # Which settings each revision actually writes (see the matching writer in
@@ -192,7 +196,10 @@ MAT_VERSION_FIELDS = {
     'REV_28_TBRB': {'blend', 'base_color', 'pre_lit', 'intensify', 'use_environment',
                     'z_mode', 'alpha_cut', 'textures', 'tex_wrap', 'specular_rgb',
                     'specular_power', 'emissive_multiplier', 'cull'},
-    'REV_28_GH2': {'textures', 'tex_wrap'},
+    # GH2 writes the same rev-28 field list as TBRB (see gh2_exporter.write_gh2_rnd_mat).
+    'REV_28_GH2': {'blend', 'base_color', 'pre_lit', 'intensify', 'use_environment',
+                   'z_mode', 'alpha_cut', 'textures', 'tex_wrap', 'specular_rgb',
+                   'specular_power', 'emissive_multiplier', 'cull'},
 }
 
 MAT_TEXWRAP_ITEMS = (
@@ -518,6 +525,34 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
     )
 
 
+class MATERIAL_OT_gltfmilo_gh2_defaults(bpy.types.Operator):
+    """Sets this material's non-texture values to what the Guitar Hero II exporter wrote
+    before these options were exposed (an opaque retail character body material).
+    Textures and texture mapping are left alone"""
+    bl_idname = "material.gltfmilo_gh2_defaults"
+    bl_label = "Load GH2 Character Defaults"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return getattr(context, 'material', None) is not None
+
+    def execute(self, context):
+        s = context.material.gltfmilo_settings
+        s.blend = 'kBlendSrc'
+        s.base_color = (1.0, 1.0, 1.0, 1.0)
+        s.pre_lit = True
+        s.intensify = False
+        s.use_environment = True
+        s.z_mode = 'kZModeNormal'
+        s.alpha_cut = False
+        s.specular_rgb = (0.0, 0.0, 0.0)
+        s.specular_power = 40.0
+        s.emissive_multiplier = 1.0
+        s.cull = True
+        return {'FINISHED'}
+
+
 class MATERIAL_OT_gltfmilo_autodetect_textures(bpy.types.Operator):
     """Scans this material's node tree for a Principled BSDF (or an imported material's
     Milo Character Shader node) and fills the texture slots above from whatever Image
@@ -788,8 +823,9 @@ class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
         if 'rb3_shader' in fields:
             _draw_rb3_preview(layout, context, settings)
         if settings.material_version == 'REV_28_GH2':
-            layout.label(text="Guitar Hero II materials take only the textures and "
-                              "texture mapping from here", icon='INFO')
+            box = layout.box()
+            box.label(text="Every value below is written to the GH2 .mat", icon='INFO')
+            box.operator("material.gltfmilo_gh2_defaults", icon='LOOP_BACK')
 
         def prop(target, name):
             if name in fields:
@@ -1436,8 +1472,9 @@ def _milo_game_items(self, context):
          "older revision set (DirectoryMeta 25 / ObjectDir 17 / Character 10 / Mesh 28), "
          "all byte-verified against a retail Xbox 360 milo. Mesh 28 stores plain float32 "
          "vertices with a FOUR-bone palette per mesh, so meshes are automatically split "
-         "to fit that limit on export. Requires a donor GH2 milo for the character "
-         "directory body. Materials and textures are not written yet",
+         "to fit that limit on export. Characters need a donor GH2 milo for the "
+         "character directory body; instruments (Type=Instrument) are built entirely "
+         "from the scene with no donor",
          _milo_icon_id('GH2'), 5),
     )
 
@@ -1971,7 +2008,7 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         box.prop(self, "platform")
         box.prop(self, "game")
         box.prop(self, "milo_type")
-        if self.milo_type == 'instrument':
+        if self.milo_type == 'instrument' and self.game != 'gh2':
             box.prop(self, "instrument_type")
         if self.milo_type == 'custom_song_asset':
             if self.game != 'tbrb':
@@ -2009,11 +2046,23 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
             if self.platform != 'xbox360':
                 sub.label(text="GH2 is Xbox 360 only - set Platform to Xbox 360.",
                           icon='ERROR')
-            sub.prop(self, "gh2_donor_mode")
-            sub.prop(self, "donor_milo")
-            if not self.donor_milo:
+            if self.milo_type == 'instrument':
+                sub.label(text="Instrument: built from the scene, no donor needed.",
+                          icon='INFO')
+                sub.label(text="Writes bones, meshes, materials, textures and the")
+                sub.label(text="lod0 / lod1 / shadow.grp groups.")
+                if not self.export_armature:
+                    sub.label(text="Export Armature is off - the game needs the guitar",
+                              icon='ERROR')
+                    sub.label(text="rig (bone_pos_guitar, spot_neck_fret01-20, ...).")
+                sub.label(text="Shadow: meshes named shadow* go into shadow.grp.",
+                          icon='INFO')
+            else:
+                sub.prop(self, "gh2_donor_mode")
+                sub.prop(self, "donor_milo")
+            if self.milo_type != 'instrument' and not self.donor_milo:
                 sub.label(text="A donor GH2 milo is REQUIRED.", icon='ERROR')
-            if self.gh2_donor_mode == 'reverse':
+            if self.milo_type != 'instrument' and self.gh2_donor_mode == 'reverse':
                 sub.label(text="Bone names must match the donor's rig - its", icon='INFO')
                 sub.label(text="drivers/IK reference bones by name.")
                 sub.prop(self, "gh2_omit_groups")
@@ -2021,9 +2070,9 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                     sub.label(text="Test build: directory will name 3 groups that",
                               icon='ERROR')
                     sub.label(text="won't exist. May not load.")
-            sub.label(text="Meshes auto-split to GH2's 4-bone-per-mesh limit.",
-                      icon='INFO')
-            sub.label(text="Materials/textures not written yet.", icon='INFO')
+            if self.milo_type != 'instrument':
+                sub.label(text="Meshes auto-split to GH2's 4-bone-per-mesh limit.",
+                          icon='INFO')
 
         if self.game in ('dc1', 'dc3'):
             sub = box.box()
@@ -2195,6 +2244,8 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
                         "Guitar Hero 2 is Xbox 360 only - GH2 never shipped on PS3. "
                         "Set Platform to Xbox 360.")
             return {'CANCELLED'}
+        if self.milo_type == 'instrument':
+            return self._export_gh2_instrument(context)
         if not self.donor_milo:
             self.report({'ERROR'},
                         "GH2 export needs a donor milo (any retail GH2 Xbox 360 "
@@ -2441,6 +2492,353 @@ class EXPORT_OT_milo_scene(bpy.types.Operator, ExportHelper):
         if truncated_total:
             warnings.append(f"{truncated_total} chunk(s) had weights truncated to the "
                             f"{GH2_MAX_BONES_PER_MESH}-bone limit")
+        if warnings:
+            full = summary + ". " + "; ".join(warnings)
+            _log(f"===== DONE WITH WARNINGS: {full} =====")
+            self.report({'WARNING'}, full)
+        else:
+            _log(f"===== SUCCESS: {summary} =====")
+            self.report({'INFO'}, summary)
+        return {'FINISHED'}
+
+    def _export_gh2_instrument(self, context):
+        """Guitar Hero 2 instrument (guitar / bass) export, built entirely from the
+        scene - no donor.
+
+        A GH2 instrument milo is a plain `Character` directory (not `BandCharacter`)
+        whose body references nothing but its LOD groups, its shadow group and its own
+        name, so unlike a character there is no behaviour config to borrow. Layout and
+        values decoded from retail flyingv_v2.milo_xbox - see the instrument block in
+        gh2_exporter.py.
+
+        What is written, in retail order:
+          * Tex / Mat   from each material's export settings (same path as characters).
+          * Mesh        one RIGID mesh per Blender object, no bone palette, parented
+                        through its own RndTrans to a bone (or to another exported
+                        mesh), exactly like retail guitar.mesh -> bone_pos_guitar.mesh
+                        and strings.mesh -> guitar.mesh. The vertices are re-expressed in
+                        a fixed frame relative to that parent, NOT in the Blender
+                        object's own space - see "Mesh frame" below.
+
+        Mesh frame. The first in-game test showed why this matters: the guitar played
+        correctly but sat diagonally in the guitar-select menu. The export had kept
+        each Blender object's own space, and an object at the origin means vertices in
+        pelvis space (diagonal) with the tilt carried in the mesh's local transform.
+        In play that composes back fine, but the menu evidently shows the meshes by
+        their own frame, not through the play rig. Retail stores guitar.mesh upright in
+        its own space (neck along +Z) with a fixed local frame under bone_pos_guitar -
+        GH2_GUITAR_BODY_FRAME. So a mesh under bone_pos_guitar.mesh gets that exact
+        local transform and its vertices are baked into it; under any other parent the
+        local transform is identity and the vertices are baked into the parent's
+        frame. World placement is unchanged, and an imported retail guitar round-trips
+        to its original vertices.
+          * Group       lod0 / lod1 listing every non-shadow mesh (lod1 hidden, as in
+                        retail), shadow.grp listing meshes whose name starts "shadow".
+          * Trans       every armature bone when Export Armature is on (the default for
+                        Type=Instrument). Root bones parent onto the directory.
+
+        The directory is named after the output file (flyingv_v2.milo_xbox ->
+        "flyingv_v2"), because the game opens the milo by that name.
+        """
+        import os
+
+        root_name = os.path.basename(self.filepath)
+        for ext in ('.milo_xbox', '.milo'):
+            if root_name.lower().endswith(ext):
+                root_name = root_name[:-len(ext)]
+                break
+        root_name = root_name or "instrument"
+
+        candidates = (context.selected_objects
+                      if (self.only_selected and context.selected_objects)
+                      else context.scene.objects)
+        mesh_objs = [o for o in candidates if o.type == 'MESH']
+        if not mesh_objs:
+            self.report({'ERROR'}, "No mesh objects to export.")
+            return {'CANCELLED'}
+
+        armature_obj = None
+        for o in mesh_objs:
+            for mod in o.modifiers:
+                if mod.type == 'ARMATURE' and mod.object is not None:
+                    armature_obj = mod.object
+                    break
+            if armature_obj is None and o.parent is not None and o.parent.type == 'ARMATURE':
+                armature_obj = o.parent
+            if armature_obj:
+                break
+        if armature_obj is None:
+            armature_obj = next((o for o in candidates if o.type == 'ARMATURE'), None)
+        if armature_obj is None:
+            armature_obj = next((o for o in context.scene.objects
+                                 if o.type == 'ARMATURE'), None)
+
+        _log(f"===== Exporting GH2 instrument '{root_name}' =====")
+        warnings = []
+
+        # --- bones ---
+        bone_entries = []
+        bone_world = {}
+        if self.export_armature:
+            if armature_obj is None:
+                self.report({'ERROR'},
+                            "Export Armature is on but no armature was found. Import or "
+                            "build the guitar rig, or turn Export Armature off.")
+                return {'CANCELLED'}
+            raw_bones, _inv = _collect_gh2_bones(armature_obj)
+            for (bn, local12, world12, parent) in raw_bones:
+                # Retail roots (bone_pelvis.mesh) parent onto the directory itself.
+                bone_entries.append((bn, local12, world12, parent or root_name))
+            bone_world = {b.name: armature_obj.matrix_world @ b.matrix_local
+                          for b in armature_obj.data.bones}
+            missing_rig = [b for b in GH2_INSTRUMENT_RIG_BONES if b not in bone_world]
+            _log(f"  armature '{armature_obj.name}': {len(bone_entries)} bone(s)")
+            if missing_rig:
+                ex = ", ".join(missing_rig[:4])
+                _log(f"  WARNING: {len(missing_rig)} standard GH2 guitar rig bone(s) "
+                     f"missing: {', '.join(missing_rig)}")
+                warnings.append(f"{len(missing_rig)} guitar rig bone(s) missing "
+                                f"({ex}{' ...' if len(missing_rig) > 4 else ''})")
+        else:
+            _log("  Export Armature is OFF - no Trans bones written.")
+            warnings.append("no bones exported (Export Armature off) - the game "
+                            "expects the guitar rig")
+            # bone_world stays empty: with no Trans written, a mesh parented to a
+            # bone would dangle, so meshes parent onto the directory instead.
+
+        # --- materials & textures ---
+        gh2_mats = {s.material for o in mesh_objs for s in o.material_slots
+                    if s.material is not None}
+        if report_material_version_problems(self, gh2_mats, {'REV_28_GH2'},
+                                            "Guitar Hero II"):
+            return {'CANCELLED'}
+        try:
+            material_entries, mat_name_by_material = _collect_gh2_materials(
+                mesh_objs, max_tex_size=512,
+                ignore_tex_size_limits=self.ignore_tex_size_limits)
+        except Exception as e:
+            _log(f"  WARNING: material/texture export failed ({e}) - meshes will "
+                 f"reference no material.")
+            warnings.append("materials/textures failed - see the system console")
+            material_entries, mat_name_by_material = [], {}
+
+        # --- meshes ---
+        used_names = set(bone_world)
+        entry_name_by_obj = {}
+        import re as _re
+        for obj in mesh_objs:
+            # "greenday_resource.mesh.001" -> "greenday_resource.mesh", not
+            # "greenday_resource.mesh.001.mesh"; duplicates get _2, _3 below.
+            stem = _re.sub(r'\.\d{3}$', '', obj.name)
+            if stem.lower().endswith('.mesh'):
+                stem = stem[:-5]
+            base = f"{sanitize_milo_name(stem)}.mesh"
+            name = base
+            n = 2
+            while name in used_names:
+                name = f"{base[:-5]}_{n}.mesh"
+                n += 1
+            used_names.add(name)
+            entry_name_by_obj[obj.name] = name
+        obj_by_entry = {v: k for k, v in entry_name_by_obj.items()}
+
+        default_parent = ('bone_pos_guitar.mesh' if 'bone_pos_guitar.mesh' in bone_world
+                          else root_name)
+
+        def resolve_parent(obj):
+            """Parent entry name for `obj`. Order: a Blender bone parent, the imported
+            gh2_parent tag (a bone, another exported mesh, or the directory), a single
+            fully-weighted vertex group, then bone_pos_guitar.mesh (the retail body's
+            parent)."""
+            if (obj.parent is not None and obj.parent.type == 'ARMATURE'
+                    and obj.parent_type == 'BONE' and obj.parent_bone in bone_world):
+                return obj.parent_bone
+            tag = obj.get('gh2_parent')
+            if isinstance(tag, str) and tag:
+                if tag in bone_world or tag == root_name:
+                    return tag
+                if tag in obj_by_entry and obj_by_entry[tag] != obj.name:
+                    return tag
+            bone_groups = [g.name for g in obj.vertex_groups if g.name in bone_world]
+            if len(bone_groups) == 1:
+                return bone_groups[0]
+            if default_parent in bone_world:
+                return default_parent
+            return root_name
+
+        from mathutils import Matrix as _Matrix, Vector
+        body_frame = _milo_to_blender_matrix(GH2_GUITAR_BODY_FRAME)
+        identity4 = _Matrix.Identity(4)
+        parent_of = {entry_name_by_obj[o.name]: resolve_parent(o) for o in mesh_objs}
+        export_world = {}            # entry name -> world matrix as written
+
+        def local_frame(parent_name):
+            return body_frame if parent_name == 'bone_pos_guitar.mesh' else identity4
+
+        def world_of_entry(name, seen=()):
+            """World matrix an entry is WRITTEN with (bones from the armature, meshes
+            from their parent's written world @ their fixed local frame)."""
+            if name in bone_world:
+                return bone_world[name]
+            if name in export_world:
+                return export_world[name]
+            if name not in parent_of or name in seen:
+                return identity4         # directory root, or a parent cycle
+            parent = parent_of[name]
+            wm = world_of_entry(parent, seen + (name,)) @ local_frame(parent)
+            export_world[name] = wm
+            return wm
+
+        depsgraph = context.evaluated_depsgraph_get()
+        alpha_blends = {'kBlendSrcAlpha', 'kBlendSrcAlphaAdd', 'kPreMultAlpha'}
+        mesh_objects = []          # (type, name, bytes)
+        main_meshes, shadow_meshes = [], []
+        first_main_mat = ""
+        multi_bone = []
+
+        for obj in mesh_objs:
+            name = entry_name_by_obj[obj.name]
+            try:
+                vertices, faces = _collect_gh2_mesh_data(obj, depsgraph,
+                                                         world_space=False)
+            except Exception as e:
+                _log(f"  WARNING: couldn't read mesh '{obj.name}': {e} - skipped.")
+                continue
+            if not faces:
+                _log(f"  NOTE: '{obj.name}' has no faces - skipped.")
+                continue
+            if len({b for v in vertices for b, _w in v["weights"]
+                    if b in bone_world}) > 1:
+                multi_bone.append(obj.name)
+            for v in vertices:
+                v["weights"] = []          # rigid - placement comes from the parent
+
+            parent_name = parent_of[name]
+            local = local_frame(parent_name)
+            world = world_of_entry(name)
+            # Re-express the object-space vertices in the written frame - see "Mesh
+            # frame" in the docstring. World placement is exactly what Blender shows.
+            to_frame = world.inverted() @ obj.matrix_world
+            nrm = to_frame.to_3x3().inverted().transposed()
+            for v in vertices:
+                co = to_frame @ Vector((v["x"], v["y"], v["z"]))
+                n = (nrm @ Vector((v["nx"], v["ny"], v["nz"]))).normalized()
+                v["x"], v["y"], v["z"] = co.x, co.y, co.z
+                v["nx"], v["ny"], v["nz"] = n.x, n.y, n.z
+
+            mat_name = ""
+            mat = next((m for m in obj.data.materials if m is not None), None)
+            if mat is not None:
+                mat_name = mat_name_by_material.get(mat.name, "")
+
+            draw_order = obj.get('gh2_draw_order')
+            if draw_order is None:
+                st = getattr(mat, 'gltfmilo_settings', None) if mat is not None else None
+                draw_order = 0.1 if (st is not None and st.blend in alpha_blends) else 0.0
+
+            is_shadow = name.lower().startswith('shadow')
+            is_fire = name == 'guitar_fire.mesh'
+            w = MiloWriter(big_endian=False)
+            write_gh2_rnd_mesh(w, name, _matrix_to_gh2_m12(local),
+                               _matrix_to_gh2_m12(world), parent_name,
+                               vertices, faces, [], mat_name=mat_name,
+                               showing=not is_fire, draw_order=float(draw_order),
+                               mutable=63 if is_fire else 0)
+            mesh_objects.append(('Mesh', name, bytes(w.buf)))
+            (shadow_meshes if is_shadow else main_meshes).append(name)
+            if not is_shadow and not first_main_mat:
+                first_main_mat = mat_name
+            _log(f"  '{obj.name}' -> '{name}': {len(vertices)} vert(s), "
+                 f"{len(faces)} tri(s), parent '{parent_name}', mat '{mat_name or '-'}'"
+                 f"{', drawOrder ' + format(draw_order, 'g') if draw_order else ''}")
+
+        if not main_meshes:
+            self.report({'ERROR'}, "Nothing exportable - no non-shadow mesh had any "
+                                    "faces (see the system console).")
+            return {'CANCELLED'}
+
+        # Retail ships a hidden, mutable 'guitar_fire.mesh'. Nothing here is known to
+        # look it up by name, but a blank stub costs nothing and keeps any such lookup
+        # resolving - the same reasoning the character path uses for the donor's eyes.
+        if 'guitar_fire.mesh' not in main_meshes:
+            fire_parent = ('guitar.mesh' if 'guitar.mesh' in main_meshes
+                           else default_parent)
+            fire_local = local_frame(fire_parent)
+            fire_world = world_of_entry(fire_parent) @ fire_local
+            w = MiloWriter(big_endian=False)
+            write_gh2_rnd_mesh(w, 'guitar_fire.mesh', _matrix_to_gh2_m12(fire_local),
+                               _matrix_to_gh2_m12(fire_world), fire_parent,
+                               [], [], [], mat_name=first_main_mat, showing=False,
+                               mutable=63)
+            mesh_objects.append(('Mesh', 'guitar_fire.mesh', bytes(w.buf)))
+            main_meshes.append('guitar_fire.mesh')
+            _log(f"  added blank hidden 'guitar_fire.mesh' stub (parent "
+                 f"'{fire_parent}'), as retail ships one")
+
+        # --- groups (retail: lod0 shown, lod1 hidden, shadow.grp shown) ---
+        group_objects = []
+        for gname, members, showing in (('lod0', main_meshes, True),
+                                         ('lod1', main_meshes, False),
+                                         ('shadow.grp', shadow_meshes, True)):
+            w = MiloWriter(big_endian=False)
+            write_gh2_group(w, gname, members, anim_frame=0.0, anim_flag=0,
+                            showing=showing)
+            group_objects.append(('Group', gname, bytes(w.buf)))
+
+        # --- bones ---
+        trans_objects = []
+        for (bn, local12, world12, parent) in bone_entries:
+            w = MiloWriter(big_endian=False)
+            write_gh2_rnd_trans(w, local12, world12, parent, standalone=True)
+            trans_objects.append(('Trans', bn, bytes(w.buf)))
+
+        dir_w = MiloWriter(big_endian=False)
+        write_gh2_instrument_dir(dir_w, root_name)
+
+        entries = (list(material_entries) + mesh_objects + group_objects
+                   + trans_objects)
+        try:
+            data = build_gh2_instrument_milo_bytes(root_name, entries, bytes(dir_w.buf))
+        except Exception as e:
+            _log(f"GH2 INSTRUMENT EXPORT FAILED (build): {e}")
+            self.report({'ERROR'}, f"Failed while building the milo: {e}")
+            return {'CANCELLED'}
+
+        for label, check in (("verify", verify_gh2_milo_bytes),
+                             ("references", check_gh2_references),
+                             ("deep references", check_gh2_all_references)):
+            ok, msg = check(data)
+            if not ok:
+                _log(f"GH2 INSTRUMENT EXPORT FAILED ({label}): {msg}")
+                self.report({'ERROR'}, f"Built milo failed the {label} check, nothing "
+                                        f"written: {msg}")
+                return {'CANCELLED'}
+            _log(f"  {label}: {msg}")
+        if bone_entries:
+            ok, msg = check_gh2_root_bones(data)
+            if not ok:
+                _log(f"GH2 INSTRUMENT EXPORT FAILED (root bones): {msg}")
+                self.report({'ERROR'}, f"Milo has unparented root bones, nothing "
+                                        f"written: {msg}")
+                return {'CANCELLED'}
+            _log(f"  root bones: {msg}")
+
+        try:
+            with open(self.filepath, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            self.report({'ERROR'}, f"Couldn't write '{self.filepath}': {e}")
+            return {'CANCELLED'}
+
+        nmat = sum(1 for t, _n, _b in material_entries if t == 'Mat')
+        ntex = sum(1 for t, _n, _b in material_entries if t == 'Tex')
+        summary = (f"Exported GH2 instrument '{root_name}': {len(bone_entries)} bone(s), "
+                   f"{len(mesh_objects)} mesh(es), {nmat} material(s), {ntex} "
+                   f"texture(s), {len(data)} bytes")
+        if multi_bone:
+            warnings.append(f"{len(multi_bone)} mesh(es) were weighted to several bones "
+                            f"but GH2 instrument meshes are rigid - exported following "
+                            f"one parent each ({', '.join(multi_bone[:3])})")
         if warnings:
             full = summary + ". " + "; ".join(warnings)
             _log(f"===== DONE WITH WARNINGS: {full} =====")
@@ -4986,7 +5384,7 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
 
     Images are deduplicated, so two materials sharing a texture produce one Tex entry.
     """
-    from .texture_exporter import get_image_rgba8
+    from .texture_exporter import get_image_rgba8, MAT_BLEND_VALUES, MAT_ZMODE_VALUES
 
     extra_entries = []
     mat_name_by_material = {}
@@ -5006,6 +5404,8 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
         if key in tex_by_image:
             return tex_by_image[key]
         base = sanitize_milo_name(image.name.rsplit('.', 1)[0])
+        if suffix and base.lower().endswith(suffix.lower()):
+            suffix = ""          # "tun_norm" + "_norm" would give "tun_norm_norm"
         entry_name = f"{base}{suffix}.tex"
         n = 2
         while entry_name in seen_names:
@@ -5037,7 +5437,7 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
         # and the milo shipped with zero textures. Reading the same attribute name the
         # rest of the addon reads is the fix.
         s = getattr(mat, 'gltfmilo_settings', None)
-        diffuse = normal = specular = ""
+        diffuse = normal = specular = emissive = ""
         if s is not None:
             try:
                 if getattr(s, 'diffuse_tex', None) is not None:
@@ -5046,6 +5446,8 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
                     normal = register_texture(s.normal_tex, "_norm", True)
                 if getattr(s, 'specular_tex', None) is not None:
                     specular = register_texture(s.specular_tex, "_spec", False)
+                if getattr(s, 'emissive_tex', None) is not None:
+                    emissive = register_texture(s.emissive_tex, "_emis", False)
             except Exception as e:
                 _log(f"  WARNING: couldn't encode a texture for material "
                      f"'{mat_name}': {e} - that slot is left empty.")
@@ -5053,22 +5455,45 @@ def _collect_gh2_materials(mesh_objs, max_tex_size=512, ignore_tex_size_limits=F
         if s is None:
             _log(f"  WARNING: material '{mat_name}' has no material export settings - "
                  f"exported with no textures.")
-        elif not (diffuse or normal or specular):
+        elif not (diffuse or normal or specular or emissive):
             _log(f"  NOTE: material '{mat_name}' has no texture slots filled in "
                  f"(Material Properties > Rock Band Material Export Settings > Textures) - "
                  f"exported untextured.")
 
-        entry_name = f"{sanitize_milo_name(mat_name)}.mat"
+        mat_stem = mat_name[:-4] if mat_name.lower().endswith('.mat') else mat_name
+        entry_name = f"{sanitize_milo_name(mat_stem)}.mat"
         w = MiloWriter(big_endian=False)
+        if s is not None:
+            # Every rev-28 field the material panel shows for GH2 is written as set.
+            mat_kwargs = dict(
+                blend=MAT_BLEND_VALUES.get(s.blend, 1),
+                base_color=tuple(s.base_color),
+                pre_lit=bool(s.pre_lit),
+                intensify=bool(s.intensify),
+                use_environment=bool(s.use_environment),
+                z_mode=MAT_ZMODE_VALUES.get(s.z_mode, 1),
+                alpha_cut=bool(s.alpha_cut),
+                specular_rgb=tuple(s.specular_rgb),
+                specular_power=float(s.specular_power),
+                emissive_multiplier=float(s.emissive_multiplier),
+                cull=bool(s.cull),
+                tex_wrap=s.tex_wrap,
+            )
+        else:
+            mat_kwargs = {}     # writer defaults: opaque retail character body
         write_gh2_rnd_mat(w, diffuse_tex=diffuse, normal_tex=normal,
-                          specular_tex=specular,
-                          tex_wrap=getattr(s, 'tex_wrap', 'kTexWrapRepeat')
-                          if s is not None else 'kTexWrapRepeat')
+                          specular_tex=specular, emissive_tex=emissive, **mat_kwargs)
         extra_entries.append(('Mat', entry_name, bytes(w.buf)))
         mat_name_by_material[mat_name] = entry_name
         _log(f"  material '{mat_name}' -> '{entry_name}' "
              f"(diffuse={diffuse or '-'}, normal={normal or '-'}, "
-             f"specular={specular or '-'})")
+             f"specular={specular or '-'}, emissive={emissive or '-'})")
+        if s is not None:
+            c = s.base_color
+            _log(f"    blend={s.blend}, color=({c[0]:.3f}, {c[1]:.3f}, {c[2]:.3f}, "
+                 f"{c[3]:.3f}), cull={bool(s.cull)}, preLit={bool(s.pre_lit)}, "
+                 f"useEnv={bool(s.use_environment)}, zMode={s.z_mode}, "
+                 f"specPower={s.specular_power:g}")
 
     return extra_entries, mat_name_by_material
 
@@ -5113,7 +5538,7 @@ def _collect_gh2_bones(armature_obj):
     return bones, inv_bind
 
 
-def _collect_gh2_mesh_data(obj, depsgraph):
+def _collect_gh2_mesh_data(obj, depsgraph, world_space=True):
     """Evaluate one Blender mesh object and return (vertices, faces) in the dict shape
     gh2_exporter expects - the SAME shape parse_gh2_meshes returns, so imported data
     and freshly-authored data take identical paths from here on.
@@ -5127,12 +5552,20 @@ def _collect_gh2_mesh_data(obj, depsgraph):
     Per-vertex weights are taken from vertex groups whose names match armature bones;
     groups that don't name a bone (stray or user groups) are ignored rather than
     exported as bogus bone references. Weights are normalized per vertex.
+
+    `world_space=False` keeps positions and normals in the object's own space instead,
+    for rigid meshes that carry their placement in their own RndTrans (the instrument
+    path - retail guitar meshes store local vertices plus a parent-relative xfm).
     """
     eval_obj = obj.evaluated_get(depsgraph)
     me = eval_obj.to_mesh()
     try:
         me.calc_loop_triangles()
-        mw = eval_obj.matrix_world
+        if world_space:
+            mw = eval_obj.matrix_world
+        else:
+            from mathutils import Matrix
+            mw = Matrix.Identity(4)
         nm = mw.to_3x3().inverted().transposed()
 
         try:
@@ -5203,6 +5636,7 @@ classes = (
     SCENE_OT_gltfmilo_rb3_standard_view,
     MATERIAL_OT_gltfmilo_rb3_shader_all,
     MATERIAL_OT_gltfmilo_autodetect_textures,
+    MATERIAL_OT_gltfmilo_gh2_defaults,
     MATERIAL_PT_gltfmilo_settings,
     MATERIAL_PT_gltfmilo_refract,
     GltfMiloHairBoneItem,
