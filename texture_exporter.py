@@ -830,8 +830,13 @@ def write_rnd_mat(w: MiloWriter, settings, standalone=True):
 
     w.i32(MAT_BLEND_VALUES[settings['blend']])
     write_color4(w, *settings['base_color'])
-    w.boolean(settings['pre_lit'])
-    w.boolean(settings['use_environment'])
+    # Rev 68 stores useEnviron BEFORE prelit (RndMat::Load in RB3's default.xex). See
+    # rb3_shader.effective_rb3_lighting for how the panel's two checkboxes map onto them.
+    from .rb3_shader import effective_rb3_lighting
+    use_environ, prelit = effective_rb3_lighting(settings['pre_lit'],
+                                                 settings['use_environment'])
+    w.boolean(use_environ)
+    w.boolean(prelit)
     w.i32(MAT_ZMODE_VALUES[settings['z_mode']])
     w.boolean(settings['alpha_cut'])
     # revision(68) > 0x25(37): True
@@ -867,10 +872,13 @@ def write_rnd_mat(w: MiloWriter, settings, standalone=True):
     # revision(68) < 51: False -> unkSymbol2 skipped
     w.symbol("instruments.cube" if settings['environment_map'] else "")  # environMap
 
-    # revision > 25: True; revision == 68: True
-    w.u16(0)                           # unkShort
+    # revision > 60 / > 66: True. Falloff fades the reflection in towards grazing angles;
+    # specmask scales it by the specular map's alpha (only with a specular map).
+    w.boolean(settings.get('environment_map_falloff', False))   # environMapFalloff
+    w.boolean(settings.get('environment_map_specmask', False))  # environMapSpecMask
 
-    w.boolean(True)                    # perPixelLit - Program.cs line 664: always true
+    w.boolean(settings.get('per_pixel_lit', True))   # perPixelLit - off falls back to vertex
+                                                     # lighting: no normal/specular map or rim
 
     # revision >= 27 and < 50: False (68 is outside) -> unkBool1 skipped
 
@@ -892,13 +900,14 @@ def write_rnd_mat(w: MiloWriter, settings, standalone=True):
     # revision < 0x3F(63): False (68 not < 63) -> projLights skipped
     w.boolean(False)                   # fog - Program.cs line 671: always false
     w.boolean(False)                   # fadeout - not set by CLI, C# default
-    w.boolean(False)                   # colorAdjust - not set by CLI, C# default
+    w.boolean(settings.get('rb3_color_adjust', False))  # colorAdjust - the environment's
+                                                        # colour transform applies to it
 
     # revision > 47: True
     write_color3(w, *settings.get('rim_rgb', (0.0, 0.0, 0.0)))  # rimRGB - user-editable
     w.f32(settings.get('rim_power', 4.0))  # rimPower - user-editable
     w.symbol("")                       # rimMap
-    w.boolean(False)                   # rimAlwaysShow
+    w.boolean(False)                   # rimLightUnder (rimAlwaysShow before rev 58)
 
     # revision > 48: True
     w.boolean(False)                   # screenAligned
@@ -1444,6 +1453,11 @@ def gather_materials_and_textures(materials_by_name, max_tex_size=512, ignore_te
             'specular_power': s.specular_power,
             'emissive_multiplier': s.emissive_multiplier,
             'environment_map': s.environment_map,
+            'environment_map_falloff': getattr(s, 'environment_map_falloff', False),
+            'environment_map_specmask': getattr(s, 'environment_map_specmask', False),
+            'per_pixel_lit': getattr(s, 'per_pixel_lit', True),
+            # Own key: the TBRB/RB2 writers read 'color_adjust' with their own defaults.
+            'rb3_color_adjust': getattr(s, 'color_adjust', False),
             'cull': s.cull,
             'tex_wrap': s.tex_wrap,
             'material_version': s.material_version,

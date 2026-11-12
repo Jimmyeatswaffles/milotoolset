@@ -387,20 +387,23 @@ def parse_mat(data, name):
 
 
 def _parse_mat_68(data, name):
-    """RndMat revision 68 (Rock Band 3, Dance Central 1), in the order
-    texture_exporter.write_rnd_mat writes it. The slots up to the specular map match 55/56;
-    after it come the environment map, a short, perPixelLit, stencil, fur, the detail-normal
-    fields, four light/fog flags (no projLights), rim, screenAligned, shaderVariation,
-    specular2, three perf flags and the refraction settings. All 13 materials in the retail
-    angel01.milo_xbox end exactly on their object boundary, which is required here."""
+    """RndMat revision 68 (Rock Band 3, Dance Central 1), in the order RndMat::Load reads it
+    in RB3's default.xex. Unlike 55/56, useEnviron comes BEFORE prelit. The slots up to the
+    specular map otherwise match 55/56; after it come the environment map, its falloff and
+    specmask flags (rev > 60 and > 66), perPixelLit, stencil, fur, the detail-normal fields,
+    four light/fog flags (no projLights), rim, screenAligned, shaderVariation, specular2,
+    three perf flags and the refraction settings. The flag after the rim map is
+    rimLightUnder from rev 58 on (rimAlwaysShow only exists up to 57). All 13 materials in
+    the retail angel01.milo_xbox end exactly on their object boundary, which is required
+    here."""
     r = _R(data)
     rev = r.u32()
     r.p = MAT_OBJECT_HEADER_END
     m = dict(revision=rev)
     m['blend'] = r.u32()
     m['color'] = (r.f32(), r.f32(), r.f32(), r.f32())
-    m['prelit'] = bool(r.u8())
     m['use_environ'] = bool(r.u8())
+    m['prelit'] = bool(r.u8())
     m['z_mode'] = r.u32()
     m['alpha_cut'] = bool(r.u8())
     m['alpha_threshold'] = r.u32()
@@ -419,7 +422,8 @@ def _parse_mat_68(data, name):
     m['emissive'] = r.sym()
     m['specular'] = r.sym()
     m['environ_map'] = r.sym()
-    r.u16()                                             # unknown short
+    m['environ_map_falloff'] = bool(r.u8())
+    m['environ_map_specmask'] = bool(r.u8())
     m['per_pixel_lit'] = bool(r.u8())
     m['stencil'] = r.u32()
     m['fur'] = r.sym()
@@ -436,7 +440,8 @@ def _parse_mat_68(data, name):
     m['rim_rgb'] = (r.f32(), r.f32(), r.f32())
     m['rim_power'] = r.f32()
     m['rim_map'] = r.sym()
-    m['rim_always_show'] = bool(r.u8())
+    m['rim_light_under'] = bool(r.u8())
+    m['rim_always_show'] = False
     m['screen_aligned'] = bool(r.u8())
     m['shader_variation'] = r.u32()
     m['specular2_rgb'] = (r.f32(), r.f32(), r.f32())
@@ -1486,6 +1491,10 @@ def fill_material_settings(mat, slots, images):
     put('specular_power', float(slots.get('specular_power', 0.0)))
     put('emissive_multiplier', float(slots.get('emissive_multiplier', 1.0)))
     put('environment_map', bool(slots.get('environ_map')))
+    put('environment_map_falloff', bool(slots.get('environ_map_falloff')))
+    put('environment_map_specmask', bool(slots.get('environ_map_specmask')))
+    put('per_pixel_lit', bool(slots.get('per_pixel_lit', True)))
+    put('color_adjust', bool(slots.get('color_adjust')))
     put('cull', bool(slots.get('cull')))
     dn = slots.get('de_normal', 0.0)
     put('de_normal', '-1' if dn < -0.5 else ('1' if dn > 0.5 else '0'))
@@ -1498,6 +1507,7 @@ def fill_material_settings(mat, slots, images):
         put('shader_variation', _VARIATION_ENUM[sv])
 
     mat["milo_rim_always_show"] = bool(slots.get('rim_always_show'))
+    mat["milo_rim_light_under"] = bool(slots.get('rim_light_under'))
     mat["milo_specular2_rgb"] = list(slots.get('specular2_rgb', (0.0, 0.0, 0.0)))
     mat["milo_specular2_power"] = float(slots.get('specular2_power', 0.0))
     mat["milo_normal_detail_map"] = slots.get('detail_normal', '')
@@ -1744,6 +1754,10 @@ def apply_textures(filepath, material_names, flip_green=True, source=None,
         # The panel keeps the material's own slots, so a re-export writes what the game
         # file had rather than the borrowed preview map.
         fill_material_settings(mat, slots, own_imgs)
+        if mat.get("milo_rb3_shader"):
+            # The tree was rebuilt under a material previewed with the Rock Band 3 shader.
+            from .rb3_shader import enable_rb3_shader
+            enable_rb3_shader(mat)
         mat["milo_borrowed_specular"] = borrowed[1] if (borrowed and imgs['specular']
                                                         is not None
                                                         and own_imgs['specular'] is None) \

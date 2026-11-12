@@ -49,6 +49,7 @@ from .lipsync_importer import *
 from . import rb2_creator_textures
 from . import rb2_character_importer
 from . import rb2_proportions
+from . import rb3_shader
 
 # `import *` skips names starting with underscore, so anything private that this file
 # calls directly (rather than through a public wrapper) has to be imported explicitly.
@@ -178,9 +179,12 @@ _MAT_ALL_FIELDS = ('blend', 'base_color', 'pre_lit', 'intensify', 'use_environme
                    'environment_map', 'cull', 'de_normal', 'anisotropy',
                    'normal_detail_strength', 'rim_rgb', 'rim_power', 'shader_variation',
                    'meta_material', 'refract')
+# Rev-68-only controls (Rock Band 3 / Dance Central 1): the environment-map flags, per-pixel
+# lighting, and the Rock Band 3 preview shader.
+_MAT_RB3_FIELDS = {'environment_map_flags', 'per_pixel_lit', 'color_adjust', 'rb3_shader'}
 MAT_VERSION_FIELDS = {
-    'AUTO': set(_MAT_ALL_FIELDS),
-    'REV_68': set(_MAT_ALL_FIELDS) - {'meta_material'},
+    'AUTO': set(_MAT_ALL_FIELDS) | _MAT_RB3_FIELDS,
+    'REV_68': (set(_MAT_ALL_FIELDS) - {'meta_material'}) | _MAT_RB3_FIELDS,
     'REV_70': set(_MAT_ALL_FIELDS),
     'REV_55': set(_MAT_ALL_FIELDS) - {'environment_map', 'refract', 'meta_material'},
     'REV_47': set(_MAT_ALL_FIELDS) - {'environment_map', 'refract', 'meta_material',
@@ -231,8 +235,28 @@ def report_material_version_problems(op, materials, accepted, game_label):
     return True
 
 
+def _rb3_settings_changed(self, context):
+    """Keeps a material's Rock Band 3 preview shader in step with its export settings."""
+    mat = self.id_data
+    if isinstance(mat, bpy.types.Material) and mat.get(rb3_shader.MAT_KEY):
+        rb3_shader.sync_rb3_material(mat)
+
+
+def _rb3_shader_toggled(self, context):
+    mat = self.id_data
+    if not isinstance(mat, bpy.types.Material):
+        return
+    if self.rb3_shader:
+        rb3_shader.enable_rb3_shader(mat)
+        _push_rb3_environment(getattr(context.scene, 'gltfmilo_rb3_preview', None)
+                              if context is not None and context.scene is not None else None)
+    else:
+        rb3_shader.disable_rb3_shader(mat)
+
+
 class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
     material_version: EnumProperty(
+        update=_rb3_settings_changed,
         name="Material Version",
         description="Which RndMat revision this material is exported at. Material "
                      "revisions are not interchangeable between games; the export stops "
@@ -248,12 +272,14 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default='kTexWrapRepeat',
     )
     blend: EnumProperty(
+        update=_rb3_settings_changed,
         name="Blend Mode",
         description="RndMat.blend - how to blend this material's poly into the screen",
         items=MAT_BLEND_ITEMS,
         default='kBlendSrc',
     )
     base_color: FloatVectorProperty(
+        update=_rb3_settings_changed,
         name="Base Color",
         description="RndMat.color - base material color",
         subtype='COLOR',
@@ -262,11 +288,16 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=(1.0, 1.0, 1.0, 1.0),
     )
     pre_lit: BoolProperty(
+        update=_rb3_settings_changed,
         name="Pre-Lit",
-        description="RndMat.preLit - use vertex color and alpha for base or ambient",
+        description="RndMat.preLit - use vertex color and alpha for base or ambient. For "
+                    "Rock Band 3 (rev 68), Pre-Lit on with Use Environment off - the default - "
+                    "is written as the lit setup every retail RB3 character uses "
+                    "(useEnviron on, preLit off); any other combination is written as set",
         default=True,
     )
     intensify: BoolProperty(
+        update=_rb3_settings_changed,
         name="Intensify Base Color",
         description="RndMat.intensify - boosts (doubles) the base color, pushing bright "
                      "materials further into the venue's bloom range. This is the trick "
@@ -277,8 +308,11 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=False,
     )
     use_environment: BoolProperty(
+        update=_rb3_settings_changed,
         name="Use Environment",
-        description="RndMat.useEnviron - modulate with environment ambient and lights",
+        description="RndMat.useEnviron - modulate with environment ambient and lights. "
+                    "In Rock Band 3 a material without it is unlit (no cube, no specular). "
+                    "See Pre-Lit for how the default pair is written",
         default=False,
     )
     z_mode: EnumProperty(
@@ -288,37 +322,44 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default='kZModeNormal',
     )
     alpha_cut: BoolProperty(
+        update=_rb3_settings_changed,
         name="Alpha Cut",
         description="RndMat.alphaCut - cut zero-alpha pixels from the z-buffer",
         default=False,
     )
     alpha_threshold: IntProperty(
+        update=_rb3_settings_changed,
         name="Alpha Threshold",
         description="RndMat.alphaThreshold - alpha level below which gets cut (0-255)",
         min=0, max=255,
         default=0,
     )
     diffuse_tex: PointerProperty(
+        update=_rb3_settings_changed,
         name="Diffuse Texture",
         description="RndMat.diffuseTex - base texture map, modulated with color and alpha",
         type=bpy.types.Image,
     )
     normal_tex: PointerProperty(
+        update=_rb3_settings_changed,
         name="Normal Map",
         description="RndMat.normalMap - texture map that defines lighting normals",
         type=bpy.types.Image,
     )
     specular_tex: PointerProperty(
+        update=_rb3_settings_changed,
         name="Specular Map",
         description="RndMat.specularMap - texture map for specular color and power",
         type=bpy.types.Image,
     )
     emissive_tex: PointerProperty(
+        update=_rb3_settings_changed,
         name="Emissive Map",
         description="RndMat.emissiveMap - map for self illumination",
         type=bpy.types.Image,
     )
     specular_rgb: FloatVectorProperty(
+        update=_rb3_settings_changed,
         name="Specular RGB",
         description="RndMat.specularRGB - color to use when not driven by a specular map",
         subtype='COLOR',
@@ -327,16 +368,19 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=(0.255, 0.255, 0.255),
     )
     specular_power: FloatProperty(
+        update=_rb3_settings_changed,
         name="Specular Power",
         description="RndMat.specularPower - power to use when not driven by a specular map",
         default=0.0,
     )
     emissive_multiplier: FloatProperty(
+        update=_rb3_settings_changed,
         name="Emissive Multiplier",
         description="RndMat.emissiveMultiplier - multiplier applied to emission",
         default=1.0,
     )
     environment_map: BoolProperty(
+        update=_rb3_settings_changed,
         name="Environment Map?",
         description='RndMat.environMap - when enabled, uses the game\'s base cube map '
                      '("instruments.cube") for reflections. No support yet for custom '
@@ -344,6 +388,7 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=False,
     )
     cull: BoolProperty(
+        update=_rb3_settings_changed,
         name="Cull (Backface)",
         description="RndMat.cull - cull backfaces of this material's polygons "
                      "(equivalent to the CLI tool's !DoubleSided). On by default, as on "
@@ -351,6 +396,7 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=True,
     )
     de_normal: EnumProperty(
+        update=_rb3_settings_changed,
         name="De-Normal",
         description="RndMat.deNormal - stored as a float, but only -1, 0, or 1 are "
                      "meaningful values, so it's exposed as a 3-way choice here",
@@ -367,11 +413,13 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=0.0,
     )
     normal_detail_strength: FloatProperty(
+        update=_rb3_settings_changed,
         name="Normal Detail Strength",
         description="RndMat.normalDetailStrength",
         default=0.0,
     )
     rim_rgb: FloatVectorProperty(
+        update=_rb3_settings_changed,
         name="Rim RGB",
         description="RndMat.rimRGB - rim lighting color",
         subtype='COLOR',
@@ -380,15 +428,59 @@ class GltfMiloMaterialSettings(bpy.types.PropertyGroup):
         default=(0.0, 0.0, 0.0),
     )
     rim_power: FloatProperty(
+        update=_rb3_settings_changed,
         name="Rim Power",
         description="RndMat.rimPower - rim lighting falloff power",
         default=4.0,
     )
     shader_variation: EnumProperty(
+        update=_rb3_settings_changed,
         name="Shader Variation",
         description="RndMat.shaderVariation - special shading path (skin/hair)",
         items=MAT_SHADER_VARIATION_ITEMS,
         default='kShaderVariationNone',
+    )
+    environment_map_falloff: BoolProperty(
+        name="Environment Map Falloff",
+        description="RndMat.environMapFalloff (Rock Band 3) - fade the reflection in towards "
+                    "grazing angles: it's scaled by 1 - (normal . view), so surfaces facing "
+                    "the camera show almost none of it",
+        default=False,
+        update=_rb3_settings_changed,
+    )
+    environment_map_specmask: BoolProperty(
+        name="Environment Map Spec Mask",
+        description="RndMat.environMapSpecMask (Rock Band 3) - scale the reflection by the "
+                    "specular map's alpha. Only has an effect when there's a specular map",
+        default=False,
+        update=_rb3_settings_changed,
+    )
+    per_pixel_lit: BoolProperty(
+        name="Per-Pixel Lighting",
+        description="RndMat.perPixelLit (Rock Band 3) - light every pixel. Off, the game "
+                    "falls back to vertex lighting and drops the normal map, specular map, "
+                    "detail normal map and rim light",
+        default=True,
+        update=_rb3_settings_changed,
+    )
+    color_adjust: BoolProperty(
+        name="Color Adjust",
+        description="RndMat.colorAdjust (Rock Band 3) - let the lighting environment's colour "
+                    "transform (hue, saturation, contrast, brightness, levels) recolour this "
+                    "material. Only has an effect in environments with colour adjust enabled",
+        default=False,
+        update=_rb3_settings_changed,
+    )
+    rb3_shader: BoolProperty(
+        name="Rock Band 3 Shader",
+        description="Preview this material with Rock Band 3's own material shading, rebuilt "
+                    "from the game's shaders and lit by the scene (HDRI, lamps): specular, "
+                    "rim, environment map, skin and hair behaviour and the environment's "
+                    "colour adjust, driven by the settings below. The material's existing "
+                    "nodes are kept and come back when this is turned off. Doesn't change "
+                    "what's exported",
+        default=False,
+        update=_rb3_shader_toggled,
     )
     meta_material: StringProperty(
         name="MetaMaterial (DC3)",
@@ -535,6 +627,144 @@ class MATERIAL_OT_gltfmilo_autodetect_textures(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _rb3_environment_changed(self, context):
+    _push_rb3_environment(self)
+
+
+def _push_rb3_environment(st):
+    """Sends the scene's Rock Band 3 environment (ambient, colour adjust) to the shared
+    node group every RB3-shaded material reads."""
+    if st is None:
+        return
+    xfm = rb3_shader.build_color_xfm(
+        st.hue, st.saturation, st.lightness, st.contrast, st.brightness,
+        tuple(st.in_lo), tuple(st.in_hi), tuple(st.out_lo), tuple(st.out_hi))
+    rb3_shader.push_environment(ambient=tuple(st.ambient), color_xfm=xfm,
+                                color_adjust_on=st.use_color_adjust)
+
+
+def _rb3_pct(name, desc):
+    return FloatProperty(name=name, description=desc, default=0.0, soft_min=-100.0,
+                         soft_max=100.0, subtype='PERCENTAGE', update=_rb3_environment_changed)
+
+
+def _rb3_level(name, desc, default):
+    return FloatVectorProperty(name=name, description=desc, subtype='COLOR', size=3,
+                               soft_min=0.0, soft_max=1.0, default=default,
+                               update=_rb3_environment_changed)
+
+
+class GltfMiloRB3PreviewSettings(bpy.types.PropertyGroup):
+    """The scene-wide part of Rock Band 3's lighting environment (RndEnviron) that the
+    preview shader can show: the ambient colour, and the colour transform materials with
+    Color Adjust pick up. Lighting itself comes from the scene (HDRI, lamps)."""
+    ambient: FloatVectorProperty(
+        name="Ambient",
+        description="RndEnviron.ambientColor - added on top of the lighting on every lit RB3 "
+                    "surface (texture x colour x ambient), in the game's display values. "
+                    "Black leaves the lighting to the scene",
+        subtype='COLOR', size=3, min=0.0, soft_max=1.0, default=(0.0, 0.0, 0.0),
+        update=_rb3_environment_changed)
+    use_color_adjust: BoolProperty(
+        name="Environment Color Adjust",
+        description="RndEnviron.useColorAdjust - apply the colour transform below to every "
+                    "material with Color Adjust on. Off, those materials are drawn as is, "
+                    "as in an RB3 venue whose environment doesn't use it",
+        default=False, update=_rb3_environment_changed)
+    hue: FloatProperty(
+        name="Hue",
+        description="Rotates the colours (degrees). RB3 blends each channel into the next "
+                    "in 120-degree steps, so in-between hues come out somewhat brighter",
+        default=0.0, soft_min=-180.0, soft_max=180.0, update=_rb3_environment_changed)
+    saturation: _rb3_pct("Saturation", "Percent; -100 is greyscale (an equal-weight "
+                                       "average of the channels)")
+    lightness: _rb3_pct("Lightness", "Percent; positive fades towards white, negative "
+                                     "towards black")
+    contrast: _rb3_pct("Contrast", "Percent, around mid-grey")
+    brightness: _rb3_pct("Brightness", "Percent; adds brightness/200 to every channel")
+    in_lo: _rb3_level("In Low", "Levels - input black point, per channel", (0.0, 0.0, 0.0))
+    in_hi: _rb3_level("In High", "Levels - input white point, per channel", (1.0, 1.0, 1.0))
+    out_lo: _rb3_level("Out Low", "Levels - output black point, per channel", (0.0, 0.0, 0.0))
+    out_hi: _rb3_level("Out High", "Levels - output white point, per channel", (1.0, 1.0, 1.0))
+
+
+class SCENE_OT_gltfmilo_rb3_standard_view(bpy.types.Operator):
+    """Set the scene's view transform to Standard (look None, exposure 0, gamma 1). The
+    Rock Band 3 shader works out its colours the way the game does, which only shows
+    through unaltered with the Standard transform"""
+    bl_idname = "scene.gltfmilo_rb3_standard_view"
+    bl_label = "Use Standard View Transform"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        vs = context.scene.view_settings
+        vs.view_transform = 'Standard'
+        try:
+            vs.look = 'None'
+        except TypeError:
+            pass
+        vs.exposure = 0.0
+        vs.gamma = 1.0
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_gltfmilo_rb3_shader_all(bpy.types.Operator):
+    """Turn the Rock Band 3 shader on or off for every material exported as Rock Band 3
+    (Material Version Auto or Rev 68)"""
+    bl_idname = "material.gltfmilo_rb3_shader_all"
+    bl_label = "Rock Band 3 Shader On All"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    enable: BoolProperty(default=True, options={'HIDDEN'})
+
+    def execute(self, context):
+        n = 0
+        for m in bpy.data.materials:
+            st = getattr(m, 'gltfmilo_settings', None)
+            if st is None or st.material_version not in ('AUTO', 'REV_68'):
+                continue
+            if m.library is not None:
+                continue
+            if st.rb3_shader != self.enable:
+                st.rb3_shader = self.enable
+                n += 1
+        self.report({'INFO'}, f"Rock Band 3 shader {'on' if self.enable else 'off'} for "
+                              f"{n} material(s)")
+        return {'FINISHED'}
+
+
+def _draw_rb3_preview(layout, context, settings):
+    box = layout.box()
+    head = box.row(align=True)
+    head.prop(settings, "rb3_shader", toggle=True, icon='SHADING_RENDERED')
+    on = head.operator("material.gltfmilo_rb3_shader_all", text="", icon='CHECKMARK')
+    on.enable = True
+    off = head.operator("material.gltfmilo_rb3_shader_all", text="", icon='X')
+    off.enable = False
+    if not settings.rb3_shader:
+        return
+    scene = context.scene
+    st = scene.gltfmilo_rb3_preview
+    if scene.view_settings.view_transform != 'Standard':
+        col = box.column(align=True)
+        col.label(text="Colours match the game best with the Standard view transform",
+                  icon='INFO')
+        col.operator("scene.gltfmilo_rb3_standard_view", icon='RESTRICT_VIEW_OFF')
+    col = box.column(align=True)
+    col.label(text="Scene Environment (shared by every material)", icon='WORLD')
+    col.prop(st, "ambient")
+    sub = box.column(align=True)
+    sub.prop(st, "use_color_adjust")
+    if st.use_color_adjust:
+        for name in ("hue", "saturation", "lightness", "contrast", "brightness"):
+            sub.prop(st, name)
+        grid = sub.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+        for name in ("in_lo", "in_hi", "out_lo", "out_hi"):
+            grid.prop(st, name)
+        if not settings.color_adjust:
+            sub.label(text="This material's Color Adjust is off", icon='INFO')
+
+
 class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
     bl_label = "Rock Band Material Export Settings"
     bl_idname = "MATERIAL_PT_gltfmilo_settings"
@@ -555,6 +785,8 @@ class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
         fields = MAT_VERSION_FIELDS.get(settings.material_version, MAT_VERSION_FIELDS['AUTO'])
 
         layout.prop(settings, "material_version")
+        if 'rb3_shader' in fields:
+            _draw_rb3_preview(layout, context, settings)
         if settings.material_version == 'REV_28_GH2':
             layout.label(text="Guitar Hero II materials take only the textures and "
                               "texture mapping from here", icon='INFO')
@@ -590,8 +822,14 @@ class MATERIAL_PT_gltfmilo_settings(bpy.types.Panel):
         for name in ("specular_rgb", "specular_power", "emissive_multiplier",
                      "environment_map"):
             prop(layout, name)
+        if 'environment_map_flags' in fields and settings.environment_map:
+            sub = layout.column()
+            sub.prop(settings, "environment_map_falloff")
+            sub.prop(settings, "environment_map_specmask")
 
-        advanced = [n for n in ("cull", "de_normal", "anisotropy", "normal_detail_strength",
+        advanced = [n for n in ("cull", "per_pixel_lit", "color_adjust", "de_normal",
+                                "anisotropy",
+                                "normal_detail_strength",
                                 "rim_rgb", "rim_power", "shader_variation", "meta_material")
                     if n in fields]
         if advanced:
@@ -4961,6 +5199,9 @@ def menu_func_import(self, context):
 
 classes = (
     GltfMiloMaterialSettings,
+    GltfMiloRB3PreviewSettings,
+    SCENE_OT_gltfmilo_rb3_standard_view,
+    MATERIAL_OT_gltfmilo_rb3_shader_all,
     MATERIAL_OT_gltfmilo_autodetect_textures,
     MATERIAL_PT_gltfmilo_settings,
     MATERIAL_PT_gltfmilo_refract,
@@ -5033,6 +5274,7 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Material.gltfmilo_settings = PointerProperty(type=GltfMiloMaterialSettings)
+    bpy.types.Scene.gltfmilo_rb3_preview = PointerProperty(type=GltfMiloRB3PreviewSettings)
     bpy.types.Armature.gltfmilo_hair = PointerProperty(type=GltfMiloHairSettings)
     bpy.types.Bone.gltfmilo_collision = PointerProperty(type=GltfMiloCollisionSettings)
     bpy.types.Object.gltfmilo_object = PointerProperty(type=GltfMiloObjectSettings)
@@ -5064,6 +5306,7 @@ def unregister():
     del bpy.types.Object.gltfmilo_object
     del bpy.types.Bone.gltfmilo_collision
     del bpy.types.Armature.gltfmilo_hair
+    del bpy.types.Scene.gltfmilo_rb3_preview
     del bpy.types.Material.gltfmilo_settings
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

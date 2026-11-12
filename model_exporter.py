@@ -352,7 +352,9 @@ def build_tbrb_mesh_milo_bytes(root_name, mesh_entries, materials, textures,
 
 
 def compute_group_sizes(face_count):
-    """groupSizes is a List<byte>, so each entry maxes out at 255. Confirmed against
+    """groupSizes is a List<byte>, so each entry maxes out at 255. NOT used for DC1 any
+    more: these fixed slices break the engine's patch budget on any real character mesh -
+    see build_patches. Confirmed against
     a real CLI-exported file: a 12-triangle cube produced groupSizes=[12] (a single
     group covering every face). The multi-group chunking below for >255 faces is
     an untested extrapolation - flag if a large mesh doesn't load right."""
@@ -365,6 +367,72 @@ def compute_group_sizes(face_count):
         sizes.append(chunk)
         remaining -= chunk
     return sizes
+
+
+def patch_okay(verts, faces):
+    """RndMesh::PatchOkay (rndobj/Mesh.h, dc3 decomp): the budget one render patch must fit -
+    about 70 distinct vertices for a patch of ~100 faces."""
+    return verts * 4.31 + faces * 0.25 < 329.0
+
+
+def build_patches(positions, faces):
+    """(faces, patch sizes) the way the engine's own tools build them: a port of the default
+    branch of RndMesh::OnSync (rndobj/Mesh.cpp, dc3 decomp).
+
+    A mesh's faces are drawn in patches, and each patch must fit patch_okay. Every vanilla
+    Dance Central mesh does - all 2,111 patches across aubrey01, angel01 and emilia01 - while
+    cutting the face list into fixed 255-face slices (compute_group_sizes) left 166 of an
+    exported character's 173 patches over budget, up to 233 vertices in one: the suspected
+    cause of the flickering shading seen only on exported characters, in DC1 and DC3 alike.
+
+    The engine reorders the faces as it goes: it repeatedly takes the remaining face that
+    adds the fewest new vertices to the current patch, the one whose centre is nearest the
+    patch's vertex centroid among equals (the earliest on an exact tie), and starts a new
+    patch when adding it would break the budget. A mesh that fits whole stays one patch, in
+    its original order. Patch sizes are stored as bytes, so a patch is also never allowed
+    past 255 faces (the engine never reaches that - the vertex budget is far tighter).
+
+    `positions`: one (x, y, z) per vertex, as written. Returns the reordered face list and
+    the patch sizes."""
+    import numpy as np
+    n_faces = len(faces)
+    if n_faces == 0:
+        return [], []
+    if patch_okay(len(positions), n_faces) and n_faces <= 255:
+        return list(faces), [n_faces]
+
+    pos = np.asarray(positions, dtype=np.float64)
+    fa = np.asarray(faces, dtype=np.int64)
+    centres = pos[fa].mean(axis=1)
+    remaining = np.arange(n_faces)
+    in_patch = np.zeros(len(pos), dtype=bool)
+    patch_verts = 0
+    centroid_sum = np.zeros(3)
+    centroid = np.zeros(3)               # the engine's ve0: NOT reset when a patch closes
+    out_faces, sizes, patch = [], [], 0
+    while remaining.size:
+        new = (~in_patch[fa[remaining]]).sum(axis=1)
+        least = new.min()
+        cand = remaining[new == least]
+        d = ((centres[cand] - centroid) ** 2).sum(axis=1)
+        pick = int(cand[int(np.argmin(d))])   # argmin keeps the earliest on a tie
+        if not patch_okay(int(least) + patch_verts, patch + 1) or patch + 1 > 255:
+            sizes.append(patch)
+            in_patch[:] = False
+            patch_verts = 0
+            centroid_sum[:] = 0.0
+            patch = 0
+        for vi in fa[pick]:
+            if not in_patch[vi]:
+                in_patch[vi] = True
+                patch_verts += 1
+                centroid_sum += pos[vi]
+                centroid = centroid_sum / patch_verts
+        out_faces.append(tuple(int(x) for x in fa[pick]))
+        remaining = remaining[remaining != pick]
+        patch += 1
+    sizes.append(patch)
+    return out_faces, sizes
 
 
 def write_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_obj,
@@ -524,8 +592,16 @@ def write_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_obj,
             # Unlike PS3's 11-11-10, the Xbox 10-10-10-2 format has a 2-bit W, which carries
             # the bitangent sign / handedness (Blender's loop.bitangent_sign, +/-1).
             if write_tangents:
+                tw = v.get("tw", 1.0)
+                if dc1:
+                    # Vanilla DC1 stores the opposite handedness to Blender's bitangent
+                    # sign: per triangle, the stored W matches sign((N x T) . dP/dv) on
+                    # 0.1-0.2% of corners in aubrey01 and emilia01, while an export using
+                    # Blender's sign matched it on 99.6% - every normal map's detail was
+                    # flipped across the mesh. Negated to match the game.
+                    tw = -tw
                 w.u32(pack_signed_10_10_10_2(
-                    v.get("tx", 0.0), v.get("ty", 0.0), v.get("tz", 0.0), v.get("tw", 1.0)))
+                    v.get("tx", 0.0), v.get("ty", 0.0), v.get("tz", 0.0), tw))
             else:
                 w.u32(pack_signed_10_10_10_2(0.0, 0.0, 0.0, 0.0))
             w.u32(pack_unsigned_10_10_10_2(weights[0], weights[1], weights[2], weights[3]))
@@ -535,13 +611,18 @@ def write_rnd_mesh(w: MiloWriter, entry_name, local_xfm, world_xfm, parent_obj,
             w.u8(bones[3])
 
     # --- faces ---
+    if dc1:
+        # Faces reordered into engine-legal render patches - see build_patches.
+        faces, group_sizes = build_patches([(v["x"], v["y"], v["z"]) for v in vertices],
+                                           faces)
+    else:
+        group_sizes = compute_group_sizes(len(faces))
     w.u32(len(faces))
     for (i1, i2, i3) in faces:
         w.u16(i1)
         w.u16(i2)
         w.u16(i3)
 
-    group_sizes = compute_group_sizes(len(faces))
     w.u32(len(group_sizes))
     for g in group_sizes:
         w.u8(g)
