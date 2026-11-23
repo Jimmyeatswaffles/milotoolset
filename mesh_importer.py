@@ -715,7 +715,8 @@ def _armature_rest(armature_obj, bone_name):
             [ml[0][2], ml[1][2], ml[2][2], 0.0], [ml[0][3], ml[1][3], ml[2][3], 1.0]]
 
 
-def apply_bind_corrections(meshes, armature_obj=None, rest_lookup=None, extra_rest=None):
+def apply_bind_corrections(meshes, armature_obj=None, rest_lookup=None, extra_rest=None,
+                           force_skeleton=False):
     """Moves vertices (and normals) of any mesh whose bone-table matrices don't cancel at
     rest to where the game draws them. Returns [(mesh name, note)] for the log.
 
@@ -733,7 +734,13 @@ def apply_bind_corrections(meshes, armature_obj=None, rest_lookup=None, extra_re
     Corrections are skipped when they would only nudge a mesh imperceptibly (under 0.05
     units), mirror it (negative determinant: 21st's LOD01 shoes and shadow), or only spin it
     in place (its centre moving under 0.1 units: George's eyeballs, which the skeleton would
-    turn 8 and 90 degrees about their centres - the game aims the eyes every frame anyway)."""
+    turn 8 and 90 degrees about their centres - the game aims the eyes every frame anyway).
+
+    force_skeleton: the armature IS the game's rest pose for every bone the meshes use -
+    skip the check that it belongs to this file. The RB3 character importer builds it from
+    the shared skeleton plus the item's own bones, chained from their skeleton parent as
+    the game does; an RB3 hair can be bound with bone_hair 1.7 units from that (crazyhawk),
+    which the check would take for another character's skeleton."""
     if rest_lookup is None:
         def rest_lookup(name):
             return _armature_rest(armature_obj, name)
@@ -764,7 +771,9 @@ def apply_bind_corrections(meshes, armature_obj=None, rest_lookup=None, extra_re
             skeleton[name] = sk
     use_skeleton = False
     armature_ok = True                  # nothing to compare against: trust it as a fallback
-    if skeleton:
+    if skeleton and force_skeleton:
+        use_skeleton = True
+    elif skeleton:
         fits = sorted(min(_mismatch(g[0], skeleton[n]) for g in variants[n]) for n in skeleton)
         use_skeleton = fits[len(fits) // 2] <= 0.5
         armature_ok = use_skeleton
@@ -1289,6 +1298,30 @@ def parse_gdrb_meshes(filepath):
     return dir_name, meshes, failed
 
 
+
+def parse_rb3_meshes(filepath):
+    """parse_gdrb_meshes for Rock Band 3: every Mesh in the milo, nested directories
+    included. RB3 items keep their geometry in an inline '<item>/<item>_resource.milo'
+    subdirectory (admiraljacket_ornate -> admiraljacket_resource.mesh, 51squier_paint ->
+    51squier_resource.mesh), which a walk of the top-level entry table never sees.
+    Falls back to the top-level reader if the nested walk can't account for the file."""
+    with open(filepath, 'rb') as f:
+        body = read_milo_container_body(f.read())
+    try:
+        entries = walk_milo_entries(body)
+    except MeshImportError:
+        return parse_gdrb_meshes(filepath)
+    dir_name = next((path[0] for _d, path, _t, _n, _s, _e in entries if path), "")
+    meshes, failed = [], []
+    for _depth, _path, etype, ename, s, e in entries:
+        if etype != 'Mesh':
+            continue
+        try:
+            meshes.append(parse_mesh_entry(body[s:e], ename))
+        except (MeshImportError, struct.error) as ex:
+            failed.append((ename, str(ex)))
+    return dir_name, meshes, failed
+
 # ---------------------------------------------------------------------------------------
 # Blender construction
 # ---------------------------------------------------------------------------------------
@@ -1547,8 +1580,11 @@ class _IMPORT_OT_milo_meshes_base(bpy.types.Operator, ImportHelper):
             trans_bones = {}
         for name, note in place_rigid_meshes(meshes):
             _log(f"  '{name}': {note}")
+        force_rest = bool(getattr(self, 'rest_from_armature', False)) and armature_obj is not None
         for name, note in apply_bind_corrections(
-                meshes, armature_obj if self._skeleton_corrections else None, extra_rest={n: t[0] for n, t in trans_bones.items()}):
+                meshes, armature_obj if (self._skeleton_corrections or force_rest) else None,
+                extra_rest={n: t[0] for n, t in trans_bones.items()},
+                force_skeleton=force_rest):
             _log(f"  '{name}': {note}")
         for name, note in remap_unknown_bones(meshes, trans_bones, armature_obj):
             _log(f"  '{name}': {note}")
@@ -1708,3 +1744,11 @@ class IMPORT_OT_rb3_meshes(_IMPORT_OT_milo_meshes_base):
     filter_glob: StringProperty(default="*.milo_xbox", options={'HIDDEN'})
     import_textures: BoolProperty(default=False, options={'HIDDEN'})
     flip_normal_green: BoolProperty(default=False, options={'HIDDEN'})
+
+    # Set by the RB3 character importer for everything but the head: place the meshes
+    # through their bone-table matrices against the armature's rest (the game's), the way
+    # the game skins them. See apply_bind_corrections(force_skeleton).
+    rest_from_armature: BoolProperty(default=False, options={'HIDDEN'})
+
+    def _parse_meshes(self, filepath):
+        return parse_rb3_meshes(filepath)

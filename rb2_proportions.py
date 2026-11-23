@@ -717,8 +717,13 @@ def _armature_users(arm_obj):
     return out
 
 
-def apply_girth(arm_obj, deform, world, neutral, pose_m, enabled=True):
-    """Writes each MeshDeform mesh's 'RB2 Proportions' shape key. Returns the count."""
+def apply_girth(arm_obj, deform, world, neutral, pose_m, enabled=True, shape_key=None,
+                relative=False):
+    """Writes each MeshDeform mesh's 'RB2 Proportions' shape key (or `shape_key`). Returns
+    the count. relative: move each MeshDeform bone by world @ neutral^-1 (exact when the
+    meshes' bind pose isn't the neutral body - RB3's hands and feet) instead of RB2's
+    I + (world - neutral) @ inverse bind."""
+    SHAPE_KEY = shape_key or globals()['SHAPE_KEY']
     import numpy as np
     from mathutils import Matrix
     users = _armature_users(arm_obj)
@@ -761,7 +766,10 @@ def apply_girth(arm_obj, deform, world, neutral, pose_m, enabled=True):
             if not sel.any():
                 continue
             vi, w = md['vi'][sel], md['w'][sel]
-            m = np.eye(4) + (np.array(world[stem]) - np.array(neutral[stem])) @ md['inv'][k]
+            if relative:
+                m = np.array(world[stem]) @ np.linalg.inv(np.array(neutral[stem]))
+            else:
+                m = np.eye(4) + (np.array(world[stem]) - np.array(neutral[stem])) @ md['inv'][k]
             moved[vi] += w[:, None] * (v[vi] @ m.T)
             body[vi] += w
         if not (body > 1e-6).any():

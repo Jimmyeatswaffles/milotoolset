@@ -1199,12 +1199,21 @@ class MiloToolsetPreferences(bpy.types.AddonPreferences):
         description="Folder holding Rock Band 2's extracted game files (the one containing "
                     "'char'). The Rock Band 2 character importer finds every outfit milo, "
                     "the colour palettes and the skin textures here")
+    rb3_extracted_dir: StringProperty(
+        name="Rock Band 3 Xbox 360 Dump",
+        subtype='DIR_PATH',
+        description="Folder holding Rock Band 3's extracted Xbox 360 game files (the one "
+                    "containing 'char'). The Rock Band 3 character importer finds the "
+                    "skeleton, the deform milo and every outfit and instrument milo here")
 
     def draw(self, context):
         layout = self.layout
         layout.label(text="Location of Rock Band 2 extracted files (for the Rock Band 2 "
                           "character importer):")
         layout.prop(self, "rb2_extracted_dir", text="")
+        layout.label(text="Location of the Rock Band 3 Xbox 360 dump (for the Rock Band 3 "
+                          "character importer):")
+        layout.prop(self, "rb3_extracted_dir", text="")
 
 
 def extracted_root(context):

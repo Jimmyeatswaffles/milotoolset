@@ -10,6 +10,7 @@ Also includes various other tools to assist with game modification.
 - The Beatles Rock Band Character Export and Custom Song Asset Export (Tested only on PS3)
 - .hair export working in various Harmonix games to give characters clothes or hair physics.
 - Armature importer for custom character creator for Rock Band 3, The Beatles Rock Band and Dance Central.
+- Rock Band 3 character importer (experimental): a prefab from prefabs.milo with the shared skeleton, outfit/instrument meshes and the height/weight/muscle body proportions (set the Rock Band 3 Xbox 360 dump folder in the add-on preferences).
 - Experimental .coll exporter for adding collision boxes to custom characters for physics.
 - More detailed .mat exporter.
 - Inspect "Visemes" facial animations from Rock Band 3.

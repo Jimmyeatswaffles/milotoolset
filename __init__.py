@@ -38,6 +38,7 @@ from .viseme_importer import *
 from .viseme_exporter import *
 from .mesh_importer import *
 from .dc_mesh_importer import IMPORT_OT_dc_meshes, IMPORT_OT_dc3_meshes
+from .gdrb_venue_importer import IMPORT_OT_gdrb_venue
 from .anim_importer import *
 from .cam_importer import *
 from .gh2_lipsync import *
@@ -45,10 +46,15 @@ from .dc_clip_importer import *
 from .dc_routine_importer import *
 from .gdrb_clip_exporter import *
 from .rb3_clip_exporter import EXPORT_OT_rb3_clip_inject
+from .dc3_boomy_exporter import EXPORT_OT_dc3_boomy_clips
 from .lipsync_importer import *
 from . import rb2_creator_textures
 from . import rb2_character_importer
 from . import rb2_proportions
+from . import rb3_proportions
+from . import rb3_face
+from . import rb3_textures
+from . import rb3_character_importer
 from . import rb3_shader
 
 # `import *` skips names starting with underscore, so anything private that this file
@@ -3941,6 +3947,11 @@ def menu_func_export(self, context):
     self.layout.operator(EXPORT_OT_rb3_clip_inject.bl_idname,
                          text="RB3 CharClip Into Song Milo (.milo_xbox)",
                          icon_value=_milo_icon_id('RB3'))
+    # Each Action becomes a DC3 move clip (CharClip version 22) in a Boomy move library,
+    # as a new clip of a template move that supplies the scoring data.
+    self.layout.operator(EXPORT_OT_dc3_boomy_clips.bl_idname,
+                         text="Export Actions to CharClips for Boomy (DC3)",
+                         icon_value=_milo_icon_id('DC3'))
 
 
 def _coll_redraw(self, context):
@@ -5219,11 +5230,19 @@ class TOPBAR_MT_milo_mesh_import(bpy.types.Menu):
         layout.operator(IMPORT_OT_rb3_meshes.bl_idname,
                         text="Rock Band 3 (.milo_xbox)",
                         icon_value=_milo_icon_id('RB3'))
+        layout.operator(rb3_character_importer.IMPORT_OT_rb3_character.bl_idname,
+                        text="Rock Band 3 Character (prefabs.milo) (Experimental)",
+                        icon_value=_milo_icon_id('RB3'))
         layout.operator(IMPORT_OT_tbrb_meshes.bl_idname,
                         text="The Beatles: Rock Band (.milo_xbox)",
                         icon_value=_milo_icon_id('TBRB'))
         layout.operator(IMPORT_OT_gdrb_meshes.bl_idname,
                         text="Green Day: Rock Band (.milo_xbox)",
+                        icon_value=_milo_icon_id('GDRB'))
+        # Whole venue from its main milo: follows the venue's milo chain and the shared
+        # props it places (world/shared). Static meshes and textures only.
+        layout.operator(IMPORT_OT_gdrb_venue.bl_idname,
+                        text="Green Day: Rock Band Venue (.milo_xbox)",
                         icon_value=_milo_icon_id('GDRB'))
         # Dance Central: RB3's RndMesh 38, but its own operator - meshes stored turned 180
         # degrees from the skeleton, face rig kept in the character milo, LODs declared by
@@ -5659,6 +5678,7 @@ classes = (
     IMPORT_OT_tbrb_skeleton,
     IMPORT_OT_gdrb_skeleton,
     IMPORT_OT_gdrb_meshes,
+    IMPORT_OT_gdrb_venue,
     IMPORT_OT_rb3_meshes,
     IMPORT_OT_dc_meshes,
     IMPORT_OT_dc3_meshes,
@@ -5694,6 +5714,7 @@ classes = (
     EXPORT_OT_dc1_viseme_milo,
     EXPORT_OT_gdrb_body_performance_milo,
     EXPORT_OT_rb3_clip_inject,
+    EXPORT_OT_dc3_boomy_clips,
     VIEW3D_MT_milo_lipsync,
     TOPBAR_MT_milo_skeleton_import,
     TOPBAR_MT_milo_mesh_import,
@@ -5715,6 +5736,10 @@ def register():
     rb2_creator_textures.register()
     rb2_proportions.register()
     rb2_character_importer.register()
+    rb3_proportions.register()
+    rb3_face.register()
+    rb3_textures.register()
+    rb3_character_importer.register()
     _register_coll_draw_handler()
     bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
     bpy.types.TOPBAR_MT_file_import.append(menu_func_import)
@@ -5734,6 +5759,10 @@ def unregister():
     bpy.types.TOPBAR_MT_file_import.remove(menu_func_import)
     bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
     _unregister_coll_draw_handler()
+    rb3_character_importer.unregister()
+    rb3_textures.unregister()
+    rb3_face.unregister()
+    rb3_proportions.unregister()
     rb2_character_importer.unregister()
     rb2_proportions.unregister()
     rb2_creator_textures.unregister()
