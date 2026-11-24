@@ -55,7 +55,7 @@ import struct
 
 import bpy
 import numpy as np
-from bpy.props import IntProperty, PointerProperty
+from bpy.props import BoolProperty, IntProperty, PointerProperty, StringProperty
 
 from .io import read_milo_container_body
 from .utilities import _log
@@ -757,6 +757,9 @@ def patch_jobs(lib, cfgs, mat_names, char_patches, art, target_filter=None):
     mesh drawn with one of `mat_names` (or accepted by target_filter(mesh name)), its own
     patch and the character's patches of its category. art: {texture index: art ref}."""
     jobs = []
+    # empty names never match: the tattoo meshes have no material, and a MatSwap without a
+    # resource material (eyes.cfg) has an empty one - '' == '' put the tattoos on the eyes
+    mat_names = {n for n in mat_names or () if n}
     for cfg in cfgs or ():
         for bpm in cfg.get('patches') or ():
             for tname in bpm['meshes']:
@@ -765,7 +768,7 @@ def patch_jobs(lib, cfgs, mat_names, char_patches, art, target_filter=None):
                         continue
                 else:
                     tm = _mesh(lib, tname)
-                    if tm is None or tm.get('mat') not in mat_names:
+                    if tm is None or not tm.get('mat') or tm['mat'] not in mat_names:
                         continue
                 if bpm['src']:
                     own = tname.rsplit('.', 1)[0] + '_patch.mesh'
@@ -940,9 +943,13 @@ _COMPOSITES = {}       # state -> image name, so a texture shared by several mat
 def _composite_image(lib, st):
     """Builds / refreshes the composite image for a material's tint state."""
     key = json.dumps(st, sort_keys=True, default=str)
+    digest = hashlib.md5(key.encode()).hexdigest()
     name = _COMPOSITES.get(key)
-    if name and bpy.data.images.get(name) is not None:
-        return bpy.data.images[name]
+    # every colour choice of a material draws into the same output image, so a cached
+    # entry only stands while that image still shows this state
+    img = bpy.data.images.get(name) if name else None
+    if img is not None and img.get("rb3_state") == digest:
+        return img
     colors = st['colors']
     jobs = st.get('patch_jobs')
     if st.get('textures'):
@@ -969,6 +976,7 @@ def _composite_image(lib, st):
         rgba = apply_patches(lib, rgba, jobs)
     img = image_from_rgba(st['output'], rgba, 'sRGB')
     if img is not None:
+        img["rb3_state"] = digest
         _COMPOSITES[key] = img.name
     return img
 
@@ -977,7 +985,7 @@ def recompose(mat):
     """Recomputes a material's tinted diffuse from its stored state and its colour options
     (the material panel's colour indices)."""
     raw = mat.get(_STATE)
-    if not raw:
+    if not raw or mat.get(BAKED_KEY):
         return False
     st = json.loads(raw)
     tp = mat.rb3_tint
@@ -1291,6 +1299,8 @@ def update_head_normal(arm_obj, gender, types):
 
 
 def _set_role(mat, role, img):
+    if mat.get(BAKED_KEY):
+        return                       # baked: keeps its frozen textures until restored
     s = getattr(mat, 'gltfmilo_settings', None)
     if s is not None:
         setattr(s, f"{role}_tex", img)
@@ -1309,19 +1319,246 @@ def _set_role(mat, role, img):
 # Material panel
 # ---------------------------------------------------------------------------------------
 
-def _update(self, context):
-    mat = self.id_data
-    if isinstance(mat, bpy.types.Material):
+def option_count(mat, o):
+    """How many choices colour option o has on this material: its palette's length (or
+    the number of texture options), 0 if unknown."""
+    raw = mat.get(_STATE)
+    if not raw:
+        return 0
+    st = json.loads(raw)
+    lib = Library(st['lib'])
+    for p, opt in ((st.get('pal1'), st.get('opt1')), (st.get('pal2'), st.get('opt2'))):
+        if p and opt == o:
+            pal = lib.palette(p)
+            if pal:
+                return len(pal)
+    if st.get('textures') and st.get('opt1', 0) == o:
+        return len(st['textures'])
+    return 0
+
+
+_WRAPPING = set()
+
+
+def _make_update(o):
+    def update(self, context):
+        mat = self.id_data
+        if not isinstance(mat, bpy.types.Material) or mat.name in _WRAPPING:
+            return
+        prop = f"color{o}"
+        v = getattr(self, prop)
+        n = option_count(mat, o)
+        if n and not 0 <= v < n:
+            # wrap round the palette both ways (the arrows step past either end)
+            _WRAPPING.add(mat.name)
+            try:
+                setattr(self, prop, v % n)
+            finally:
+                _WRAPPING.discard(mat.name)
         recompose(mat)
+    return update
 
 
 class RB3TintSettings(bpy.types.PropertyGroup):
-    color0: IntProperty(name="Colour 1", min=0, max=255, default=0, update=_update,
-                        description="The piece's first colour index (palette entry)")
-    color1: IntProperty(name="Colour 2", min=0, max=255, default=1, update=_update,
-                        description="The piece's second colour index (palette entry)")
-    color2: IntProperty(name="Colour 3", min=0, max=255, default=2, update=_update,
-                        description="The piece's third colour index (palette entry)")
+    color0: IntProperty(name="Colour 1", min=-1, max=255, default=0, update=_make_update(0),
+                        description="The piece's first colour (palette entry; wraps round)")
+    color1: IntProperty(name="Colour 2", min=-1, max=255, default=1, update=_make_update(1),
+                        description="The piece's second colour (palette entry; wraps round)")
+    color2: IntProperty(name="Colour 3", min=-1, max=255, default=2, update=_make_update(2),
+                        description="The piece's third colour (palette entry; wraps round)")
+
+
+# ---------------------------------------------------------------------------------------
+# Baking: freezing the generated textures
+# ---------------------------------------------------------------------------------------
+#
+# The composites (tint, makeup, patches, tattoos; the head / body normal blends) are
+# already plain images computed from the game textures' own pixels, so baking is a copy:
+# each generated image a material uses becomes a fixed '<image>_baked' (packed, and saved
+# as PNG if asked), the material points at it, and later colour / proportion changes leave
+# it alone until 'Restore Live Textures' reconnects the live images.
+
+BAKED_KEY = "rb3_baked"
+_LIVE_KEY = "rb3_live_images"
+_ROLE_NODES = {'diffuse': "Milo_Diffuse", 'normal': "Milo_Normal",
+               'specular': "Milo_Specular", 'emissive': "Milo_Emissive"}
+
+
+def _generated_slots(mat):
+    """{slot: image} for the generated images the material uses: 'node:<name>' for image
+    nodes, 'set:<attr>' for its glTFMilo texture settings."""
+    out = {}
+    if mat.node_tree is not None:
+        for n in mat.node_tree.nodes:
+            if n.type == 'TEX_IMAGE' and n.image is not None and n.image.get("rb3_generated"):
+                out[f"node:{n.name}"] = n.image
+    s = getattr(mat, 'gltfmilo_settings', None)
+    if s is not None:
+        for role in _ROLE_NODES:
+            img = getattr(s, f"{role}_tex", None)
+            if img is not None and img.get("rb3_generated"):
+                out[f"set:{role}_tex"] = img
+    return out
+
+
+def is_rb3_material(mat):
+    return bool(mat.get(_STATE) or mat.get(BAKED_KEY) or _generated_slots(mat))
+
+
+def _assign(mat, slot, img):
+    kind, name = slot.split(':', 1)
+    if kind == 'node':
+        n = mat.node_tree.nodes.get(name) if mat.node_tree else None
+        if n is not None:
+            n.image = img
+    else:
+        s = getattr(mat, 'gltfmilo_settings', None)
+        if s is not None:
+            setattr(s, name, img)
+
+
+def _sync(mat):
+    try:
+        from . import rb3_shader
+        rb3_shader.sync_rb3_material(mat)
+    except Exception:
+        pass
+
+
+def bake_image(src, done):
+    """A fixed copy of a generated image ('<name>_baked'), made once per bake run."""
+    if src.name in done:
+        return done[src.name]
+    name = f"{src.name}_baked"
+    old = bpy.data.images.get(name)
+    if old is not None:
+        bpy.data.images.remove(old)           # a fresh, unpacked image saves cleanly
+    w, h = src.size
+    img = bpy.data.images.new(name, width=w, height=h, alpha=True)
+    img.colorspace_settings.name = src.colorspace_settings.name
+    try:
+        img.alpha_mode = src.alpha_mode
+    except (AttributeError, TypeError):
+        pass
+    px = np.empty(w * h * 4, dtype=np.float32)
+    src.pixels.foreach_get(px)
+    img.pixels.foreach_set(px)
+    img.update()
+    img["rb3_baked_from"] = src.name
+    done[src.name] = img
+    return img
+
+
+def bake_material(mat, done):
+    """Points the material at frozen copies of its generated images. Returns how many."""
+    if mat.get(BAKED_KEY):
+        restore_live(mat)                     # bake from the live images, not an old bake
+    if mat.get(_STATE):
+        recompose(mat)                        # the current colours
+    slots = _generated_slots(mat)
+    if not slots:
+        return 0
+    live = {}
+    for slot, src in slots.items():
+        live[slot] = src.name
+        _assign(mat, slot, bake_image(src, done))
+    mat[_LIVE_KEY] = json.dumps(live)
+    mat[BAKED_KEY] = True
+    _sync(mat)
+    return len(slots)
+
+
+def restore_live(mat):
+    live = json.loads(mat.get(_LIVE_KEY, "{}"))
+    for slot, name in live.items():
+        img = bpy.data.images.get(name)
+        if img is not None:
+            _assign(mat, slot, img)
+    for k in (BAKED_KEY, _LIVE_KEY):
+        if k in mat:
+            del mat[k]
+    if mat.get(_STATE):
+        recompose(mat)
+    _sync(mat)
+
+
+class MATERIAL_OT_rb3_bake_all(bpy.types.Operator):
+    """Freeze every Rock Band 3 material's customised textures - palette colours, makeup,
+    tattoos, art and shirt graphics, the head / body normal blends - into plain baked
+    images and use them, for exporting. A pixel copy of what the materials show (no
+    Cycles bake), at the game texture's size"""
+    bl_idname = "material.rb3_bake_all"
+    bl_label = "Bake All Character Textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    save_dir: StringProperty(
+        name="Also Save PNGs To", subtype='DIR_PATH',
+        description="Optional folder to save the baked textures to as PNG files (for "
+                    "exporters that don't embed images). Leave empty to only pack them "
+                    "into the .blend")
+    use_in_materials: BoolProperty(
+        name="Use Baked Textures in Materials", default=True,
+        description="Connect each material to its baked textures, so exporters see plain "
+                    "textured materials ('Restore Live Textures' undoes it)")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def execute(self, context):
+        mats = [m for m in bpy.data.materials if is_rb3_material(m)]
+        if not mats:
+            self.report({'WARNING'}, "No Rock Band 3 character materials found")
+            return {'CANCELLED'}
+        out_dir = bpy.path.abspath(self.save_dir) if self.save_dir else ""
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        done, baked, failed = {}, [], []
+        for m in mats:
+            try:
+                n = bake_material(m, done)
+            except Exception as e:
+                failed.append(f"{m.name}: {e}")
+                continue
+            if n:
+                baked.append(m.name)
+            if not self.use_in_materials and m.get(BAKED_KEY):
+                restore_live(m)
+        for img in done.values():
+            if out_dir:
+                path = os.path.join(out_dir, bpy.path.clean_name(img.name) + ".png")
+                img.filepath_raw = path
+                img.file_format = 'PNG'
+                try:
+                    img.save()
+                except RuntimeError as e:
+                    failed.append(f"{img.name}: saving {path} failed ({e})")
+            try:
+                img.pack()
+            except RuntimeError:
+                pass
+        _log(f"RB3 bake: {len(done)} texture(s) from {len(baked)} material(s)"
+             + (f", saved to {out_dir}" if out_dir else "") + ": " + ", ".join(done))
+        for f in failed:
+            _log(f"RB3 bake: {f}")
+        self.report({'INFO'}, f"Baked {len(done)} texture(s) for {len(baked)} material(s)"
+                    + (f"; {len(failed)} problem(s) (see the log)" if failed else ""))
+        return {'FINISHED'}
+
+
+class MATERIAL_OT_rb3_restore_live(bpy.types.Operator):
+    """Reconnect the live (editable) textures on every baked Rock Band 3 material"""
+    bl_idname = "material.rb3_restore_live"
+    bl_label = "Restore Live Textures"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        n = 0
+        for m in bpy.data.materials:
+            if m.get(BAKED_KEY):
+                restore_live(m)
+                n += 1
+        self.report({'INFO'}, f"Live textures restored on {n} material(s)")
+        return {'FINISHED'}
 
 
 class MATERIAL_PT_rb3_tint(bpy.types.Panel):
@@ -1334,11 +1571,21 @@ class MATERIAL_PT_rb3_tint(bpy.types.Panel):
     @classmethod
     def poll(cls, context):
         m = context.material
-        return m is not None and bool(m.get(_STATE))
+        return m is not None and is_rb3_material(m)
 
     def draw(self, context):
         layout = self.layout
         mat = context.material
+        row = layout.row(align=True)
+        row.operator(MATERIAL_OT_rb3_bake_all.bl_idname, icon='RENDER_STILL')
+        if any(m.get(BAKED_KEY) for m in bpy.data.materials):
+            row.operator(MATERIAL_OT_rb3_restore_live.bl_idname, text="", icon='LOOP_BACK')
+        if mat.get(BAKED_KEY):
+            layout.label(text="Baked - colours are frozen until you restore live textures "
+                              "or bake again", icon='INFO')
+            return
+        if not mat.get(_STATE):
+            return
         st = json.loads(mat[_STATE])
         lib = Library(st['lib'])
         tp = mat.rb3_tint
@@ -1357,14 +1604,15 @@ class MATERIAL_PT_rb3_tint(bpy.types.Panel):
                     pal = lib.palette(p)
                     if pal:
                         c = pal[cols[o] % len(pal)]
-                        row.label(text=f"{p} [{cols[o] % len(pal)}/{len(pal)}]  "
+                        row.label(text=f"{p} [{cols[o] % len(pal) + 1}/{len(pal)}]  "
                                        f"#{int(c[0]*255):02X}{int(c[1]*255):02X}"
                                        f"{int(c[2]*255):02X}")
         if st.get('textures'):
             layout.label(text=f"{len(st['textures'])} texture options")
 
 
-_classes = (RB3TintSettings, MATERIAL_PT_rb3_tint)
+_classes = (RB3TintSettings, MATERIAL_OT_rb3_bake_all, MATERIAL_OT_rb3_restore_live,
+            MATERIAL_PT_rb3_tint)
 
 
 def register():

@@ -58,6 +58,7 @@ from .utilities import _log
 from . import rb3_proportions as rb3p
 from . import rb3_face
 from . import rb3_textures
+from . import rb3_outfit_fit
 from .rb2_character_importer import (parse_dta, DtaString, _read_text, _cached,
                                      _new_collection, _activate, _strip_ext)
 
@@ -865,6 +866,12 @@ class IMPORT_OT_rb3_character(bpy.types.Operator, ImportHelper):
         description="Sculpt the head with the character's face types and sliders from the "
                     "head-shape milo (head_male / head_female). Adjustable afterwards in "
                     "the armature's Rock Band 3 Face panel")
+    apply_fit: BoolProperty(
+        name="Hide & Cuff", default=True,
+        description="Apply the items' CharMeshHide (hide pieces another item covers) and "
+                    "CharCuff (squeeze e.g. pants into boots, into an 'RB3 Cuff' shape key, "
+                    "removing what's inside through an 'RB3 Cuff' Mask modifier) - as the "
+                    "game's CharCuff::DeformMesh does")
     load_patches: BoolProperty(
         name="Tattoos and Art", default=True,
         description="Project the character's tattoos and art (the prefab's prefab_art "
@@ -913,6 +920,7 @@ class IMPORT_OT_rb3_character(bpy.types.Operator, ImportHelper):
         sub.enabled = self.load_textures
         sub.prop(self, "load_makeup")
         sub.prop(self, "load_patches")
+        layout.prop(self, "apply_fit")
         layout.prop(self, "use_rb3_shader")
         layout.prop(self, "locale_file")
         if self.prefab and self.prefab != 'NONE':
@@ -1121,6 +1129,7 @@ class IMPORT_OT_rb3_character(bpy.types.Operator, ImportHelper):
         dressed = set()
 
         imported = []
+        fit_parts = []
         n_md = 0
         for category, name, milo in parts:
             if milo is None:
@@ -1145,6 +1154,15 @@ class IMPORT_OT_rb3_character(bpy.types.Operator, ImportHelper):
             for o in new:
                 o["rb3_part"] = category
             imported += new
+            if self.apply_fit:
+                try:
+                    fit = rb3_outfit_fit.read_fit(milo)
+                    if fit['hides'] or fit['cuffs']:
+                        _log(f"    fitting: {len(fit['hides'])} CharMeshHide, "
+                             f"{len(fit['cuffs'])} CharCuff")
+                    fit_parts.append((category, fit, new))
+                except Exception as e:
+                    warnings.append(f"{category}: hide / cuff data unreadable ({e})")
             if category == 'head':
                 try:
                     n, med = conform_face_bones(context, armature, milo)
@@ -1196,6 +1214,23 @@ class IMPORT_OT_rb3_character(bpy.types.Operator, ImportHelper):
                                         "vertex count")
                 except Exception as e:
                     warnings.append(f"face sculpting failed: {e}")
+
+        # Fitting: CharMeshHide, then CharCuff (bind pose, before the proportions)
+        if self.apply_fit and fit_parts:
+            try:
+                hidden, combined = rb3_outfit_fit.apply_hides(fit_parts)
+                if combined:
+                    _log(f"  hides: combined flags {combined:#x}; hidden: "
+                         + (", ".join(f"{o} ({cat})" for o, cat, _f in hidden) or "none"))
+            except Exception as e:
+                warnings.append(f"hides: {e}")
+            try:
+                for cuff, obj, count, removed in rb3_outfit_fit.apply_cuffs(fit_parts,
+                                                                           armature):
+                    _log(f"  cuffs: {cuff} squeezed {count} vertex(es) of '{obj}'"
+                         + (f", hid {removed} triangle(s) inside it" if removed else ""))
+            except Exception as e:
+                warnings.append(f"cuffs: {e}")
 
         # Material slots: placeholders from the mesh importer; RB3 shader on request
         if self.use_rb3_shader:
