@@ -5,15 +5,19 @@ Also includes various other tools to assist with game modification.
 
 **Current Features:**
 
-- Rock Band 3 Character and Instruments Export (PS3/X360)
+- Rock Band 3 and Guitar Hero 2 Character and Instruments Export (PS3/X360)
 - Dance Central 1 Character Export (milo backwards compatible with Dance Central 2 and 3, X360 only)
 - The Beatles Rock Band Character Export and Custom Song Asset Export (Tested only on PS3)
-- .hair export working in various Harmonix games to give characters clothes or hair physics.
-- Armature importer for custom character creator for Rock Band 3, The Beatles Rock Band and Dance Central.
-- Rock Band 3 character importer (experimental): a prefab from prefabs.milo with the shared skeleton, outfit/instrument meshes and the height/weight/muscle body proportions (set the Rock Band 3 Xbox 360 dump folder in the add-on preferences).
+- .hair export working in various Harmonix games to give characters clothes or hair physics plus ability to have multiple .hair files in 1 character. 
+- Armature importer for custom character creation for various Harmonix games.
+- Rock Band 2 character importer (experimental): import prefab characters or your own from a decrypted PS3 save or a xbox 360 save (Requires a Rock Band 3 Xbox 360 dump folder in the add-on preferences)
+- Rock Band 3 character importer (experimental): a prefab from prefabs.milo with the shared skeleton, outfit/instrument meshes and the height/weight/muscle body proportions (Requires a Rock Band 3 Xbox 360 dump folder in the add-on preferences).
 - Experimental .coll exporter for adding collision boxes to custom characters for physics.
 - More detailed .mat exporter.
-- Inspect "Visemes" facial animations from Rock Band 3.
+- Inspect "Visemes" facial animations from Rock Band 3, Green Day Rock Band, Dance Central games, The Beatles Rock Band, Rock Band 2.
+- Green Day Rock Band "song" animation export.
+- Import various Harmonix animations as actions.
+- Lipsync animation previewer for various Harmonix games. 
 
 Created by @jimmyeatwaffles
 
